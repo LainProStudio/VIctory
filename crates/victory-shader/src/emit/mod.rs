@@ -25,10 +25,10 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//! * **Root CBVs, root SRVs and root UAVs** (raw buffers) as root descriptors
+//!   `b<i>` / `t<i>` / `u<i>` in [`ROOT_CBV_SPACE`], `i` the title's root
+//!   parameter index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`],
+//!   [`HostShader::root_uavs`]); the address the title sets is the buffer's.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -165,6 +165,9 @@ pub struct HostShader {
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
+    /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
 }
 
 impl HostShader {
@@ -375,6 +378,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
+        root_uavs: l.root_uavs,
     })
 }
 
@@ -570,6 +574,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: false,
+            root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -581,6 +586,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: false,
+                root_uavs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -787,6 +793,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 stride_table: l.stride_table,
+                root_uavs: l.root_uavs,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let srv_data: Vec<u32> = (100..112).collect();
