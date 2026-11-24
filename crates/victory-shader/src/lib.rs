@@ -39,3 +39,20 @@ pub enum ShaderError {
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
 }
+
+#[cfg(all(test, windows))]
+#[allow(non_upper_case_globals)]
+mod d3d12_agility {
+    #[repr(transparent)]
+    pub struct SdkPath(*const u8);
+    // SAFETY: points to a `'static` NUL-terminated ASCII path literal.
+    unsafe impl Sync for SdkPath {}
+
+    #[used]
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKVersion: u32 = 619;
+
+    #[used]
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr().cast());
+}

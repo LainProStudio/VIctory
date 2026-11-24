@@ -549,6 +549,9 @@ pub(crate) fn srgb_castable(format: u32) -> bool {
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
     // SAFETY: a live resource.
@@ -1115,7 +1118,7 @@ fn host_texture(
     // Make sRGB-castable textures typeless on the host so both linear UNORM
     // and `_SRGB` SRV/RTV views (as well as linear UAVs) remain D3D12-valid
     // without losing sRGB hardware conversion.
-    if srgb_castable(d.format) {
+    if srgb_castable(pc_format(desc.format)) {
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
