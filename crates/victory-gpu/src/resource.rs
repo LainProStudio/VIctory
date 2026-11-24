@@ -303,12 +303,18 @@ fn host_lacks_target(_: u32) -> bool {
 
 /// The format a render target or unordered-access texture of `format` is
 /// made in on the host, and that render target views and pipelines name:
-/// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
-/// write typed (each channel keeps its value, with more precision); else
-/// the format as the host has it. Textures only sampled keep theirs.
+/// - `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67), which PC D3D12
+///   forbids as a render target or unordered-access resource;
+/// - `R8G8B8A8_UNORM` (28) for a packed 16-bit format the GPU cannot render
+///   to or write typed;
+/// - else [`pc_format`]. Textures only sampled keep theirs.
 pub(crate) fn target_format(format: u32) -> u32 {
+    const R9G9B9E5_SHAREDEXP: u32 = 67;
+    const RGBA16_FLOAT: u32 = 10;
     let format = pc_format(format);
-    if PACKED_16.contains(&format) && host_lacks_target(format) {
+    if format == R9G9B9E5_SHAREDEXP {
+        RGBA16_FLOAT
+    } else if PACKED_16.contains(&format) && host_lacks_target(format) {
         RGBA8_UNORM
     } else {
         format
@@ -566,7 +572,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    // Widened packed targets are typed R8G8B8A8_UNORM, so null view descs
+    // Widened/substituted targets are typed, so null view descs
     // can stay null and inherit the resource's exact dimension.
     (format != own && format != target_format(own)).then_some(own)
 }
@@ -2635,7 +2641,9 @@ mod tests {
     #[test]
     fn target_format_is_identity_for_non_packed_formats() {
         for format in 0..=200u32 {
-            if PACKED_16.contains(&format) {
+            if format == 67 {
+                assert_eq!(target_format(format), 10);
+            } else if PACKED_16.contains(&format) {
                 assert!(
                     [format, RGBA8_UNORM].contains(&target_format(format)),
                     "unexpected target format for {format}"
@@ -2650,8 +2658,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn r9g9b9e5_target_format_substitutes_rgba16f() {
+        assert_eq!(pc_format(67), 67);
+        assert_eq!(target_format(67), 10);
+        assert_eq!(target_format(28), 28);
+        assert_eq!(target_format(118), 45);
+    }
+
     #[cfg(windows)]
     #[test]
+<<<<<<< HEAD
     fn packed_16_targets_copy_and_skip_mixed_transfers() {
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::core::Interface;
@@ -2945,5 +2962,47 @@ mod tests {
         assert_eq!(pc_format(119), 46);
         assert_eq!(pc_format(120), 47);
         assert_eq!(pc_format(28), 28);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r9g9b9e5_render_target_and_uav_textures_create_on_host() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let tex_desc = |flags: u32| ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 67, // DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        for (flags, expected_host_format) in [(0, 67), (4, 10), (5, 10)] {
+            let d = tex_desc(flags);
+            let mut out = std::ptr::null();
+            let hr = create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &d,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(hr, S_OK, "flags {flags}");
+            let host = host_resource(out).expect("host texture created");
+            // SAFETY: a live host texture.
+            let got = unsafe { host.GetDesc() }.Format.0 as u32;
+            assert_eq!(got, expected_host_format, "flags {flags}");
+            assert_eq!(view_format(out), None, "flags {flags}");
+            assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
     }
 }
