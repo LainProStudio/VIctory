@@ -1324,9 +1324,11 @@ impl Drop for Resource {
                 );
             }
         }
-        if let Some(h) = &self.host {
+        if let Some(host) = self.host.take() {
             use windows::core::Interface;
-            crate::descriptor::host::drop_depth_scratch(h.texture.as_raw() as usize);
+            crate::descriptor::host::drop_depth_scratch(host.texture.as_raw() as usize);
+            // A running submission may still read the host copy.
+            crate::host::retire(host);
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
