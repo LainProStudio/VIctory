@@ -370,47 +370,32 @@ mod tests {
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     thread_local! {
-<<<<<<< HEAD
         /// The kernel askings `writes` made on this thread (each test runs
         /// on its own).
         pub(super) static KERNEL_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The view queries `guard` made on this thread (each test runs on
+        /// its own).
+        pub(super) static QUERIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     fn kernel_asked() -> usize {
         KERNEL_ASKED.with(|n| n.get())
     }
 
-    /// A pagefile section of `blocks` blocks, mapped read-write.
-    fn view(blocks: usize) -> usize {
-        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
-        // SAFETY: a fresh section; the view is ours.
-=======
-        /// The view queries `guard` made on this thread (each test runs on
-        /// its own).
-        pub(super) static QUERIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
     fn queried() -> usize {
         QUERIED.with(|n| n.get())
     }
 
-    /// A view is asked about once per block an asking starts in, again
-    /// only after the runtime remapped it; other memory every time.
-    #[test]
-    fn views_are_queried_once_until_remapped() {
-        use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-            UnmapViewOfFile,
-        };
-        // SAFETY: a pagefile section of two blocks, mapped read-write.
->>>>>>> e6f9159 (GPU: ask whether guarded memory is a view once per block, not per asking)
+    /// A pagefile section of `blocks` blocks, mapped read-write.
+    fn view(blocks: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a fresh section; the view is ours.
         let view = unsafe {
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
                 PAGE_READWRITE,
                 0,
-<<<<<<< HEAD
                 (blocks * BLOCK) as u32,
                 std::ptr::null(),
             );
@@ -512,7 +497,23 @@ mod tests {
         assert!(writes(v, v + 2 * BLOCK, false).is_none());
         assert_eq!(kernel_asked(), asked + 3);
         unmap(v, 2);
-=======
+    }
+
+    /// A view is asked about once per block an asking starts in, again
+    /// only after the runtime remapped it; other memory every time.
+    #[test]
+    fn views_are_queried_once_until_remapped() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
                 (2 * BLOCK) as u32,
                 std::ptr::null(),
             );
@@ -545,7 +546,6 @@ mod tests {
             })
         };
         title_memory_remapped(view, 2 * BLOCK);
->>>>>>> e6f9159 (GPU: ask whether guarded memory is a view once per block, not per asking)
     }
 
     #[test]
