@@ -24,6 +24,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
+use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
@@ -436,7 +437,25 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
             1 => "write",
             _ => "execute",
         };
-        format!(" ({kind} {:#x})", p[1])
+        // SAFETY: plain query into zeroed `MEMORY_BASIC_INFORMATION`.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p[1] as *const _, &mut mbi, size_of_val(&mbi)) };
+        if n != 0 {
+            format!(
+                " ({kind} {:#x}, mem base={:#x} abase={:#x} size={:#x} state={:#x} prot={:#x} aprot={:#x} type={:#x})",
+                p[1],
+                mbi.BaseAddress as usize,
+                mbi.AllocationBase as usize,
+                mbi.RegionSize,
+                mbi.State,
+                mbi.Protect,
+                mbi.AllocationProtect,
+                mbi.Type
+            )
+        } else {
+            format!(" ({kind} {:#x})", p[1])
+        }
     } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
         // SAFETY: a live MSVC throw.
         format!(" (C++ {} thrown)", unsafe { thrown(&p) })

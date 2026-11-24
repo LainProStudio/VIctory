@@ -10,24 +10,30 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, EXCEPTION_ACCESS_VIOLATION, HANDLE,
+    INVALID_HANDLE_VALUE, NTSTATUS,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_MAPPED,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2,
+    VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
     PROCESS_MEMORY_COUNTERS,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
 use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
@@ -67,6 +73,8 @@ const GRAPHICS: u64 = 3;
 const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
+/// Coalesces adjacent split placeholders back into one (not in windows-sys' memory module).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
@@ -691,10 +699,17 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
+    // SAFETY: coalesces adjacent placeholders if split, splits the placeholder
+    // around the range (failing harmlessly when the range is the whole
+    // placeholder), then maps the section there; all act only on placeholders.
     let view = unsafe {
+        if len > PAGE {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+            );
+        }
         VirtualFree(
             base as *mut c_void,
             len,
@@ -713,6 +728,18 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         )
     };
     if view.Value as usize != base {
+        if len > PAGE {
+            for k in (0..len).step_by(PAGE) {
+                let page_slice = Slice {
+                    section: slice.section.clone(),
+                    index: slice.index + k / PAGE,
+                };
+                if !map(physical, base + k, PAGE, page_slice) {
+                    return false;
+                }
+            }
+            return true;
+        }
         tracing::warn!(
             address = format_args!("{base:#x}"),
             len,
@@ -778,6 +805,61 @@ fn commit_limit_message(
     message
 }
 
+/// Non-zero while `unmap` is splitting a coalesced view and temporarily has its
+/// untouched neighbours unmapped; concurrent threads hitting those placeholders
+/// wait for `PHYSICAL` and retry once the neighbours are mapped again.
+static SPLITTING: AtomicUsize = AtomicUsize::new(0);
+static SPLITTER_TID: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn on_split_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // SAFETY: the system passes valid exception pointers.
+    let r = unsafe { &*(*info).ExceptionRecord };
+    if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let kind = r.ExceptionInformation[0];
+    if kind != 0 && kind != 1 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if SPLITTING.load(Ordering::Acquire) != 0 {
+        // SAFETY: plain query of the calling thread id.
+        if unsafe { GetCurrentThreadId() } == SPLITTER_TID.load(Ordering::Acquire) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // Wait until the active split finishes remapping the untouched ranges.
+        drop(physical());
+    }
+    let at = r.ExceptionInformation[1];
+    // SAFETY: plain data filled in by the query.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut mbi, size_of_val(&mbi)) };
+    if n != 0 && mbi.State == MEM_COMMIT && mbi.Type == MEM_MAPPED {
+        let ok = match kind {
+            0 => {
+                mbi.Protect
+                    & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)
+                    != 0
+            }
+            1 => mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0,
+            _ => false,
+        };
+        if ok {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+fn install_split_handler() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: registered once ahead of the crash reporter; inspects only
+    // access violations during view splits after serializing on `PHYSICAL`.
+    ONCE.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(on_split_fault));
+    });
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -799,6 +881,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
+        let splitting = at < base || at + size > end;
+        if splitting {
+            install_split_handler();
+            // SAFETY: plain query of the calling thread id.
+            SPLITTER_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+            SPLITTING.fetch_add(1, Ordering::SeqCst);
+        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -815,6 +904,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
+        }
+        let hole_start = base.max(at);
+        let hole_end = end.min(at + size);
+        victory_gpu::title_memory_remapped(hole_start, hole_end.saturating_sub(hole_start));
+        if splitting {
+            SPLITTER_TID.store(0, Ordering::Release);
+            SPLITTING.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -1188,5 +1284,71 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn concurrent_access_survives_view_split() {
+        use std::sync::atomic::AtomicBool;
+        let mut pages = [0usize; 3];
+        let mut n = 3;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let p0 = a as usize;
+        let p1 = p0 + PAGE;
+        let p2 = p0 + 2 * PAGE;
+
+        for round in 0..50u32 {
+            assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+            // SAFETY: all 3 pages are mapped read-write.
+            unsafe {
+                (p0 as *mut u32).write_volatile(0x1111_2222);
+                (p2 as *mut u32).write_volatile(0x3333_4444);
+            }
+            let started = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let started_w = started.clone();
+            let stop_w = stop.clone();
+            let worker = std::thread::spawn(move || {
+                let mut iters = 0u64;
+                while !stop_w.load(Ordering::Relaxed) {
+                    // SAFETY: outer pages stay mapped throughout middle-page split.
+                    unsafe {
+                        let v0 = (p0 as *const u32).read_volatile();
+                        assert_eq!(v0, 0x1111_2222);
+                        ((p0 + 4) as *mut u32).write_volatile(round ^ iters as u32);
+                        let v2 = (p2 as *const u32).read_volatile();
+                        assert_eq!(v2, 0x3333_4444);
+                        ((p2 + 4) as *mut u32).write_volatile(round ^ iters as u32);
+                    }
+                    if iters == 0 {
+                        started_w.store(true, Ordering::Release);
+                    }
+                    iters += 1;
+                }
+                iters
+            });
+            while !started.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // Forces a real split of the 3-page coalesced view into `[p0]` and `[p2]`.
+            assert_eq!(
+                XMemMapPhysicalPages(p1 as *mut c_void, 1, std::ptr::null()),
+                p1 as *mut c_void
+            );
+            stop.store(true, Ordering::Release);
+            let iters = worker.join().expect("worker must survive view split");
+            assert!(iters > 0);
+            assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        }
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(a, 0, MEM_RELEASE) }, 0);
     }
 }

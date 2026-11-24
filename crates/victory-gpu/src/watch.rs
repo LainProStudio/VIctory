@@ -200,7 +200,13 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(&block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } == 0 {
+            tracing::warn!(
+                block = format_args!("{:#x}", block * BLOCK),
+                error = %std::io::Error::last_os_error(),
+                "watch::open VirtualProtect failed"
+            );
+        }
     }
     !blocks.is_empty()
 }
@@ -210,22 +216,20 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     open(&mut guards(), at, at + len);
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
+/// shows is new and read-write, so it is no longer guarded. Restores write
+/// access in case [`guard`] marked blocks read-only while the remap ran.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..(at + len).div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    if len == 0 {
+        return;
     }
+    open(&mut guards(), at, at + len);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -366,5 +370,43 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn remap_restores_write_access_after_guard() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of one block, mapped read-write.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + BLOCK).is_some());
+        assert!(!writable(view), "guard must make view read-only");
+        title_memory_remapped(view, BLOCK);
+        assert!(writable(view), "remap must restore PAGE_READWRITE");
+        assert!(!guards().protected.contains(&(view / BLOCK)));
+        // SAFETY: writable again after remap; write must succeed without faulting.
+        unsafe {
+            (view as *mut u8).write_volatile(0x42);
+            assert_eq!((view as *const u8).read_volatile(), 0x42);
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            CloseHandle(section);
+        }
     }
 }
