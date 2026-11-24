@@ -3869,6 +3869,19 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// GFX10 puts an inline f16 constant in the low half of the operand.
+    fn f16_operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
+        match *op {
+            Operand::Const(c @ 240..=248) => {
+                let h = [
+                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+                ][usize::from(c - 240)];
+                Ok(self.s.m.i32(h))
+            }
+            _ => self.operand(inst, op),
+        }
+    }
+
     fn as_float(&mut self, x: V) -> V {
         self.s.m.cast(self.cur, Cast::Bitcast, x, self.s.t.f32)
     }
@@ -7612,7 +7625,7 @@ impl<'a> Lower<'a> {
                         // VOP3P picks each half with op_sel/op_sel_hi; VOP2
                         // takes the low half for the low product.
                         let h = if packed {
-                            self.packed_src(inst, k, high)?
+                            self.packed_src(inst, k, high, true)?
                         } else {
                             let x = s(self, k)?;
                             let x = if high {
@@ -8165,15 +8178,9 @@ impl<'a> Lower<'a> {
                 _ => return Err("a byte select on a 16-bit operation"),
             }
         }
-        let x = match (op, self.src0) {
-            (_, Some(x)) if k == 0 => x,
-            (Operand::Const(c @ 240..=248), _) => {
-                let h = [
-                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                ][usize::from(c - 240)];
-                self.s.m.i32(h)
-            }
-            _ => self.operand(inst, &op)?,
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => self.f16_operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if high {
@@ -8504,22 +8511,18 @@ impl<'a> Lower<'a> {
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
     /// 16 bits: op_sel picks the half the low result reads, op_sel_hi the
-    /// half the high result reads. Inline float constants are f16 values.
-    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
+    /// half the high result reads. Packed integer instructions see the f32
+    /// bits of an inline float constant.
+    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool, float: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
-        let x = match op {
-            Operand::Const(c @ 240..=248) => {
-                let h = [
-                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                ][usize::from(c - 240)];
-                // shortcut: taken to fill both halves.
-                self.s.m.i32(h | h << 16)
-            }
-            _ => self.operand(inst, &op)?,
+        let x = if float {
+            self.f16_operand(inst, &op)?
+        } else {
+            self.operand(inst, &op)?
         };
         let c = self.cur;
         let x = if sel {
@@ -8555,7 +8558,7 @@ impl<'a> Lower<'a> {
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = self.packed_src(inst, k, high)?;
+                let h = self.packed_src(inst, k, high, float)?;
                 if float {
                     let mut f = self
                         .s
@@ -10994,13 +10997,12 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
+        let pixel_done = self.s.pixel && e.done;
         let c = self.cur;
         if let Some(g) = guard
             && !mesh
+            && pixel_done
         {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
             let t = self.s.m.bool(true);
             let kill = self.s.m.bin(c, Bin::Xor, g, t);
             self.s
@@ -11134,7 +11136,9 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit output the stage data does not mark");
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
+        // Other conditional exports also run only for their enabled lanes;
+        // a pixel's final `done` export instead discards the other lanes.
+        let at = if mesh || !pixel_done {
             self.begin_guarded(guard)
         } else {
             None
