@@ -61,7 +61,7 @@ pub fn effective_wave64_mode() -> Wave64Mode {
 
 /// Serialization schema version for [`encode`] / [`decode`]. Bump whenever
 /// [`HostShader`]'s on-disk format changes.
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Opens a shader cache at `dir` (outside the repository), for offline AOT
 /// warming (`victory translate --write-cache`) or custom callers.
@@ -395,12 +395,26 @@ mod tests {
         HostShader {
             stage: HwStage::Ps,
             dxil: b"DXBC and the rest".to_vec(),
-            user_data: vec![UserData {
-                index: 8,
-                slot: 1,
-                root: RootType::Table,
-                dword: 0,
-            }],
+            user_data: vec![
+                UserData {
+                    index: 8,
+                    slot: 1,
+                    root: RootType::Table,
+                    dword: 0,
+                },
+                UserData {
+                    index: 9,
+                    slot: 0,
+                    root: RootType::ResourceHeap,
+                    dword: 0,
+                },
+                UserData {
+                    index: 10,
+                    slot: 0,
+                    root: RootType::SamplerHeap,
+                    dword: 0,
+                },
+            ],
             samplers: vec![[0x400, 0xc0_0000, 0x18f0_0000, 0]],
             static_samplers: vec![StaticSampler::from_words([
                 0x400,
