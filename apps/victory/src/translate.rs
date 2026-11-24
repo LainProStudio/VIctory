@@ -449,6 +449,17 @@ pub fn run(
     Ok(())
 }
 
+fn build_program(native: &NativeProgram) -> Result<ir::Program, ShaderError> {
+    // Match the root-argument spill convention in victory_shader::emit::translate_with.
+    let spilled = native.stage == HwStage::Cs
+        && !native.layout.is_empty()
+        && native
+            .layout
+            .iter()
+            .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
+    ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)
+}
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -486,7 +497,7 @@ fn translate(
     let container_bytes = &bytes[..container.total_size];
     for (program_index, p) in programs.into_iter().enumerate() {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+        match build_program(&p) {
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
@@ -841,4 +852,65 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_shader::RootParam;
+    use victory_shader::native::{ComputeIo, StageIo};
+
+    fn track_compute_load(root: RootType, user_data: u8, sgprs: u32) -> resource::Resources {
+        // s_load_dwordx4 s[8:11], s[0:1], 0; s_endpgm
+        let words = [0xF408_0200u32, 0xFA00_0000, 0xBF81_0000];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![RootParam {
+                root,
+                user_data,
+                sgprs,
+                table_offset_dwords: 0,
+                base_register: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [64, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let program = build_program(&native).unwrap();
+        resource::track(&program, &native.layout, native.stage).unwrap()
+    }
+
+    #[test]
+    fn compute_spill_load_tracks_four_root_constants() {
+        let resources = track_compute_load(RootType::Constants, 16, 4);
+        assert!(resources.scalar.is_empty());
+        let dwords: Vec<_> = resources
+            .params
+            .iter()
+            .map(|&(_, param, word)| (param, word))
+            .collect();
+        assert_eq!(dwords, [(0, 0), (0, 1), (0, 2), (0, 3)]);
+    }
+
+    #[test]
+    fn compute_direct_load_tracks_the_root_descriptor() {
+        let resources = track_compute_load(RootType::Descriptor, 0, 2);
+        let [(_, address)] = resources.scalar.as_slice() else {
+            panic!("expected one root descriptor load")
+        };
+        assert_eq!(
+            *address,
+            resource::Address {
+                param: 0,
+                offset: 0,
+                dynamic: None
+            }
+        );
+    }
 }
