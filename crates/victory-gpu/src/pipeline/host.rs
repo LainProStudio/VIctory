@@ -1043,11 +1043,9 @@ mod tests {
                 .expect("host CreateRootSignature with deduplicated CBV/SRV/UAV root views");
         }
     }
-=======
+
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
-
-    use super::*;
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
@@ -1113,13 +1111,22 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        let ms_stream = || MeshStream {
+            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(&ms)),
+            topology: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ),
+        };
+        let depth = || Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth);
+        stream_pipeline(&host.device, &root, ms_stream(), code(&ps), &g, depth(), &name)
+            .expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        stream_pipeline(&host.device, &root, ms_stream(), code(&ps), &g, depth(), &name)
+            .expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
     }
->>>>>>> f77bd28 (GPU: mesh pipelines load from the pipeline library (name their topology))
 }
