@@ -276,6 +276,62 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn fast_copy_copies_mapped_memory_and_recovers_on_unmapped_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let p = crate::watch::PAGE;
+        // SAFETY: Reserves a fresh 2-page region freed at the end of the test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * p, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: Commits only the first page inside the reserved 2-page region.
+        let page0 = unsafe { VirtualAlloc(base, p, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(page0, base);
+        // SAFETY: Page 0 is committed read-write for `p` bytes.
+        unsafe {
+            let src = base.cast::<u8>();
+            src.write_bytes(0x5A, p);
+            *src = 0x12;
+            *src.add(p - 1) = 0x9E;
+        }
+
+        let mut dst = vec![0u8; p];
+        assert!(super::fast_copy::try_fast_copy(
+            dst.as_mut_ptr(),
+            base.cast::<u8>().cast_const(),
+            p,
+        ));
+        assert_eq!(dst[0], 0x12);
+        assert!(dst[1..p - 1].iter().all(|&b| b == 0x5A));
+        assert_eq!(dst[p - 1], 0x9E);
+
+        let mut two_pages = vec![0xFFu8; 2 * p];
+        assert!(!super::fast_copy::try_fast_copy(
+            two_pages.as_mut_ptr(),
+            base.cast::<u8>().cast_const(),
+            2 * p,
+        ));
+        super::copy_mapped(two_pages.as_mut_ptr(), base.cast::<u8>().cast_const(), 2 * p, false);
+        assert_eq!(two_pages[0], 0x12);
+        assert!(two_pages[1..p - 1].iter().all(|&b| b == 0x5A));
+        assert_eq!(two_pages[p - 1], 0x9E);
+        assert!(two_pages[p..2 * p].iter().all(|&b| b == 0));
+
+        let mut overlap: Vec<u8> = (0u8..64).collect();
+        // SAFETY: Both pointers stay well inside `overlap`'s 64-byte allocation.
+        let overlap_dst = unsafe { overlap.as_mut_ptr().add(8) };
+        let overlap_src = overlap.as_ptr();
+        assert!(!super::fast_copy::can_fast_copy(overlap_dst, overlap_src, 32));
+        super::copy_mapped(overlap_dst, overlap_src, 32, false);
+        let expected: Vec<u8> = (0u8..32).collect();
+        assert_eq!(&overlap[8..40], expected.as_slice());
+
+        // SAFETY: Frees the 2-page reserved region allocated above.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -1283,15 +1339,137 @@ impl Batch {
     }
 }
 
+mod fast_copy {
+    pub(super) fn can_fast_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let d = dst as usize;
+        let s = src as usize;
+        d.saturating_add(len) <= s || s.saturating_add(len) <= d
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    mod imp {
+        use std::sync::Once;
+
+        use windows_sys::Win32::Foundation::{
+            EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, STATUS_GUARD_PAGE_VIOLATION,
+        };
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+            EXCEPTION_POINTERS,
+        };
+
+        core::arch::global_asm!(
+            ".text",
+            ".globl victory_try_copy",
+            ".globl victory_try_copy_start",
+            ".globl victory_try_copy_end",
+            ".globl victory_try_copy_fault",
+            "victory_try_copy:",
+            "    push rdi",
+            "    push rsi",
+            "    mov rdi, rcx",
+            "    mov rsi, rdx",
+            "    mov rcx, r8",
+            "    cld",
+            "victory_try_copy_start:",
+            "    rep movsb",
+            "victory_try_copy_end:",
+            "    mov eax, 1",
+            "    pop rsi",
+            "    pop rdi",
+            "    ret",
+            "victory_try_copy_fault:",
+            "    xor eax, eax",
+            "    pop rsi",
+            "    pop rdi",
+            "    ret",
+        );
+
+        // SAFETY: Symbols defined in `global_asm!` above using the Win64 ABI.
+        unsafe extern "C" {
+            fn victory_try_copy(dst: *mut u8, src: *const u8, len: usize) -> u8;
+            static victory_try_copy_start: u8;
+            static victory_try_copy_end: u8;
+            static victory_try_copy_fault: u8;
+        }
+
+        static INSTALL_VEH: Once = Once::new();
+
+        /// Vectored exception handler installed first (`first = 1`) so faults inside
+        /// `victory_try_copy_start..victory_try_copy_end` bounce to `victory_try_copy_fault`
+        /// before reaching title or crash-reporting handlers.
+        // SAFETY: Invoked by Windows exception dispatch with valid pointers when non-null.
+        unsafe extern "system" fn on_copy_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+            if info.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            // SAFETY: Non-null `EXCEPTION_POINTERS` passed by the OS dispatcher.
+            let (record, context) = unsafe { ((*info).ExceptionRecord, (*info).ContextRecord) };
+            if record.is_null() || context.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            // SAFETY: Non-null `EXCEPTION_RECORD` passed by the OS dispatcher.
+            let code = unsafe { (*record).ExceptionCode };
+            if code != EXCEPTION_ACCESS_VIOLATION
+                && code != EXCEPTION_IN_PAGE_ERROR
+                && code != STATUS_GUARD_PAGE_VIOLATION
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            // SAFETY: Non-null `CONTEXT` passed by the OS dispatcher.
+            let rip = unsafe { (*context).Rip as usize };
+            let start = &raw const victory_try_copy_start as usize;
+            let end = &raw const victory_try_copy_end as usize;
+            if rip >= start && rip < end {
+                let fault = &raw const victory_try_copy_fault as u64;
+                // SAFETY: Redirecting `Rip` to `victory_try_copy_fault` keeps the saved `rdi`/`rsi`
+                // stack frame intact and returns `0` cleanly.
+                unsafe { (*context).Rip = fault };
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            EXCEPTION_CONTINUE_SEARCH
+        }
+
+        pub fn try_fast_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+            if len == 0 {
+                return true;
+            }
+            if !super::can_fast_copy(dst, src, len) {
+                return false;
+            }
+            INSTALL_VEH.call_once(|| {
+                // SAFETY: Registers a first-chance handler that only intercepts faults inside `victory_try_copy`.
+                unsafe {
+                    AddVectoredExceptionHandler(1, Some(on_copy_fault));
+                }
+            });
+            // SAFETY: Faults on unmapped/guarded pages inside `[victory_try_copy_start..end)`
+            // are redirected to `victory_try_copy_fault` and return `0`.
+            unsafe { victory_try_copy(dst, src, len) != 0 }
+        }
+    }
+
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    mod imp {
+        pub fn try_fast_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+            super::super::read(src, dst, len)
+        }
+    }
+
+    pub(super) use imp::try_fast_copy;
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
 /// destination (`title_dst`) that is not all mapped is left alone.
 ///
-/// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// Uses a VEH-guarded `rep movsb` (`fast_copy::try_fast_copy`) when non-overlapping
+/// and falls back to `ReadProcessMemory` page-by-page only if an unmapped or guarded
+/// page is encountered.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -1312,7 +1490,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = if fast_copy::can_fast_copy(dst, src, len) {
+        fast_copy::try_fast_copy(dst, src, len)
+    } else {
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -1341,7 +1523,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    if dst.is_empty() {
+        return true;
+    }
+    if fast_copy::can_fast_copy(dst.as_mut_ptr(), src, dst.len()) {
+        fast_copy::try_fast_copy(dst.as_mut_ptr(), src, dst.len())
+    } else {
+        read(src, dst.as_mut_ptr(), dst.len())
+    }
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
