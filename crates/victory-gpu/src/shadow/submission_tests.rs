@@ -7,9 +7,8 @@ fn repeated_gpu_writes_keep_their_first_copy_back_order() {
     let start = title.as_mut_ptr() as usize;
     let make_shadow = || {
         let len = title.len() as u64;
-        let (buffer, data) = host.shared_buffer(len).unwrap();
-        // These lists have no GPU commands. The deferred work below writes the mapped bytes.
-        Arc::new(Shadow::new(buffer, data, 0, start as u64, len))
+        let buffer = host.default_buffer(len).unwrap();
+        Arc::new(Shadow::new(buffer, 0, start as u64, len))
     };
     let a = make_shadow();
     let b = make_shadow();
@@ -21,6 +20,9 @@ fn repeated_gpu_writes_keep_their_first_copy_back_order() {
     first.defer_gpu_write(&a, start, 1);
     first.close();
 
+    let (up_a, ptr_a) = host.upload_buffer(1).unwrap();
+    let (up_b, ptr_b) = host.upload_buffer(1).unwrap();
+
     let second = host.new_list().unwrap();
     second.defer_gpu_write(&b, start, 2);
     second.defer(move || {
@@ -29,26 +31,29 @@ fn repeated_gpu_writes_keep_their_first_copy_back_order() {
     });
     second.defer_refresh(&a, start + 2, 1);
     second.defer_gpu_write(&a, start, 2);
+    let a_check = a.clone();
+    let b_check = b.clone();
     second.defer_host(move || {
         assert_eq!(
-            *a.pending.lock().unwrap(),
+            *a_check.pending.lock().unwrap(),
             [(start, start + 2), (start, start + 1)]
         );
-        assert_eq!(*b.pending.lock().unwrap(), [(start, start + 2)]);
-        // SAFETY: both shadows own three mapped bytes, used by this submitting thread.
-        unsafe {
-            assert_eq!(
-                a.data.add(2).read(),
-                33,
-                "a duplicate must still flush refreshes"
-            );
-            a.data.write(a.data.read() + 11);
-            b.data.write(b.data.read() + 22);
-        }
+        assert_eq!(*b_check.pending.lock().unwrap(), [(start, start + 2)]);
     });
+    // Record GPU writes to byte 0 of `a` (+11) and `b` (+22) via CopyBufferRegion.
+    // SAFETY: open list and live buffers.
+    unsafe {
+        second.list.CopyBufferRegion(&a.buffer, 0, &up_a, 0, 1);
+        second.list.CopyBufferRegion(&b.buffer, 0, &up_b, 0, 1);
+    }
     second.close();
 
-    for expected in [22, 44] {
+    for expected in [22u8, 44u8] {
+        // SAFETY: mapped 1-byte upload buffers.
+        unsafe {
+            ptr_a.write(expected - 11);
+            ptr_b.write(expected);
+        }
         host.execute(&[&first, &second]);
         assert_eq!(
             title,

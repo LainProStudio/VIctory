@@ -1019,11 +1019,13 @@ extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn heap_release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn heap_desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: `this` is a heap; the title passes room for a description.
         unsafe { out.write((*this.cast::<Heap>()).desc) };
     }
+    out
 }
 
 /// A resource's memory: its own, or a range of a heap it holds a reference
@@ -1692,13 +1694,28 @@ pub(crate) extern "system" fn create_at_address(
     )
 }
 
+#[cfg(windows)]
+struct PlacedEntry {
+    res: usize,
+}
+
+#[cfg(windows)]
+impl Drop for PlacedEntry {
+    fn drop(&mut self) {
+        resource_release(self.res as This);
+    }
+}
+
+#[cfg(windows)]
+type PlacedSlot = std::sync::Arc<std::sync::OnceLock<Option<PlacedEntry>>>;
+
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, streamed and interface textures), by
 /// address and description: a resource at that address and where its
 /// footprint ends, made the first time a draw reads one and evicted when
 /// [`crate::watch::title_memory_remapped`] unmaps or remaps the range.
 #[cfg(windows)]
-type PlacedTextureMap = std::collections::BTreeMap<(u64, [u32; 14]), (usize, u64)>;
+type PlacedTextureMap = std::collections::BTreeMap<(u64, [u32; 14]), (u64, PlacedSlot)>;
 
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<PlacedTextureMap> =
@@ -1724,6 +1741,8 @@ pub(crate) struct PlacedTexture(This, u64);
 // and thread-safe interior synchronization.
 #[cfg(windows)]
 unsafe impl Send for PlacedTexture {}
+// SAFETY: `PlacedTexture` holds a non-mutated `Resource` pointer and immutable size;
+// accesses to title memory and `Resource` refcounting are thread-safe.
 #[cfg(windows)]
 unsafe impl Sync for PlacedTexture {}
 
@@ -1755,45 +1774,54 @@ pub(crate) fn placed_texture_end(address: u64, desc: &[u32; 14]) -> u64 {
 }
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use without holding
+/// `PLACED_TEXTURES` across host texture creation.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<PlacedTexture> {
     if address == 0 {
         return None;
-    }
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(r, end)) = map.get(&(address, *desc)) {
-        object::add_ref(r as This);
-        return Some(PlacedTexture(r as This, end));
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
     }
-    let size = footprint(&d).map_or(1, |info| info.size.max(1));
-    let end = address.saturating_add(size);
-    let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
-    );
-    if made != S_OK {
-        return None;
-    }
-    if resource(out).host().is_none() {
-        drop(map);
-        resource_release(out);
-        return None;
-    }
-    map.insert((address, *desc), (out as usize, end));
-    object::add_ref(out);
-    Some(PlacedTexture(out, end))
+    let (end, slot) = {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((end, slot)) = map.get(&(address, *desc)) {
+            (*end, slot.clone())
+        } else {
+            let size = footprint(&d).map_or(1, |info| info.size.max(1));
+            let end = address.saturating_add(size);
+            let slot = std::sync::Arc::new(std::sync::OnceLock::new());
+            map.insert((address, *desc), (end, slot.clone()));
+            (end, slot)
+        }
+    };
+    let entry = slot
+        .get_or_init(|| {
+            let mut out = std::ptr::null();
+            let made = create_at_address(
+                std::ptr::null(),
+                address,
+                &d,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            if made != S_OK {
+                return None;
+            }
+            if resource(out).host().is_none() {
+                resource_release(out);
+                return None;
+            }
+            Some(PlacedEntry { res: out as usize })
+        })
+        .as_ref()?;
+    object::add_ref(entry.res as This);
+    Some(PlacedTexture(entry.res as This, end))
 }
 
 /// Releases placed textures whose backing range overlaps `[start, end)`.
@@ -1805,19 +1833,17 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
     let mut evicted = Vec::new();
     {
         let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|&(addr, _), &mut (res, tex_end)| {
-            let overlaps = addr < end && tex_end > start;
+        map.retain(|&(addr, _), (tex_end, slot)| {
+            let overlaps = addr < end && *tex_end > start;
             if overlaps {
-                evicted.push(res);
+                evicted.push(slot.clone());
             }
             !overlaps
         });
     }
     if !evicted.is_empty() {
         PLACED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
-        for res in evicted {
-            resource_release(res as This);
-        }
+        drop(evicted);
     }
 }
 
@@ -1826,7 +1852,8 @@ pub(crate) fn has_placed_texture(address: u64, desc: &[u32; 14]) -> bool {
     PLACED_TEXTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&(address, *desc))
+        .get(&(address, *desc))
+        .is_some_and(|(_, slot)| slot.get().is_some_and(Option::is_some))
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1898,11 +1925,18 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`,
+/// and expands `mip_levels == 0` on textures to the allocated mip count.
+extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
+        let mut desc = resource(this).desc;
+        if desc.dimension != BUFFER && desc.mip_levels == 0 {
+            desc.mip_levels = mip_count(&desc) as u16;
+        }
         // SAFETY: checked non-null; the title passes room for a description.
-        unsafe { out.write(resource(this).desc) };
+        unsafe { out.write(desc) };
     }
+    out
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
 /// hidden first argument: what a standard heap type is as a custom heap.
@@ -2105,9 +2139,12 @@ mod tests {
         let memory = unsafe { &(*heap.cast::<Heap>()).memory };
         assert_eq!(memory.ptr.as_ptr() as u64 % KIB_64, 0);
         let mut back = std::mem::MaybeUninit::<HeapDesc>::uninit();
-        slot::<extern "system" fn(This, *mut HeapDesc)>(heap, 0x40)(heap, back.as_mut_ptr());
+        type GetDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_desc = slot::<GetDesc>(heap, 0x40);
+        assert_eq!(get_desc(heap, back.as_mut_ptr()), back.as_mut_ptr());
         // SAFETY: written above.
         assert_eq!(unsafe { back.assume_init() }.size, 1 << 20);
+        assert!(get_desc(heap, std::ptr::null_mut()).is_null());
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
 
         let bad = HeapDesc {
@@ -2879,6 +2916,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             &mut committed,
         );
         assert_eq!(hr, S_OK);
+        let mut back = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut ResourceDesc) -> *mut ResourceDesc;
+        let get_desc = slot::<GetDesc>(committed, 0x50);
+        assert_eq!(get_desc(committed, back.as_mut_ptr()), back.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { back.assume_init() };
+        assert_eq!((read.dimension, read.width), (BUFFER, 256));
+        assert!(get_desc(committed, std::ptr::null_mut()).is_null());
         let mut data = std::ptr::null_mut();
         assert_eq!(
             slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
@@ -2921,6 +2966,30 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+
+        // Textures created with `mip_levels = 0` report their expanded mip count.
+        let mut tex = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &texture(256, 256, 28, 0),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut tex,
+            ),
+            S_OK
+        );
+        let mut tex_back = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+        assert_eq!(
+            slot::<GetDesc>(tex, 0x50)(tex, tex_back.as_mut_ptr()),
+            tex_back.as_mut_ptr()
+        );
+        // SAFETY: written above.
+        assert_eq!(unsafe { tex_back.assume_init() }.mip_levels, 9);
+        assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
     }
 
     #[test]

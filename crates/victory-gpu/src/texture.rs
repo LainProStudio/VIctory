@@ -61,21 +61,42 @@ struct Last {
     asked: u64,
 }
 
-/// Room to read a watched or hashed texture's memory into, shared by all
-/// textures (a buffer each would hold the sum of their sizes for good). Kept,
-/// already touched, so refreshing does not fault its pages in again.
-static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-/// Shared intermediate detiling buffer across all textures (shrunk back to
-/// `MAX_SCRATCH` after one-off giant textures so RAM stays bounded).
-static LINEAR_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Scratch `(read, linear)` buffer pairs kept for reuse across worker threads
+/// (already touched, so refreshing does not fault their pages in again).
+static SCRATCH_POOL: Mutex<Vec<(Vec<u8>, Vec<u8>)>> = Mutex::new(Vec::new());
 
 const MAX_SCRATCH: usize = 64 << 20;
+const MAX_POOLED_SCRATCH: usize = 8;
+const MAX_POOLED_SCRATCH_BYTES: usize = 256 << 20;
 
 fn shrink_scratch(buf: &mut Vec<u8>) {
     if buf.capacity() > MAX_SCRATCH {
         buf.clear();
         buf.shrink_to(MAX_SCRATCH);
     }
+}
+
+fn take_scratch() -> (Vec<u8>, Vec<u8>) {
+    SCRATCH_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop()
+        .unwrap_or_default()
+}
+
+fn return_scratch(mut read: Vec<u8>, mut linear: Vec<u8>) {
+    shrink_scratch(&mut read);
+    shrink_scratch(&mut linear);
+    let mut pool = SCRATCH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.push((read, linear));
+    pool.sort_by_key(|(r, l)| std::cmp::Reverse(r.capacity() + l.capacity()));
+    let mut kept = 0usize;
+    let mut n = 0usize;
+    pool.retain(|(r, l)| {
+        n += 1;
+        kept += r.capacity() + l.capacity();
+        n <= MAX_POOLED_SCRATCH && (n == 1 || kept <= MAX_POOLED_SCRATCH_BYTES)
+    });
 }
 
 /// Submission-lifetime upload buffer ring shared across all dirty textures in a
@@ -252,90 +273,122 @@ impl Staging {
         host: &crate::host::Host,
         pool: &mut UploadPool,
     ) -> Option<(ID3D12Resource, u64)> {
-        self.refresh_with_watch(host, pool, None)
+        let watch_now = match self.check_watch_clean(None) {
+            Some(None) => return None,
+            Some(Some(now)) => Some(now),
+            None => None,
+        };
+        let (mut read, mut linear) = take_scratch();
+        let mut packed = Vec::new();
+        let pool_mutex = Mutex::new(pool);
+        let res = self.refresh_prepared(
+            host,
+            &pool_mutex,
+            watch_now,
+            &mut read,
+            &mut linear,
+            &mut packed,
+        );
+        return_scratch(read, linear);
+        res
     }
 
-    /// As [`Staging::refresh`], reusing a pre-fetched write-watch answer when provided.
-    pub(crate) fn refresh_with_watch(
+    /// Checks write-watch status on the calling (preparing) thread so `Sweep`
+    /// applies. Returns:
+    /// - `Some(None)` if watched and clean (skip refresh completely);
+    /// - `Some(Some(now))` if watched and dirty (needs read + detile at epoch `now`);
+    /// - `None` if not watched or `hash_textures()` is enabled (needs read + blake3 hash).
+    pub(crate) fn check_watch_clean(
         &self,
-        host: &crate::host::Host,
-        pool: &mut UploadPool,
         prefetched: Option<(u64, &[(usize, u64)])>,
-    ) -> Option<(ID3D12Resource, u64)> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
-        let (read, uploaded) = self.refresh_now(host, pool, prefetched);
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
-        uploaded
-    }
-
-    /// Returns `(bytes_read, Option<(upload_buffer, base_offset)>)`.
-    fn refresh_now(
-        &self,
-        host: &crate::host::Host,
-        pool: &mut UploadPool,
-        prefetched: Option<(u64, &[(usize, u64)])>,
-    ) -> (usize, Option<(ID3D12Resource, u64)>) {
+    ) -> Option<Option<u64>> {
         use std::sync::atomic::Ordering;
+        if hash_textures() {
+            return None;
+        }
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        let watched_answer = if let (false, Some((now, all_written))) = (hash_textures(), prefetched)
-        {
+        let watched_answer = if let Some((now, all_written)) = prefetched {
             let first = start / crate::watch::PAGE;
             let last_page = (start + size).div_ceil(crate::watch::PAGE);
             let lo = all_written.partition_point(|&(p, _)| p < first);
             let hi = all_written.partition_point(|&(p, _)| p < last_page);
             Some((now, std::borrow::Cow::Borrowed(&all_written[lo..hi])))
         } else {
-            crate::watch::writes(start, start + size, !hash_textures())
+            crate::watch::writes(start, start + size, true)
                 .map(|(now, v)| (now, std::borrow::Cow::Owned(v)))
         };
-        if let Some((now, written)) = watched_answer {
-            // Lock-free clean fast path: if our last detiled watch epoch already
-            // covers every write in this texture's pages, skip the mutex.
-            let asked = self.last_asked.load(Ordering::Acquire);
-            if asked != 0 && written.iter().all(|&(_, w)| w <= asked) {
-                return (0, None);
-            }
+        let (now, written) = watched_answer?;
+        // Lock-free clean fast path: if our last detiled watch epoch already
+        // covers every write in this texture's pages, skip the mutex.
+        let asked = self.last_asked.load(Ordering::Acquire);
+        if asked != 0 && written.iter().all(|&(_, w)| w <= asked) {
+            return Some(None);
+        }
+        let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            self.last_asked.store(last.asked, Ordering::Release);
+            return Some(None);
+        }
+        Some(Some(now))
+    }
+
+    /// Refreshes a single dirty or hashed texture into `pool` using caller-owned
+    /// scratch buffers (safe to run concurrently across distinct textures).
+    pub(crate) fn refresh_prepared(
+        &self,
+        host: &crate::host::Host,
+        pool: &Mutex<&mut UploadPool>,
+        watch_now: Option<u64>,
+        read: &mut Vec<u8>,
+        linear: &mut Vec<u8>,
+        packed: &mut Vec<u8>,
+    ) -> Option<(ID3D12Resource, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let started = std::time::Instant::now();
+        let (bytes_read, uploaded) =
+            self.refresh_prepared_inner(host, pool, watch_now, read, linear, packed);
+        let preparing = &crate::host::PREPARING;
+        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        preparing[3].fetch_add(bytes_read as u64, Relaxed);
+        uploaded
+    }
+
+    fn refresh_prepared_inner(
+        &self,
+        host: &crate::host::Host,
+        pool: &Mutex<&mut UploadPool>,
+        watch_now: Option<u64>,
+        read: &mut Vec<u8>,
+        linear: &mut Vec<u8>,
+        packed: &mut Vec<u8>,
+    ) -> (usize, Option<(ID3D12Resource, u64)>) {
+        use std::sync::atomic::Ordering;
+        let size = self.layout.size as usize;
+        if let Some(now) = watch_now {
             let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                self.last_asked.store(last.asked, Ordering::Release);
-                return (0, None);
-            }
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            let mut read = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(extra) = size.checked_sub(read.len())
                 && read.try_reserve_exact(extra).is_err()
             {
                 once!(bytes = size, "no room to read a texture's memory; not uploaded");
                 return (0, None);
             }
-            let Some((upload_buf, upload_ptr, base_offset)) = pool.alloc(host, self.total) else {
+            let Some((upload_buf, upload_ptr, base_offset)) =
+                pool.lock().unwrap_or_else(|e| e.into_inner()).alloc(host, self.total)
+            else {
                 return (0, None);
             };
             last.asked = now;
             self.last_asked.store(now, Ordering::Release);
             read.resize(size, 0);
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-            {
-                let mut linear = LINEAR_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
-                self.detile(&read, &mut linear, upload_ptr);
-                shrink_scratch(&mut linear);
-            }
-            shrink_scratch(&mut read);
+            self.detile(read, linear, packed, upload_ptr);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, Some((upload_buf, base_offset)));
         }
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        // Copy the whole texture out first: asking `committed` (VirtualQuery
-        // per region) is slow, especially under Wine, while the read fails by
-        // itself if any page is not committed.
-        let mut read = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(extra) = size.checked_sub(read.len())
             && read.try_reserve_exact(extra).is_err()
         {
@@ -343,7 +396,7 @@ impl Staging {
             return (0, None);
         }
         read.resize(size, 0);
-        if !crate::host::read_into(self.memory, &mut read) {
+        if !crate::host::read_into(self.memory, read) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -351,27 +404,21 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
-            shrink_scratch(&mut read);
             return (0, None);
         }
-        let hash = blake3::hash(&read);
+        let hash = blake3::hash(read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            shrink_scratch(&mut read);
             return (size, None);
         }
-        let Some((upload_buf, upload_ptr, base_offset)) = pool.alloc(host, self.total) else {
-            shrink_scratch(&mut read);
+        let Some((upload_buf, upload_ptr, base_offset)) =
+            pool.lock().unwrap_or_else(|e| e.into_inner()).alloc(host, self.total)
+        else {
             return (size, None);
         };
         last.hash = Some(hash);
-        {
-            let mut linear = LINEAR_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
-            self.detile(&read, &mut linear, upload_ptr);
-            shrink_scratch(&mut linear);
-        }
-        shrink_scratch(&mut read);
+        self.detile(read, linear, packed, upload_ptr);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, Some((upload_buf, base_offset)))
@@ -422,7 +469,7 @@ impl Staging {
     /// inside an upload pool slice). The buffer is a mapped upload heap
     /// (write-combined), where scattered writes are slow, so each subresource is
     /// detiled into `linear` and copied in one sequential pass.
-    fn detile(&self, tiled: &[u8], linear: &mut Vec<u8>, dst: *mut u8) {
+    fn detile(&self, tiled: &[u8], linear: &mut Vec<u8>, packed: &mut Vec<u8>, dst: *mut u8) {
         #[cfg(feature = "diagnostics")]
         if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -431,7 +478,6 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        let mut packed = Vec::new();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
@@ -457,7 +503,7 @@ impl Staging {
                 rows as usize,
                 f.Depth as usize,
                 self.widened_from,
-                &mut packed,
+                packed,
             ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -473,6 +519,91 @@ impl Staging {
             };
         }
     }
+}
+
+struct SendUpload(usize, ID3D12Resource, u64);
+// SAFETY: `ID3D12Resource` is free-threaded; moved once back to the preparing thread.
+unsafe impl Send for SendUpload {}
+
+/// Reads, hashes (when unwatched), and detiles all `items` in parallel using a
+/// bounded worker pool (`available_parallelism.min(8)`). Each item must refer
+/// to a distinct `Staging` instance.
+pub(crate) fn refresh_batch(
+    host: &crate::host::Host,
+    pool: &mut UploadPool,
+    items: Vec<(usize, Arc<Staging>, Option<u64>)>,
+) -> Vec<(usize, ID3D12Resource, u64)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    if items.len() == 1 {
+        let (idx, staging, watch_now) = &items[0];
+        let (mut read, mut linear) = take_scratch();
+        let mut packed = Vec::new();
+        let pool_mutex = Mutex::new(pool);
+        let res = staging
+            .refresh_prepared(
+                host,
+                &pool_mutex,
+                *watch_now,
+                &mut read,
+                &mut linear,
+                &mut packed,
+            )
+            .map(|(buf, off)| (*idx, buf, off))
+            .into_iter()
+            .collect();
+        return_scratch(read, linear);
+        return res;
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8)
+        .min(items.len())
+        .max(1);
+    let pool_mutex = Mutex::new(pool);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<Vec<SendUpload>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let (mut read, mut linear) = take_scratch();
+                    let mut packed = Vec::new();
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= items.len() {
+                            break;
+                        }
+                        let (idx, ref staging, watch_now) = items[i];
+                        if let Some((buf, off)) = staging.refresh_prepared(
+                            host,
+                            &pool_mutex,
+                            watch_now,
+                            &mut read,
+                            &mut linear,
+                            &mut packed,
+                        ) {
+                            local.push(SendUpload(idx, buf, off));
+                        }
+                    }
+                    return_scratch(read, linear);
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    let mut out: Vec<(usize, ID3D12Resource, u64)> = results
+        .drain(..)
+        .flatten()
+        .map(|SendUpload(idx, buf, off)| (idx, buf, off))
+        .collect();
+    out.sort_unstable_by_key(|&(idx, _, _)| idx);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -530,12 +661,14 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
-/// The staging state of a title texture, made on first use.
+/// The staging state of a title texture, made on first use without holding
+/// `STAGING` across layout computation or footprint queries.
 pub(crate) fn staging_for(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
+    {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = map.as_ref().and_then(|m| m.get(&(resource as usize))) {
+            return Some(s.clone());
+        }
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -552,9 +685,13 @@ pub(crate) fn staging_for(resource: This, texture: &ID3D12Resource) -> Option<Ar
     }
     let host = host()?;
     let s = create_staging(host, resource, texture, layout, memory)?;
-    tracing::debug!(?desc, "texture contents queued for staging upload");
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    let entry = map.entry(resource as usize).or_insert_with(|| {
+        tracing::debug!(?desc, "texture contents queued for staging upload");
+        s
+    });
+    Some(entry.clone())
 }
 
 fn create_staging(
