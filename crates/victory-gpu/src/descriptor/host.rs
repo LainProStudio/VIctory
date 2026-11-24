@@ -2436,13 +2436,10 @@ impl HostHeap {
                     return Some(ResolvedSlot::Null { range: None });
                 }
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let end = crate::resource::placed_texture_end(address, resource);
-                let range = (address >= 0x10000).then_some((address, end));
-                if !valid_title_address_cached(committed, address, 1) {
-                    self.set_unmapped_null_into(index, view, retired);
-                    return Some(ResolvedSlot::Null { range });
-                }
-                if let Some(placed) = placed_texture(view)
+                let placed = valid_title_address_cached(committed, address, 1)
+                    .then(|| placed_texture(view))
+                    .flatten();
+                if let Some(placed) = &placed
                     && let View::Shader(tex_res, _) = placed.view
                     && let Some(copy) =
                         crate::resource::host_copy(tex_res as crate::object::This)
@@ -2474,6 +2471,9 @@ impl HostHeap {
                     })
                 } else {
                     self.set_unmapped_null_into(index, view, retired);
+                    let range = placed_remap_range(address, placed.as_ref().map(|p| p.end), || {
+                        crate::resource::placed_texture_end(address, resource)
+                    });
                     Some(ResolvedSlot::Null { range })
                 }
             }
@@ -2541,6 +2541,15 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// A failed view can become valid when any part of its backing is remapped.
+fn placed_remap_range(
+    address: u64,
+    known_end: Option<u64>,
+    footprint_end: impl FnOnce() -> u64,
+) -> Option<(u64, u64)> {
+    (address >= 0x10000).then(|| (address, known_end.unwrap_or_else(footprint_end)))
 }
 
 /// Per-call `VirtualQuery` region cache so querying hundreds of bindless slots
@@ -4791,6 +4800,28 @@ void main(uint3 id : SV_DispatchThreadID) {
         });
         crate::watch::title_memory_remapped(addr as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr, &desc));
+    }
+
+    #[test]
+    fn placed_remap_range_preserves_the_full_footprint_on_lookup_failure() {
+        let resource = [3, 0, 0, 0, 512, 0, 512, 0x0004_0001, 28, 1, 0, 0, 0, 0];
+        for base in [0x10000, u64::MAX - 0x10000] {
+            let end = crate::resource::placed_texture_end(base, &resource);
+            assert!(end > base + 1);
+            let cached = placed_remap_range(base, Some(end), || panic!("rebuilt known footprint"));
+            let missing = placed_remap_range(base, None, || {
+                crate::resource::placed_texture_end(base, &resource)
+            });
+            assert_eq!(cached, Some((base, end)));
+            assert_eq!(missing, cached);
+            let null = ResolvedSlot::Null { range: missing };
+            assert!(null.overlaps(&[(end - 1, end)]));
+            assert!(!null.overlaps(&[(base - 1, base)]));
+        }
+        assert_eq!(
+            placed_remap_range(0xffff, None, || panic!("untrackable address")),
+            None
+        );
     }
 
     #[test]
