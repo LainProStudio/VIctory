@@ -555,7 +555,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     let mut traced = HashSet::new();
     for leaf in r.descriptors.iter().flat_map(|d| d.source.leaves()) {
         let a = match *leaf {
-            resource::Source::Loaded { load, .. } => {
+            resource::Source::Loaded { load, .. } | resource::Source::Fetched { load, .. } => {
                 t.loaded += 1;
                 address(load)
             }
@@ -568,7 +568,9 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Phi { .. } => unreachable!("leaves are no phis"),
+            resource::Source::Phi { .. }
+            | resource::Source::Select { .. }
+            | resource::Source::Lanes { .. } => unreachable!("leaves are no choices"),
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.

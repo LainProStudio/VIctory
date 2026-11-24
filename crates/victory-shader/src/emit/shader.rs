@@ -19,6 +19,7 @@ pub const STRIDE_SPACE: u32 = 2;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const TILED_RESOURCES: u64 = 1 << 12;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const UAVS_64: u64 = 1 << 15;
     pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
@@ -86,6 +87,8 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Compute shader uses SM 6.6 implicit-derivative ops (`dx.valver` 1.8).
     pub cs_derivatives: bool,
+    /// Shader passes a level clamp to a sample op (validator 1.8 sets `TILED_RESOURCES`).
+    pub sample_clamp: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -141,6 +144,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             cs_derivatives: false,
+            sample_clamp: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -613,6 +617,9 @@ impl Shader {
         };
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
+        if self.cs_derivatives && self.sample_clamp {
+            self.flags |= flags::TILED_RESOURCES;
+        }
         let mut props = Vec::new();
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
@@ -700,6 +707,9 @@ impl Shader {
         }
         if self.flags & flags::UAVS_64 != 0 {
             features |= 0x8;
+        }
+        if self.flags & flags::TILED_RESOURCES != 0 {
+            features |= 0x100;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
