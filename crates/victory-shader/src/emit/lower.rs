@@ -447,7 +447,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -3334,6 +3334,7 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 Reg::S(n) => match io_inputs.get(&v) {
+                    Some(Input::GroupInfo) => self.group_info(v),
                     Some(&input) => self.input(input),
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
@@ -3356,6 +3357,37 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
         }
         Ok(())
+    }
+
+    /// The thread-group info SGPR (`COMPUTE_PGM_RSRC2.TG_SIZE_EN`): bits 5:0
+    /// hold the waves in the group, bit 31 marks the first wave and bits
+    /// 16:6 an ordered-append term (LLVM AMDGPUUsage, "Initial Kernel
+    /// Execution State"). Only the wave count is derived, so the value is
+    /// given only to programs that read nothing but bits 5:0 of it.
+    fn group_info(&mut self, v: Value) -> Val {
+        let low = |o: &Operand| match *o {
+            Operand::Literal(k) => Some(k),
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            _ => None,
+        };
+        let only_count = self.x.p.blocks.iter().flat_map(|b| &b.insts).all(|i| {
+            if !i.reads.iter().any(|r| r.1 == v) {
+                return true;
+            }
+            let Fields::Sop { src, .. } = &i.fields else {
+                return false;
+            };
+            match (i.name(), src.get(1).and_then(low)) {
+                ("s_and_b32", Some(mask)) => mask & !0x3F == 0,
+                ("s_bfe_u32", Some(k)) => (k & 31) + (k >> 16 & 0x7F) <= 6,
+                _ => false,
+            }
+        });
+        let Some([x, y, z]) = self.s.threads.filter(|_| only_count) else {
+            return Val::Missing("the thread-group info SGPR above the wave count");
+        };
+        let waves = (x * y * z).div_ceil(self.wave());
+        Val::I32(self.s.m.i32(waves))
     }
 
     fn input(&mut self, input: Input) -> Val {
@@ -6309,19 +6341,23 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    fn cbuffer_row(&mut self, h: V, row: V) -> V {
+        self.s.op(
+            self.cur,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        )
+    }
+
     /// The dword at a computed byte address of a constant buffer.
     fn cbuffer_dword(&mut self, h: V, a: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let ri = self.s.m.bin(c, Bin::LShr, a, four);
-        let r = self.s.op(
-            c,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[h, ri],
-        );
+        let r = self.cbuffer_row(h, ri);
         let two = self.s.m.i32(2);
         let three = self.s.m.i32(3);
         let comp = self.s.m.bin(c, Bin::LShr, a, two);
@@ -6516,7 +6552,7 @@ impl<'a> Lower<'a> {
                 // The element type is part of the key: one UAV read as float
                 // and used atomically needs two handles (an atomic on a float
                 // handle is invalid and crashed the NVIDIA compiler).
-                let key = (self.cur, *load, *first, sampler, props.0, props.1);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -9208,7 +9244,12 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let atomic = name.starts_with("image_atomic_");
+        // A typed view's element: four F32 (9) components, or for atomics one
+        // U32 (5), which they need: a host that takes the element type from
+        // the annotation (vkd3d-proton) otherwise makes float atomics.
+        let element = if atomic { 0x105 } else { 0x409 };
+        let props = (kind | if uav || atomic { 0x1000 } else { 0 }, element);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -9248,11 +9289,16 @@ impl<'a> Lower<'a> {
             };
             let width = if wide { 2 } else { 1 };
             let vals = self.vgprs(inst, data, if compare { 2 * width } else { width })?;
-            let (ty, component) = if wide {
-                self.s.flags |= flags::INT64 | flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64;
-                (self.s.m.int(64), 0x107) // one uint64_t in an R32G32_UINT view
+            // 64-bit atomics operate on an R32G32_UINT view; DXC tags the
+            // handle U32 (0x105), matching `props` above.
+            let ty = if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED;
+                if matches!(src, Source::Loaded { .. }) {
+                    self.s.flags |= flags::ATOMIC_INT64_HEAP;
+                }
+                self.s.m.int(64)
             } else {
-                (self.s.t.i32, 0x105)
+                self.s.t.i32
             };
             let original = if wide {
                 self.join64(vals[0], vals[1])
@@ -9265,7 +9311,7 @@ impl<'a> Lower<'a> {
             } else {
                 original
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, component))?;
+            let h = self.handle(site, src, false, props)?;
             let mut args = vec![h];
             let (intrinsic, opcode) = if compare {
                 let comparand = if wide {
@@ -10101,10 +10147,11 @@ impl<'a> Lower<'a> {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
         }
-        if !matches!(
+        let scalar_offset = !matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
+        );
+        if scalar_offset {
             let so = self.operand(inst, soffset)?;
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
@@ -10145,6 +10192,20 @@ impl<'a> Lower<'a> {
             if let Some((width, signed, half)) = sub_load {
                 let x = self.read_subword(byte, width, signed, |l, at| Ok(l.cbuffer_dword(h, at)))?;
                 self.write_subword_result(inst, reg, x, half, guard)?;
+                return Ok(());
+            }
+            let immediate = !*offen && !scalar_offset && base == 0 && extra.is_none();
+            let first = u32::from(*offset % 16) / 4;
+            if immediate && offset.is_multiple_of(4) && first + count <= 4 {
+                // The only variable address term is a whole-row index. The
+                // immediate dwords all lie in one row, even if the byte address wraps.
+                let shift = self.s.m.i32(4);
+                let ri = self.s.m.bin(c, Bin::LShr, byte, shift);
+                let row = self.cbuffer_row(h, ri);
+                for k in 0..count {
+                    let x = self.s.m.extract(c, row, first + k);
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
                 return Ok(());
             }
             for k in 0..count {

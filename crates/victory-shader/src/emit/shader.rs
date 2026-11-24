@@ -31,9 +31,8 @@ pub(crate) mod flags {
     pub const INT64: u64 = 1 << 20;
     /// DXIL 1.2 native 16-bit data types and buffer operations (SM 6.2+).
     pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
-    pub const ATOMIC_TYPED64: u64 = 1 << 27;
+    pub const ATOMIC_INT64_TYPED: u64 = 1 << 27;
     pub const ATOMIC_INT64_GROUP_SHARED: u64 = 1 << 28;
-    pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
     pub const ATOMIC_INT64_HEAP: u64 = 1 << 32;
@@ -747,7 +746,7 @@ impl Shader {
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= flags::FEATURE_SAMPLER_HEAP;
         }
-        if self.flags & flags::ATOMIC_TYPED64 != 0 {
+        if self.flags & flags::ATOMIC_INT64_TYPED != 0 {
             features |= 0x40_0000;
         }
         if self.flags & flags::ATOMIC_INT64_GROUP_SHARED != 0 {

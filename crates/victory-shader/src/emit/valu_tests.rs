@@ -91,6 +91,10 @@ fn build_valu_cs_with_store(body: &[u32], store: [u32; 2]) -> HostShader {
 }
 
 fn build_cs_with_store(body: &[u32], lds_blocks: u32, store: [u32; 2]) -> HostShader {
+    lower_cs_lds(&valu_cs_words(body, store), lds_blocks)
+}
+
+fn valu_cs_words(body: &[u32], store: [u32; 2]) -> Vec<u32> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -103,7 +107,14 @@ fn build_cs_with_store(body: &[u32], lds_blocks: u32, store: [u32; 2]) -> HostSh
     words.extend_from_slice(body);
     words.extend_from_slice(&store);
     words.push(S_ENDPGM);
-    lower_cs_lds(&words, lds_blocks)
+    words
+}
+
+/// [`build_valu_cs`] with the program's `COMPUTE_PGM_RSRC2` and thread counts
+/// given; the lowering error is returned.
+fn lower_valu_cs(body: &[u32], rsrc2: u32, threads: [u32; 3]) -> Result<HostShader, String> {
+    let words = valu_cs_words(body, buffer_store_dword(0, 8, 0));
+    lower_cs_cfg(&words, rsrc2, threads)
 }
 
 /// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
@@ -114,6 +125,10 @@ fn lower_cs(words: &[u32]) -> HostShader {
 }
 
 fn lower_cs_lds(words: &[u32], lds_blocks: u32) -> HostShader {
+    lower_cs_cfg(words, 5 << 1 | lds_blocks << 15, [1, 1, 1]).expect("lower")
+}
+
+fn lower_cs_cfg(words: &[u32], rsrc2: u32, threads: [u32; 3]) -> Result<HostShader, String> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -147,17 +162,18 @@ fn lower_cs_lds(words: &[u32], lds_blocks: u32) -> HostShader {
             user_data: 4,
             slot: 1,
         }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1 | lds_blocks << 15, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
-        }),
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
         code,
     };
 
-    lower_compute(&native)
+    try_lower_compute(&native)
 }
 
 fn lower_compute(native: &NativeProgram) -> HostShader {
+    try_lower_compute(native).expect("lower")
+}
+
+fn try_lower_compute(native: &NativeProgram) -> Result<HostShader, String> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
     let io = io::raise(&p, native).expect("io::raise");
@@ -174,7 +190,7 @@ fn lower_compute(native: &NativeProgram) -> HostShader {
         mesh_stride: 0,
         options: super::TranslateOptions::default(),
     })
-    .expect("lower");
+    .map_err(|e| format!("{e:?}"))?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -195,7 +211,7 @@ fn lower_compute(native: &NativeProgram) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
@@ -874,6 +890,164 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+}
+
+/// `s_and_b32 s7, s6, 63; v_mov_b32 v0, s7` on a program with 6 user SGPRs
+/// (s0..s5) and `TG_SIZE_EN`, which puts the thread-group info in s6.
+const TG_INFO_RSRC2: u32 = 6 << 1 | 1 << 10;
+
+#[test]
+fn thread_group_info_wave_count_matches_the_group() {
+    // (threads in X, waves of 32): the info SGPR holds the wave count in 5:0.
+    for (threads, waves) in [(1, 1), (32, 1), (33, 2), (64, 2), (96, 3), (256, 8)] {
+        let body = [sop2(0x0E, 7, 6, 128 + 63), vop1(0x001, 0, sgpr(7))];
+        let shader = lower_valu_cs(&body, TG_INFO_RSRC2, [threads, 1, 1]).expect("lower");
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, waves, "{backend}: {threads} threads");
+        });
+        // s_bfe_u32 s7, s6, (width 6 << 16 | offset 0): the same field.
+        let body = [sop2(0x27, 7, 6, 0xFF), 6 << 16, vop1(0x001, 0, sgpr(7))];
+        let shader = lower_valu_cs(&body, TG_INFO_RSRC2, [threads, 1, 1]).expect("lower");
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, waves, "{backend}: {threads} threads (bfe)");
+        });
+    }
+}
+
+#[test]
+fn thread_group_info_bits_above_the_wave_count_are_refused() {
+    // The wave id / ordered-append field is not derived.
+    let body = [sop2(0x0E, 7, 6, 128 + 63), vop1(0x001, 0, sgpr(6))];
+    assert!(lower_valu_cs(&body, TG_INFO_RSRC2, [64, 1, 1]).is_err());
+    // s_and_b32 with a wider mask (a literal: 0xFFFF).
+    let body = [sop2(0x0E, 7, 6, 0xFF), 0xFFFF, vop1(0x001, 0, sgpr(7))];
+    assert!(lower_valu_cs(&body, TG_INFO_RSRC2, [64, 1, 1]).is_err());
+}
+
+/// Indexed vector loads from a CBV, stored to a raw UAV for comparison with host data.
+fn build_indexed_cbv_cs(byte_offset: u16, dynamic: bool) -> HostShader {
+    let mut words = vec![s_mov_b32(1, 0x80), s_mov_b32(3, 0x80)];
+    words.extend(s_load_dwordx4(8, 0));
+    words.extend(s_load_dwordx4(12, 2));
+    // v0/v1 hold the input row and optional byte offset, v2 the output offset.
+    words.push(vop1(1, 1, sgpr(4)));
+    words.extend([
+        0x3404_0084,         // v_lshlrev_b32 v2, 4, v0
+        vop1(1, 3, sgpr(5)), // v_mov_b32 v3, s5; group ID
+        0x3406_0689,         // v_lshlrev_b32 v3, 9, v3; output group base
+        0x4a04_0503,         // v_add_nc_u32 v2, v3, v2
+        0xE038_2000 | (u32::from(dynamic) << 12) | u32::from(byte_offset),
+        0x8002_0400, // buffer_load_dwordx4 v[4:7], v0 or v[0:1], s[8:11]
+        0xE078_1000,
+        0x8003_0402, // buffer_store_dwordx4 v[4:7], v2, s[12:15], 0 offen
+        S_ENDPGM,
+    ]);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 2,
+            },
+        ],
+        used: [(ResourceType::Cbv, 0, 0), (ResourceType::Uav, 2, 1)]
+            .into_iter()
+            .map(|(kind, user_data, slot)| UsedResource {
+                kind,
+                user_data,
+                slot,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+            })
+            .collect(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1 | 1 << 7,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    lower_compute(&native)
+}
+
+#[test]
+fn indexed_cbv_loads_match_their_byte_addresses() {
+    let input: Vec<u32> = (0u32..192)
+        .map(|i| (i + 1).wrapping_mul(0x91de_2f71).rotate_left(i % 32))
+        .collect();
+    let variants = [(0, false), (16, false), (12, false), (0, true)]
+        .map(|(offset, dynamic)| (offset, dynamic, build_indexed_cbv_cs(offset, dynamic)));
+    let mut ran = false;
+
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        ran = true;
+        for (offset, dynamic, shader) in &variants {
+            let (root, pso) = host.compute_pipeline(shader).expect("compute pipeline");
+            let byte_offsets: &[u32] = if *dynamic { &[0, 4, 12, 16] } else { &[0] };
+            for &dynamic_offset in byte_offsets {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Table, 0) => 0,
+                        (RootType::Table, 1) => 32,
+                        (RootType::Constants, 2) => dynamic_offset,
+                        (root, _) => super::host::guard(root, 2, 0)
+                            .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, u.slot))),
+                    };
+                }
+                let actual = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::Cbv(&input), View::RawUav(256)],
+                            samplers: &[],
+                            groups: [2, 1, 1],
+                        },
+                    )
+                    .expect("compute dispatch");
+                let dword = (usize::from(*offset) + dynamic_offset as usize) / 4;
+                assert_eq!(actual[0].len(), 256);
+                for group in actual[0].as_chunks::<128>().0 {
+                    assert_eq!(
+                        group.as_slice(),
+                        &input[dword..dword + 128],
+                        "{label}: offset {dword}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(ran, "neither hardware nor WARP SM 6.6 device available");
 }
 
 /// `s_cselect_b32 s13, 1, 0`.
