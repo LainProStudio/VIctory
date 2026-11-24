@@ -103,6 +103,7 @@ mod valu_tests;
 mod wave;
 #[cfg(all(test, windows))]
 mod wave_tests;
+mod wave64_uniform;
 #[cfg(test)]
 mod wave64_tests;
 

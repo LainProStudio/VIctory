@@ -289,7 +289,46 @@ fn lds_overflow_fails_explicitly() {
 
 #[test]
 fn divergent_cross_half_ballot_is_rejected_instead_of_hanging() {
+    // A genuinely divergent loop containing `s_bcnt1` cannot safely place a
+    // group-wide `lds_barrier`, so both Wave32 and Emulate must reject it.
+    // v1 = v0; loop while (0 < v1) { s4 = bcnt1(10 > v1); v1 -= 1; }
+    let mut code = Vec::new();
+    code.push(v_mov_b32(1, vgpr(0)));
+    let loop_hdr = code.len();
+    code.push(v_cmp_gt_u32(inline_u(0), 1)); // Wait: `v_cmp_lt_u32(0, v1)`: 0 < v1
+    code.pop();
+    code.push(v_cmp_lt_u32(inline_u(0), 1));
+    code.push(s_and_saveexec_b64(6, VCC));
+    let br_exit = code.len();
+    code.push(0); // placeholder s_cbranch_execz -> after_loop
+    code.push(v_cmp_gt_u32(inline_u(10), 1)); // 10 > v1
+    code.push(s_bcnt1_i32_b64(4, VCC));
+    code.push(v_add_nc_u32(1, NEG_ONE, 1)); // v1 -= 1
+    let br_back = code.len();
+    let back_rel = (loop_hdr as i32 - (br_back as i32 + 1)) as i16;
+    code.push(sopp(0x02, back_rel)); // s_branch loop_hdr
+    let after_loop = code.len();
+    code[br_exit] = s_cbranch_execz((after_loop - (br_exit + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    code.push(v_mov_b32(1, 4));
+    emit_uav_store(&mut code, 1, 0);
+    code.push(S_ENDPGM);
+
+    let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+    assert!(emit_cs(&prog, Wave64Mode::Native).is_ok());
+    for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let err = emit_cs(&prog, mode).unwrap_err();
+        assert!(
+            matches!(err, ShaderError::Unsupported { .. }),
+            "expected safe error for divergent ballot in {mode:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn single_sided_divergent_if_with_ballot_predicates_and_validates() {
     // if (v0 < 32) { s4 = bcnt1(v0 < 10); v1 = s4; } else { v1 = 0; } store(v1)
+    // Converted to threadgroup-convergent predication via `tg_any_true`.
     let mut code = Vec::new();
     code.push(v_mov_b32(1, inline_u(0)));
     code.push(v_cmp_gt_u32(inline_u(32), 0)); // 32 > v0
@@ -306,12 +345,162 @@ fn divergent_cross_half_ballot_is_rejected_instead_of_hanging() {
     code.push(S_ENDPGM);
 
     let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+    for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let mut host = emit_cs(&prog, mode).unwrap();
+        if let Ok(mut validator) = crate::emit::validator::Validator::load(None) {
+            validator.validate(&mut host.dxil).unwrap();
+        }
+    }
+}
+
+#[test]
+fn uniform_valu_cndmask_and_readfirstlane_chains_lower_and_validate() {
+    // GroupId.x (s2) -> scalar-cmp VOP3 v_cmp_gt_u32 -> v_cndmask_b32 -> v_add_nc_u32 ->
+    // v_readfirstlane_b32 (inside a divergent if!) must stay scalar-uniform without barriers.
+    let mut code = Vec::new();
+    code.push(v_mov_b32(1, inline_u(0)));
+    code.push(v_cmp_gt_u32(inline_u(32), 0)); // divergent condition
+    code.push(s_and_saveexec_b64(6, VCC));
+    let br_idx = code.len();
+    code.push(0); // s_cbranch_execz -> after
+    code.extend_from_slice(&vop3(0xC4, 4, 2, inline_u(4), 0)); // v_cmp_gt_u32 s[4:5], s2, 4
+    code.extend_from_slice(&v_cndmask_b32(2, inline_u(10), inline_u(20), 4));
+    code.push(v_add_nc_u32(2, inline_u(1), 2));
+    code.push(v_readfirstlane_b32(8, 2)); // src v2 is active_uniform!
+    code.push(v_mov_b32(1, 8));
+    let after = code.len();
+    code[br_idx] = s_cbranch_execz((after - (br_idx + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 1, 0);
+    code.push(S_ENDPGM);
+
+    let prog = make_cs_program(&code, [128, 1, 1], 0, true);
+    for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let mut host = emit_cs(&prog, mode).unwrap();
+        if let Ok(mut validator) = crate::emit::validator::Validator::load(None) {
+            validator.validate(&mut host.dxil).unwrap();
+        }
+    }
+    let sh32 = emit_cs(&prog, Wave64Mode::Wave32).unwrap();
+    // Uniform source in `v_readfirstlane_b32` needs zero LDS scratch and no wave64 barriers.
+    assert_eq!(psv_wave_range(&sh32), (0, u32::MAX));
+    assert_eq!(sfi0_flags(&sh32) & 0x4000, 0);
+}
+
+#[test]
+fn m0_waterfall_readfirstlane_lowers_and_validates_under_wave32() {
+    // Standard RDNA M0-relative VGPR-indexing waterfall loop:
+    // v1 = 10; v2 = 20; v3 = v0 & 1; loop { s4 = readfirstlane(v3); vcc = (s4 == v3);
+    // saveexec; m0 = s4; v4 = v_movrels_b32(v1); restore; exec &= ~vcc; branch_execnz }
+    let mut code = vec![
+        v_mov_b32(1, inline_u(10)),
+        v_mov_b32(2, inline_u(20)),
+        v_and_b32(3, inline_u(1), 0),
+        v_mov_b32(4, inline_u(0)),
+        s_mov_b64(8, EXEC_LO), // s[8:9] = outer exec
+    ];
+    let loop_hdr = code.len();
+    code.push(v_readfirstlane_b32(4, 3));
+    code.push(v_cmp_eq_u32(4, 3)); // vcc = (s4 == v3)
+    code.push(s_and_saveexec_b64(6, VCC)); // s[6:7] = loop exec
+    code.push(s_mov_b32(124, 4)); // m0 = s4
+    code.push(vop1(4, 0x42, vgpr(1))); // v_movrels_b32 v4, v1
+    code.push(s_mov_b64(EXEC_LO, 6)); // restore loop exec
+    code.push(sop2(EXEC_LO, 0x15, EXEC_LO, VCC)); // s_andn2_b64 exec, exec, vcc
+    let br_back = code.len();
+    let back_rel = (loop_hdr as i32 - (br_back as i32 + 1)) as i16;
+    code.push(sopp(0x09, back_rel)); // s_cbranch_execnz loop_hdr
+    code.push(s_mov_b64(EXEC_LO, 8)); // restore outer exec
+    emit_uav_store(&mut code, 4, 0);
+    code.push(S_ENDPGM);
+
+    let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+    for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let mut host = emit_cs(&prog, mode).unwrap();
+        if let Ok(mut validator) = crate::emit::validator::Validator::load(None) {
+            validator.validate(&mut host.dxil).unwrap();
+        }
+    }
+}
+
+#[test]
+fn single_sided_if_with_readfirstlane_and_uniform_loop_predicates_and_validates() {
+    // if (v0 < 32) {
+    //     for (s4 = 0; s4 < 4; ++s4) {
+    //         v2 = v0 + s4;
+    //         s8 = readfirstlane(v2);
+    //         s9 = readlane(v2, 32);
+    //         v1 += s8 + s9;
+    //     }
+    // }
+    // Tests both `total_threads == 64` (1 virtual wave) and `128` (multi-wave `tg_any_true`).
+    let mut code = Vec::new();
+    code.push(v_mov_b32(1, inline_u(0)));
+    code.push(v_cmp_gt_u32(inline_u(32), 0));
+    code.push(s_and_saveexec_b64(6, VCC));
+    let br_if = code.len();
+    code.push(0); // s_cbranch_execz -> merge
+    code.push(s_mov_b32(4, inline_u(0))); // s4 = 0
+    let loop_hdr = code.len();
+    code.push(v_add_nc_u32(2, 4, 0)); // v2 = v0 + s4
+    code.push(v_readfirstlane_b32(8, 2)); // s8 = readfirstlane(v2)
+    code.extend_from_slice(&v_readlane_b32(9, 2, inline_u(32))); // s9 = readlane(v2, 32)
+    code.push(v_add_nc_u32(3, 8, vgpr(0))); // dummy + s8
+    code.push(v_add_nc_u32(3, 9, 3)); // + s9
+    code.push(v_add_nc_u32(1, vgpr(3), 1)); // v1 += s8 + s9 + v0
+    code.push(s_add_i32(4, 4, inline_u(1))); // s4 += 1
+    code.push(s_cmp_lt_u32(4, inline_u(4))); // s4 < 4
+    let br_loop = code.len();
+    let back_rel = (loop_hdr as i32 - (br_loop as i32 + 1)) as i16;
+    code.push(s_cbranch_scc1(back_rel));
+    let merge = code.len();
+    code[br_if] = s_cbranch_execz((merge - (br_if + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 1, 0);
+    code.push(S_ENDPGM);
+
+    for threads in [[64, 1, 1], [128, 1, 1]] {
+        let prog = make_cs_program(&code, threads, 0, false);
+        for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+            let mut host = emit_cs(&prog, mode).unwrap();
+            if let Ok(mut validator) = crate::emit::validator::Validator::load(None) {
+                validator.validate(&mut host.dxil).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn genuinely_divergent_loop_with_readfirstlane_stays_rejected() {
+    // A loop whose trip count differs per lane (`v1 < v0`) must NOT place
+    // `lds_barrier` inside `emulated_readfirstlane` (would deadlock waves).
+    let mut code = Vec::new();
+    code.push(v_mov_b32(1, inline_u(0)));
+    code.push(v_mov_b32(2, inline_u(0)));
+    let loop_hdr = code.len();
+    code.push(v_cmp_lt_u32(vgpr(1), 0)); // vcc = v1 < v0 (per-lane!)
+    code.push(s_and_saveexec_b64(6, VCC));
+    let br_exit = code.len();
+    code.push(0); // s_cbranch_execz -> after
+    code.push(v_readfirstlane_b32(4, 1));
+    code.push(v_add_nc_u32(2, 4, 2));
+    code.push(v_add_nc_u32(1, inline_u(1), 1));
+    let br_back = code.len();
+    let back_rel = (loop_hdr as i32 - (br_back as i32 + 1)) as i16;
+    code.push(sopp(0x02, back_rel));
+    let after = code.len();
+    code[br_exit] = s_cbranch_execz((after - (br_exit + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 2, 0);
+    code.push(S_ENDPGM);
+
+    let prog = make_cs_program(&code, [128, 1, 1], 0, false);
     assert!(emit_cs(&prog, Wave64Mode::Native).is_ok());
     for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
         let err = emit_cs(&prog, mode).unwrap_err();
         assert!(
-            matches!(err, ShaderError::Unsupported { .. }),
-            "expected safe error for divergent ballot in {mode:?}, got {err:?}"
+            matches!(err, ShaderError::Unsupported { what, .. } if what.contains("v_readfirstlane")),
+            "expected divergent v_readfirstlane rejection in {mode:?}, got {err:?}"
         );
     }
 }
@@ -870,7 +1059,7 @@ mod gpu {
             [1, 1, 1],
             32,
             &expected,
-            true,
+            false,
         );
     }
 
