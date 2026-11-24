@@ -145,9 +145,21 @@ impl FrameBudget {
     }
 
     fn frame_tag(frame: u64) -> u64 {
-        // Avoid colliding with `NO_FRAME_TAG`.
-        let tag = frame & FRAME_TAG_MASK;
-        if tag == NO_FRAME_TAG { 0 } else { tag }
+        // Modulo `NO_FRAME_TAG` (`(1 << 36) - 1`) keeps the tag strictly in
+        // `0..NO_FRAME_TAG` without collisions at wraparound.
+        frame % NO_FRAME_TAG
+    }
+
+    fn is_newer_tag(tag: u64, cur_tag: u64) -> bool {
+        if cur_tag == NO_FRAME_TAG {
+            return true;
+        }
+        let diff = if tag >= cur_tag {
+            tag - cur_tag
+        } else {
+            NO_FRAME_TAG - cur_tag + tag
+        };
+        diff > 0 && diff < (NO_FRAME_TAG / 2)
     }
 
     fn pack(tag: u64, reserved_us: u32) -> u64 {
@@ -159,7 +171,9 @@ impl FrameBudget {
     }
 
     /// Atomically reserves up to the remaining budget (in microseconds) for
-    /// `frame`, resetting the counter when `frame` advances.
+    /// `frame`, resetting the counter only when `frame` advances past the
+    /// active frame tag (stale tags from earlier frames receive 0 without
+    /// altering active state).
     fn reserve(&self, frame: u64, limit_us: u32) -> u32 {
         let limit = limit_us.min(MAX_RESERVED_US);
         if limit == 0 {
@@ -171,7 +185,14 @@ impl FrameBudget {
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 let (cur_tag, cur_used) = Self::unpack(cur);
-                let used = if cur_tag == tag { cur_used } else { 0 };
+                let used = if cur_tag == tag {
+                    cur_used
+                } else if Self::is_newer_tag(tag, cur_tag) {
+                    0
+                } else {
+                    granted = 0;
+                    return None;
+                };
                 let avail = limit.saturating_sub(used);
                 granted = avail;
                 if avail == 0 && cur_tag == tag {
@@ -425,6 +446,40 @@ mod tests {
         // A stale refund from frame 100 must not alter frame 101's budget.
         budget.refund(100, 5_000);
         assert_eq!(budget.reserve(101, limit_us), 0);
+    }
+
+    #[test]
+    fn stale_reservation_never_rewinds_active_frame_or_wraparound() {
+        let budget = FrameBudget::new();
+        let limit_us = 8_000u32;
+
+        // Deterministic descheduled-thread interleaving: frame 101 reserves
+        // first, then a delayed thread from frame 100 attempts to reserve.
+        assert_eq!(budget.reserve(101, limit_us), limit_us);
+        assert_eq!(
+            (budget.reserve(100, limit_us), budget.reserve(101, limit_us)),
+            (0, 0),
+        );
+
+        // Partial budget on frame 102 stays intact when stale frame 101 arrives.
+        assert_eq!(budget.reserve(102, limit_us), limit_us);
+        budget.refund(102, 2_500);
+        assert_eq!(budget.reserve(101, limit_us), 0);
+        assert_eq!(budget.reserve(102, limit_us), 2_500);
+
+        // Wraparound across `NO_FRAME_TAG` (`(1 << 36) - 1`) boundary.
+        let wrap_budget = FrameBudget::new();
+        assert_eq!(wrap_budget.reserve(NO_FRAME_TAG - 1, limit_us), limit_us);
+        assert_eq!(wrap_budget.reserve(NO_FRAME_TAG, limit_us), limit_us);
+        assert_eq!(
+            (
+                wrap_budget.reserve(NO_FRAME_TAG - 1, limit_us),
+                wrap_budget.reserve(NO_FRAME_TAG, limit_us),
+            ),
+            (0, 0),
+        );
+        assert_eq!(wrap_budget.reserve(NO_FRAME_TAG + 1, limit_us), limit_us);
+        assert_eq!(wrap_budget.reserve(NO_FRAME_TAG, limit_us), 0);
     }
 
     #[test]
