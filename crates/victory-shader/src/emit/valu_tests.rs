@@ -57,6 +57,14 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
+/// MUBUF `buffer_store_short` / `buffer_store_short_d16_hi`.
+const fn buffer_store_short(vdata: u8, srsrc: u8, byte_off: u16, high: bool) -> [u32; 2] {
+    [
+        0x38 << 26 | (if high { 0x1B } else { 0x1A }) << 18 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
 const fn sgpr(n: u8) -> u16 {
     n as u16
 }
@@ -74,6 +82,15 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 
 /// As [`build_valu_cs`], with `lds_blocks` × 512 bytes of LDS allocated.
 fn build_cs(body: &[u32], lds_blocks: u32) -> HostShader {
+    build_cs_with_store(body, lds_blocks, buffer_store_dword(0, 8, 0))
+}
+
+/// Builds a synthetic compute shader with a caller-selected final MUBUF store.
+fn build_valu_cs_with_store(body: &[u32], store: [u32; 2]) -> HostShader {
+    build_cs_with_store(body, 0, store)
+}
+
+fn build_cs_with_store(body: &[u32], lds_blocks: u32, store: [u32; 2]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -84,7 +101,7 @@ fn build_cs(body: &[u32], lds_blocks: u32) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(&store);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -2161,4 +2178,40 @@ fn lds_byte_and_half_reads_extend_as_the_console() {
             assert_eq!(got, want(s0), "{backend}: op {op:#x} of {s0:#010x}");
         });
     }
+}
+
+#[test]
+fn buffer_store_short_writes_only_the_low_halfword() {
+    let body = [vop1(0x001, 0, vgpr(1))]; // v0 = s0
+    let shader = build_valu_cs_with_store(&body, buffer_store_short(0, 8, 0, false));
+    let cases = &[
+        [0x1234_5678, 0, 0, 0],
+        [0xdead_abcd, 0, 0, 0],
+        [0xffff_0001, 0, 0, 0],
+    ];
+    run_cases(&shader, cases, |backend, i, inputs, result| {
+        assert_eq!(
+            result,
+            inputs[0] & 0xffff,
+            "{backend} case {i}: buffer_store_short must write the low 16 bits"
+        );
+    });
+}
+
+#[test]
+fn buffer_store_short_d16_hi_writes_the_high_halfword() {
+    let body = [vop1(0x001, 0, vgpr(1))]; // v0 = s0
+    let shader = build_valu_cs_with_store(&body, buffer_store_short(0, 8, 0, true));
+    let cases = &[
+        [0x1234_5678, 0, 0, 0],
+        [0xdead_abcd, 0, 0, 0],
+        [0xffff_0001, 0, 0, 0],
+    ];
+    run_cases(&shader, cases, |backend, i, inputs, result| {
+        assert_eq!(
+            result,
+            inputs[0] >> 16,
+            "{backend} case {i}: buffer_store_short_d16_hi must write the high 16 bits"
+        );
+    });
 }
