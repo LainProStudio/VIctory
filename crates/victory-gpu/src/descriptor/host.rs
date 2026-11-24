@@ -540,6 +540,7 @@ impl HostHeap {
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
         const BLOCK: u32 = 1 << 16;
+        let block_size = BLOCK.min(total);
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
@@ -547,7 +548,7 @@ impl HostHeap {
                 host.device
                     .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                         Type: kind,
-                        NumDescriptors: BLOCK,
+                        NumDescriptors: block_size,
                         ..Default::default()
                     })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -560,15 +561,15 @@ impl HostHeap {
                 null_view(start);
             }
             let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
+            while filled < block_size {
+                let n = filled.min(block_size - filled);
                 host.device
                     .CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
+                let n = block_size.min(total - done);
                 host.device
                     .CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
