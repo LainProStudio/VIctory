@@ -2052,10 +2052,15 @@ mod tests {
         ];
         crate::descriptor::create_rtv(null, null, &null_desc, handles[0]);
         crate::descriptor::create_rtv(null, target, null.cast(), handles[1]);
+        let rtv1_desc = crate::descriptor::rtv_record(handles[1]).and_then(|r| r.desc());
         crate::list::ensure_state(&list, target, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
         // SAFETY: open list, live target and graphics pipeline.
         unsafe {
-            l.ClearRenderTargetView(host.rtv(Some(color), None), &[0.0, 0.0, 1.0, 1.0], None);
+            l.ClearRenderTargetView(
+                host.rtv(Some(color), rtv1_desc.as_ref()),
+                &[0.0, 0.0, 1.0, 1.0],
+                None,
+            );
             l.SetGraphicsRootSignature(&root);
             l.SetPipelineState(&pso);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

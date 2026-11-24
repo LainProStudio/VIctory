@@ -63,6 +63,31 @@ struct BounceSlot {
     active: bool,
 }
 
+#[derive(Clone)]
+enum ResolvedSlot {
+    CbvDirect {
+        shadow: Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        res: ID3D12Resource,
+    },
+    CbvBounce {
+        cpu: usize,
+        address: u64,
+        len: u32,
+        res: ID3D12Resource,
+    },
+    PlacedTex {
+        res: ID3D12Resource,
+    },
+    Buffer {
+        read: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
+        write: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
+        res: Option<ID3D12Resource>,
+    },
+    Null,
+}
+
 #[derive(Default)]
 struct Bindless {
     /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
@@ -71,6 +96,10 @@ struct Bindless {
     cbv_bounce: HashMap<u32, BounceSlot>,
     /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
     bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
+    /// Incremental resolution cache per tracked slot for unchanged slots.
+    resolved: HashMap<u32, ResolvedSlot>,
+    /// Global `(placed_epoch, viewed_epoch)` under which `resolved` was built.
+    resolved_global: (u64, u64),
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
     /// The placed-texture slots draws prepare at recording, likewise.
@@ -695,6 +724,7 @@ impl HostHeap {
     fn track_bindless(&self, index: u32, entry: (u32, u32)) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.insert(index, entry) != Some(entry) {
+            b.resolved.remove(&index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -705,6 +735,7 @@ impl HostHeap {
     fn untrack_bindless(&self, index: u32) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.remove(&index).is_some() {
+            b.resolved.remove(&index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -830,9 +861,7 @@ impl HostHeap {
         key: u64,
         address: u64,
         capped: u32,
-        reads: &mut Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
-        bounces: &mut Vec<(usize, u64, u32)>,
-    ) -> Option<ID3D12Resource> {
+    ) -> Option<ResolvedSlot> {
         let host = host()?;
         let aligned = capped.next_multiple_of(256);
         if address.is_multiple_of(256)
@@ -874,10 +903,12 @@ impl HostHeap {
                 slot.active = false;
             }
             let len = u64::from(capped).min(shadow.left(address)) as usize;
-            if len > 0 {
-                reads.push((shadow.clone(), address as usize, len));
-            }
-            return Some(shadow.buffer.clone());
+            return Some(ResolvedSlot::CbvDirect {
+                res: shadow.buffer.clone(),
+                shadow,
+                address: address as usize,
+                len,
+            });
         }
 
         let (gpu, cpu, res, was_active) = self.ensure_cbv_bounce(index, aligned)?;
@@ -898,8 +929,12 @@ impl HostHeap {
                 self.set_stride(index, 0);
             }
         }
-        bounces.push((cpu, address, capped));
-        Some(res)
+        Some(ResolvedSlot::CbvBounce {
+            cpu,
+            address,
+            len: capped,
+            res,
+        })
     }
 
     /// At draw/dispatch recording time: materializes any placed streamed
@@ -913,6 +948,7 @@ impl HostHeap {
         }
         let entries = self.placed_slots();
         let mut stale = Vec::new();
+        let mut committed = CommittedCache::default();
         for &(index, (vi, generation)) in entries.iter() {
             let Some(view) = view_at(vi, generation) else {
                 self.clear_stale_slot(index);
@@ -927,7 +963,7 @@ impl HostHeap {
                 continue;
             }
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            if !valid_title_address(address, 1) {
+            if !valid_title_address_cached(&mut committed, address, 1) {
                 self.set_unmapped_null(index, &view);
                 continue;
             }
@@ -951,6 +987,7 @@ impl HostHeap {
         if !stale.is_empty() {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             for idx in stale {
+                b.resolved.remove(&idx);
                 if b.slots.remove(&idx).is_some()
                     && let Some(bounce) = b.cbv_bounce.get_mut(&idx)
                 {
@@ -990,136 +1027,230 @@ impl HostHeap {
         placed
     }
 
-    /// At submission: what the heap's bindless slots need. Made again (slots
-    /// materialized, stale ones pruned, ranges found and merged) only when a
-    /// slot was written or what slots view changed; otherwise the last plan,
-    /// whose reads the caller refreshes, which costs little when the title
-    /// changed nothing.
+    /// At submission: what the heap's bindless slots need. Only dirty or
+    /// invalidated slots are re-resolved, using a per-call `VirtualQuery`
+    /// region cache; unchanged slots reuse their cached resolution.
     pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
         if self.sampler {
             return None;
         }
-        let key = self.revision();
-        let entries: Vec<(u32, (u32, u32))> = {
-            let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(plan) = &b.plan
-                && plan.key == key
-            {
-                return Some(plan.clone());
-            }
-            if b.slots.is_empty() {
-                return None;
-            }
-            b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
-        };
-        let plan = Arc::new(self.make_plan(key, entries));
-        self.bindless.lock().unwrap_or_else(|e| e.into_inner()).plan = Some(plan.clone());
-        Some(plan)
-    }
-
-    /// Materializes the bindless slots `entries` and finds what they read
-    /// and write.
-    fn make_plan(&self, key: (u64, u64, u64), entries: Vec<(u32, (u32, u32))>) -> BindlessPlan {
-        use windows::core::Interface;
-        let (mut reads, mut writes, mut bounces) = (Vec::new(), Vec::new(), Vec::new());
-        let mut retained = Vec::new();
-        let mut stale = Vec::new();
-        for (index, (vi, generation)) in entries {
-            let Some(view) = view_at(vi, generation) else {
-                self.clear_stale_slot(index);
-                stale.push(index);
-                continue;
+        loop {
+            let key = self.revision();
+            let global = (key.1, key.2);
+            let dirty: Vec<(u32, (u32, u32))> = {
+                let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(plan) = &b.plan
+                    && plan.key == key
+                {
+                    return Some(plan.clone());
+                }
+                if b.slots.is_empty() {
+                    b.resolved.clear();
+                    b.resolved_global = global;
+                    b.plan = None;
+                    return None;
+                }
+                if b.resolved_global != global {
+                    b.resolved.clear();
+                    b.resolved_global = global;
+                }
+                b.slots
+                    .iter()
+                    .filter(|(idx, _)| !b.resolved.contains_key(idx))
+                    .map(|(&idx, &v)| (idx, v))
+                    .collect()
             };
-            if !view.is_buffer() {
-                stale.push(index);
+
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::BindlessRebuilds, 1);
+                add(C::BindlessDirty, dirty.len() as u64);
+            }
+
+            let mut committed = CommittedCache::default();
+            let mut newly_resolved: Vec<(u32, (u32, u32), ResolvedSlot)> =
+                Vec::with_capacity(dirty.len());
+            let mut stale = Vec::new();
+            for (index, (vi, generation)) in dirty {
+                match self.resolve_bindless_slot(index, vi, generation, &mut committed) {
+                    Some(slot) => newly_resolved.push((index, (vi, generation), slot)),
+                    None => stale.push(index),
+                }
+            }
+
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            let current_global = (
+                crate::resource::placed_epoch(),
+                VIEWED.load(Ordering::Acquire),
+            );
+            if b.resolved_global != current_global {
+                b.resolved.clear();
+                b.resolved_global = current_global;
                 continue;
             }
-            let key = u64::from(generation) << 32 | u64::from(vi);
-            match &view {
-                &View::Constant(address, size) => {
-                    let capped = size.min(65_536);
-                    if !valid_title_address(address, u64::from(capped)) {
-                        self.set_unmapped_null(index, &view);
-                        continue;
-                    }
-                    match self.materialize_bindless_cbv(
-                        index,
-                        key,
-                        address,
-                        capped,
-                        &mut reads,
-                        &mut bounces,
-                    ) {
-                        Some(res) => retained.push(res),
-                        None => self.set_unmapped_null(index, &view),
-                    }
-                }
-                View::Placed(false, resource, desc) if resource[0] != 1 => {
-                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                    if !valid_title_address(address, 1) {
-                        self.set_unmapped_null(index, &view);
-                        continue;
-                    }
-                    if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
-                        && let Some(host_tex) =
-                            crate::resource::host_resource(tex_res as crate::object::This)
-                    {
-                        self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
-                        retained.push(host_tex.clone());
-                    } else {
-                        self.set_unmapped_null(index, &view);
-                    }
-                }
-                _ => {
-                    let Some((address, len)) = buffer_range(&view) else {
-                        self.set_unmapped_null(index, &view);
-                        continue;
-                    };
-                    if !valid_title_address(address, len) {
-                        self.set_unmapped_null(index, &view);
-                        continue;
-                    }
-                    if let Some(r) = self.ensure_buffer_slot(index, key, &view) {
-                        retained.push(r);
-                    }
-                    if let Some(shadow) = crate::shadow::find(address, len) {
-                        let clamped = len.min(shadow.left(address)) as usize;
-                        if clamped > 0 {
-                            reads.push((shadow.clone(), address as usize, clamped));
-                            if matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
-                                if clamped <= WRITE_CAP {
-                                    writes.push((shadow, address as usize, clamped));
-                                } else {
-                                    static ONCE: std::sync::Once = std::sync::Once::new();
-                                    ONCE.call_once(|| {
-                                        tracing::warn!(
-                                            bytes = clamped,
-                                            "a bindless unordered access view too big to copy back"
-                                        );
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if !stale.is_empty() {
-            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             for idx in stale {
+                b.resolved.remove(&idx);
                 if b.slots.remove(&idx).is_some()
                     && let Some(bounce) = b.cbv_bounce.get_mut(&idx)
                 {
                     bounce.active = false;
                 }
             }
+            for (index, entry, resolved) in newly_resolved {
+                if b.slots.get(&index) == Some(&entry) {
+                    b.resolved.insert(index, resolved);
+                }
+            }
+            if b.slots.is_empty() {
+                b.resolved.clear();
+                b.plan = None;
+                return None;
+            }
+
+            let (mut reads, mut writes, mut bounces, mut retained) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for resolved in b.resolved.values() {
+                match resolved {
+                    ResolvedSlot::CbvDirect {
+                        shadow,
+                        address,
+                        len,
+                        res,
+                    } => {
+                        if *len > 0 {
+                            reads.push((shadow.clone(), *address, *len));
+                        }
+                        retained.push(res.clone());
+                    }
+                    ResolvedSlot::CbvBounce {
+                        cpu,
+                        address,
+                        len,
+                        res,
+                    } => {
+                        bounces.push((*cpu, *address, *len));
+                        retained.push(res.clone());
+                    }
+                    ResolvedSlot::PlacedTex { res } => {
+                        retained.push(res.clone());
+                    }
+                    ResolvedSlot::Buffer { read, write, res } => {
+                        if let Some((shadow, addr, len)) = read {
+                            reads.push((shadow.clone(), *addr, *len));
+                        }
+                        if let Some((shadow, addr, len)) = write {
+                            writes.push((shadow.clone(), *addr, *len));
+                        }
+                        if let Some(res) = res {
+                            retained.push(res.clone());
+                        }
+                    }
+                    ResolvedSlot::Null => {}
+                }
+            }
+            let plan_key = (
+                self.revision.load(Ordering::Acquire),
+                current_global.0,
+                current_global.1,
+            );
+            let plan = Arc::new(BindlessPlan {
+                key: plan_key,
+                reads: merged(reads, READ_GAP),
+                writes: merged(writes, 0),
+                bounces,
+                _retained: retained,
+            });
+            b.plan = Some(plan.clone());
+            return Some(plan);
         }
-        BindlessPlan {
-            key,
-            reads: merged(reads, READ_GAP),
-            writes: merged(writes, 0),
-            bounces,
-            _retained: retained,
+    }
+
+    /// Resolves a single dirty bindless slot `(index, vi, generation)`. Returns
+    /// `None` if the recorded view has become stale (pruned by the caller).
+    fn resolve_bindless_slot(
+        &self,
+        index: u32,
+        vi: u32,
+        generation: u32,
+        committed: &mut CommittedCache,
+    ) -> Option<ResolvedSlot> {
+        use windows::core::Interface;
+        let Some(view) = view_at(vi, generation) else {
+            self.clear_stale_slot(index);
+            return None;
+        };
+        if !view.is_buffer() {
+            return None;
+        }
+        let slot_key = u64::from(generation) << 32 | u64::from(vi);
+        match &view {
+            &View::Constant(address, size) => {
+                let capped = size.min(65_536);
+                if !valid_title_address_cached(committed, address, u64::from(capped)) {
+                    self.set_unmapped_null(index, &view);
+                    return Some(ResolvedSlot::Null);
+                }
+                match self.materialize_bindless_cbv(index, slot_key, address, capped) {
+                    Some(resolved) => Some(resolved),
+                    None => {
+                        self.set_unmapped_null(index, &view);
+                        Some(ResolvedSlot::Null)
+                    }
+                }
+            }
+            View::Placed(false, resource, desc) if resource[0] != 1 => {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if !valid_title_address_cached(committed, address, 1) {
+                    self.set_unmapped_null(index, &view);
+                    return Some(ResolvedSlot::Null);
+                }
+                if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
+                    && let Some(host_tex) =
+                        crate::resource::host_resource(tex_res as crate::object::This)
+                {
+                    self.ensure_placed_slot(index, slot_key, &shader_view, host_tex.as_raw());
+                    Some(ResolvedSlot::PlacedTex {
+                        res: host_tex.clone(),
+                    })
+                } else {
+                    self.set_unmapped_null(index, &view);
+                    Some(ResolvedSlot::Null)
+                }
+            }
+            _ => {
+                let Some((address, len)) = buffer_range(&view) else {
+                    self.set_unmapped_null(index, &view);
+                    return Some(ResolvedSlot::Null);
+                };
+                if !valid_title_address_cached(committed, address, len) {
+                    self.set_unmapped_null(index, &view);
+                    return Some(ResolvedSlot::Null);
+                }
+                let res = self.ensure_buffer_slot(index, slot_key, &view);
+                let mut read = None;
+                let mut write = None;
+                if let Some(shadow) = crate::shadow::find(address, len) {
+                    let clamped = len.min(shadow.left(address)) as usize;
+                    if clamped > 0 {
+                        read = Some((shadow.clone(), address as usize, clamped));
+                        if matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+                            if clamped <= WRITE_CAP {
+                                write = Some((shadow, address as usize, clamped));
+                            } else {
+                                static ONCE: std::sync::Once = std::sync::Once::new();
+                                ONCE.call_once(|| {
+                                    tracing::warn!(
+                                        bytes = clamped,
+                                        "a bindless unordered access view too big to copy back"
+                                    );
+                                });
+                            }
+                        }
+                    }
+                }
+                Some(ResolvedSlot::Buffer { read, write, res })
+            }
         }
     }
 
@@ -1146,13 +1277,48 @@ impl HostHeap {
     }
 }
 
-fn valid_title_address(address: u64, len: u64) -> bool {
+/// Per-call `VirtualQuery` region cache so querying hundreds of bindless slots
+/// inside the same contiguous allocation only asks the kernel once per region.
+#[derive(Default)]
+struct CommittedCache {
+    entries: [(u64, u64, bool); 16],
+    next: usize,
+}
+
+impl CommittedCache {
+    fn is_committed(&mut self, address: u64) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+        };
+        for &(base, end, committed) in &self.entries {
+            if base < end && address >= base && address < end {
+                return committed;
+            }
+        }
+        // SAFETY: querying process virtual memory metadata into a zeroed local struct.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let got = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+        if got != size_of_val(&info) || info.RegionSize == 0 {
+            return false;
+        }
+        let base = info.BaseAddress as u64;
+        let end = base.saturating_add(info.RegionSize as u64);
+        let ok = info.State == MEM_COMMIT
+            && info.Protect != 0
+            && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+        self.entries[self.next] = (base, end, ok);
+        self.next = (self.next + 1) % self.entries.len();
+        ok
+    }
+}
+
+fn valid_title_address_cached(cache: &mut CommittedCache, address: u64, len: u64) -> bool {
     address >= 0x10000
         && len > 0
         && address
             .checked_add(len)
             .is_some_and(|end| end <= (1u64 << 48))
-        && crate::texture::committed(address as *const u8, 1)
+        && cache.is_committed(address)
 }
 
 /// Logs `what` the first time it happens.
@@ -2958,7 +3124,44 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(second.reads[0].1, mem.address() as usize);
         assert_eq!(second.reads[0].2, 0x1100);
 
+        // Unchanged slot 0 stays cached in `b.resolved`; overwriting slot 1
+        // replaces only slot 1 and still merges same-shadow reads cleanly, and
+        // releasing a viewed resource (`bindless_viewed_changed`) prunes it.
+        cbv(mem.address() + 0x2000, 1);
+        let third_same = host_heap.bindless_plan().unwrap();
+        assert_eq!(third_same.reads.len(), 1);
+        assert_eq!(third_same.reads[0].2, 0x2100);
+
+        let r0 = make_title_buffer(mem.address() + 0x3000, 512, false);
+        let srv_desc_host = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: POD conversion of 40-byte SRV desc.
+        let raw_srv: [u32; 10] = unsafe {
+            std::ptr::from_ref(&srv_desc_host)
+                .cast::<[u32; 10]>()
+                .read()
+        };
+        create_srv(std::ptr::null(), r0, &raw_srv, base + 2 * 32);
+        let third = host_heap.bindless_plan().unwrap();
+        assert_eq!(third.reads.len(), 2);
+
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(r0), 0);
+        let fourth = host_heap.bindless_plan().unwrap();
+        assert_eq!(fourth.reads.len(), 1);
+        assert_eq!(fourth.reads[0].2, 0x2100, "released resource slot pruned");
+
         assert_eq!(release(title_heap), 0);
     }
 

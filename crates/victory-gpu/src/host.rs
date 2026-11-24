@@ -2003,14 +2003,6 @@ impl HostList {
     }
 }
 
-#[cfg(all(test, feature = "diagnostics"))]
-pub(crate) fn test_submission_counters() -> (u64, u64) {
-    (
-        SUBMISSION_US[0].load(Ordering::Relaxed),
-        COPY_BACK[1].load(Ordering::Relaxed),
-    )
-}
-
 /// A submission's refreshes not done yet, per buffer copy, merged where
 /// they share or touch a 64 KiB page: done before a step that writes title
 /// memory or gives a range to shaders, and before the lists run. Ranges
@@ -2145,6 +2137,8 @@ impl Batch {
     /// for copy-back only when a shader that may write memory uses the heap.
     fn prepare_bindless(&mut self) {
         self.flush();
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         for (heap, writes) in std::mem::take(&mut self.bindless) {
             let Some(plan) = heap.bindless_plan() else {
                 continue;
@@ -2166,6 +2160,11 @@ impl Batch {
             }
             self.plans.push(plan);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::BindlessUs,
+            started.elapsed().as_micros() as u64,
+        );
     }
 }
 

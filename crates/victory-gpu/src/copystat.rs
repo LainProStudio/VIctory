@@ -37,17 +37,16 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Bindless plan rebuilds, resolved dirty slots, and bindless prep time.
+    BindlessRebuilds,
+    BindlessDirty,
+    BindlessUs,
 }
-const COUNTERS: usize = C::TexChanged as usize + 1;
+const COUNTERS: usize = C::BindlessUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
-}
-
-#[cfg(test)]
-pub(crate) fn read(c: C) -> u64 {
-    COUNT[c as usize].load(Relaxed)
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -132,6 +131,14 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    if c[C::BindlessUs as usize] > 0.0 || c[C::BindlessRebuilds as usize] > 0.0 {
+        tracing::info!(
+            "bindless per frame: {:.1} rebuilds, {:.0} dirty slots, {:.2} ms preparing",
+            c[C::BindlessRebuilds as usize],
+            c[C::BindlessDirty as usize],
+            ms(c[C::BindlessUs as usize]),
+        );
+    }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
