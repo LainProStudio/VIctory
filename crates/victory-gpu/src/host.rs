@@ -2381,21 +2381,65 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
 
 fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read. Pages found unreadable
+    // are remembered for a while and not asked again: each failed read is
+    // a kernel call (a server round trip under Wine), and the world's
+    // copies cross the same unmapped pages every frame.
+    let zero = |to: *mut u8, n: usize| {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+        // SAFETY: inside the destination, which is mapped.
+        unsafe { to.write_bytes(0, n) };
+    };
+    let mut unreadable = UNREADABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let known = |page: usize, map: &std::collections::BTreeMap<usize, std::time::Instant>| {
+        map.get(&page)
+            .is_some_and(|&seen| now.duration_since(seen) < UNREADABLE_FOR)
+    };
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+        let any_known = (at / PAGE..(at + n).div_ceil(PAGE)).any(|p| known(p, &unreadable));
+        if !any_known && read(at as *const u8, to, n) {
+            return;
         }
+        for_pieces(at, n, PAGE, |at, n| {
+            let to = dst.wrapping_add(at - src as usize);
+            if known(at / PAGE, &unreadable) {
+                zero(to, n);
+            } else if !read(at as *const u8, to, n) {
+                unreadable.insert(at / PAGE, now);
+                zero(to, n);
+            }
+        });
     });
+}
+
+/// 4 KiB pages.
+const PAGE: usize = 4 << 10;
+/// How long a page [`read_pieces`] found unreadable is taken as unmapped
+/// without asking again, unless the runtime remaps it first
+/// ([`forget_unreadable`]); after that it is asked again, for memory that
+/// is mapped another way.
+const UNREADABLE_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+/// Pages [`read_pieces`] found unreadable, by page number, and when.
+static UNREADABLE: Mutex<std::collections::BTreeMap<usize, std::time::Instant>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The runtime mapped or unmapped `[at, at + len)`: its pages are asked
+/// again.
+pub(crate) fn forget_unreadable(at: usize, len: usize) {
+    let mut unreadable = UNREADABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let pages: Vec<usize> = unreadable
+        .range(at / PAGE..at.saturating_add(len).div_ceil(PAGE))
+        .map(|(&p, _)| p)
+        .collect();
+    for page in pages {
+        unreadable.remove(&page);
+    }
+    // Entries past their time are dropped here too, so the map stays small.
+    let now = std::time::Instant::now();
+    unreadable.retain(|_, seen| now.duration_since(*seen) < UNREADABLE_FOR);
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -3306,5 +3350,65 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod unreadable_pages {
+    use super::{PAGE, copy_mapped, forget_unreadable};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    #[test]
+    fn an_unmapped_page_is_remembered_until_remapped() {
+        // Four pages: 0 and 3 committed, 1 and 2 not.
+        // SAFETY: plain reservation and commits of our own pages.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let page = |i: usize| base.cast::<u8>().wrapping_add(i * PAGE);
+        let commit = |i: usize, value: u8| {
+            // SAFETY: inside the reservation above.
+            unsafe {
+                assert!(!VirtualAlloc(page(i).cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                page(i).write_bytes(value, PAGE);
+            }
+        };
+        let filled = |out: &[u8], i: usize, value: u8| {
+            out[i * PAGE..(i + 1) * PAGE].iter().all(|&b| b == value)
+        };
+        commit(0, 1);
+        commit(3, 4);
+        let mut out = vec![0xffu8; 4 * PAGE];
+        copy_mapped(out.as_mut_ptr(), page(0), 4 * PAGE, false);
+        assert!(
+            filled(&out, 0, 1)
+                && filled(&out, 1, 0)
+                && filled(&out, 2, 0)
+                && filled(&out, 3, 4)
+        );
+        // Page 1 mapped behind the runtime's back while page 2 stays
+        // unmapped: the copy falls back again and takes page 1 as unmapped.
+        commit(1, 2);
+        out.fill(0xff);
+        copy_mapped(out.as_mut_ptr(), page(0), 4 * PAGE, false);
+        assert!(
+            filled(&out, 0, 1)
+                && filled(&out, 1, 0)
+                && filled(&out, 2, 0)
+                && filled(&out, 3, 4)
+        );
+        // Remapped through the runtime: page 1 is read again.
+        forget_unreadable(page(1) as usize, PAGE);
+        out.fill(0xff);
+        copy_mapped(out.as_mut_ptr(), page(0), 4 * PAGE, false);
+        assert!(
+            filled(&out, 0, 1)
+                && filled(&out, 1, 2)
+                && filled(&out, 2, 0)
+                && filled(&out, 3, 4)
+        );
+        // SAFETY: the reservation above, no longer used.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 }
