@@ -6885,6 +6885,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            host_waves: None,
         })
         .map(|_| ())
     }
