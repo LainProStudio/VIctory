@@ -7,6 +7,10 @@
 //! `ResourceDescriptorHeap[]` draw or dispatch materializes and refreshes
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
+#[cfg(feature = "diagnostics")]
+#[path = "attribution.rs"]
+pub(crate) mod attribution;
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

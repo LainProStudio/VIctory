@@ -67,6 +67,8 @@ pub(crate) struct Shader {
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
     wave64: OnceLock<bool>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    heap_access: OnceLock<crate::descriptor::host::attribution::Access>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -94,6 +96,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(all(windows, feature = "diagnostics"))]
                 wave64: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                heap_access: OnceLock::new(),
             })
         })
         .clone()
@@ -113,6 +117,13 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn heap_access(&self) -> crate::descriptor::host::attribution::Access {
+        *self.heap_access.get_or_init(|| {
+            crate::descriptor::host::attribution::classify_container(&self.container)
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -677,6 +688,8 @@ pub(crate) fn test_compute_pipeline(
         translated,
         #[cfg(all(windows, feature = "diagnostics"))]
         wave64: OnceLock::new(),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        heap_access: OnceLock::new(),
     });
     let mut out = std::ptr::null();
     assert_eq!(

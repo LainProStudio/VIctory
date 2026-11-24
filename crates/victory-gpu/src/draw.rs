@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+#[cfg(feature = "diagnostics")]
+use crate::descriptor::host::attribution;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -71,6 +73,10 @@ struct DepthTarget {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    #[cfg(feature = "diagnostics")]
+    attribution_request: Option<attribution::Request>,
+    #[cfg(feature = "diagnostics")]
+    attribution_list: Option<attribution::Recording>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -722,6 +728,10 @@ impl State {
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.attribution_request = None;
+        }
         self.depth_sampled = false;
         let l = &list.list;
         self.bind_heaps(list);
@@ -759,6 +769,14 @@ impl State {
         {
             let writes = p.stages.iter().any(|s| s.translated().writes_memory);
             list.defer_bindless(&host_heap, writes);
+            #[cfg(feature = "diagnostics")]
+            if attribution::enabled() {
+                let request = attribution::Request::new(&host_heap, p);
+                self.attribution_list
+                    .get_or_insert_with(|| attribution::Recording::new(list))
+                    .with_usage(|usage| usage.request(request));
+                self.attribution_request = Some(request);
+            }
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1034,9 +1052,22 @@ impl State {
         true
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn attribution_ran(&mut self, compute: bool, indirect: bool) {
+        if let (Some(request), Some(recording)) =
+            (self.attribution_request.take(), &self.attribution_list)
+        {
+            recording.with_usage(|usage| usage.ran(request, compute, indirect));
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         let _ran = self.record_dispatch(list, x, y, z);
+        #[cfg(feature = "diagnostics")]
+        if _ran {
+            self.attribution_ran(true, false);
+        }
         #[cfg(feature = "diagnostics")]
         self.trace_operation("dispatch", true, if _ran { "ran" } else { "dropped" });
     }
@@ -1231,7 +1262,12 @@ impl State {
                 Err(_) => false,
             };
         #[cfg(feature = "diagnostics")]
-        self.trace_operation("dispatch", false, if ran { "ran" } else { "dropped" });
+        {
+            if ran {
+                self.attribution_ran(false, false);
+            }
+            self.trace_operation("dispatch", false, if ran { "ran" } else { "dropped" });
+        }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1470,6 +1506,10 @@ impl State {
         first_instance: u32,
     ) {
         let _status = self.record_draw(list, vertices, instances, first, first_instance);
+        #[cfg(feature = "diagnostics")]
+        if _status == "ran" {
+            self.attribution_ran(false, false);
+        }
         #[cfg(feature = "diagnostics")]
         self.trace_operation("draw", false, _status);
     }
@@ -1793,7 +1833,12 @@ impl State {
         let _status =
             self.record_draw_indexed(list, indices, instances, first, base, first_instance);
         #[cfg(feature = "diagnostics")]
-        self.trace_operation("draw", false, _status);
+        {
+            if _status == "ran" {
+                self.attribution_ran(false, false);
+            }
+            self.trace_operation("draw", false, _status);
+        }
     }
 
     fn record_draw_indexed(
@@ -1874,6 +1919,10 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         let ran = self.record_indirect(list, (kind, stride, max), arguments, count);
+        #[cfg(feature = "diagnostics")]
+        if ran {
+            self.attribution_ran(kind == 2, true);
+        }
         #[cfg(feature = "diagnostics")]
         self.trace_operation("indirect", kind == 2, if ran { "ran" } else { "dropped" });
         ran
