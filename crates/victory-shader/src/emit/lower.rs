@@ -5768,28 +5768,12 @@ impl<'a> Lower<'a> {
             && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
         {
             let u_bit = if u.kind == ResourceType::Uav { 0x1000 } else { 0 };
-            let structured = u.stride >= 4 && u.stride.is_multiple_of(4);
-            let h = self.handle(
-                site,
-                src,
-                false,
-                if structured {
-                    (12 | u_bit, u.stride)
-                } else {
-                    (11 | u_bit, 0)
-                },
-            )?;
-            let st = structured.then(|| self.s.m.i32(u.stride));
+            // Scalar buffer loads address bytes, even when the descriptor carries a stride.
+            let h = self.handle(site, src, false, (11 | u_bit, 0))?;
+            let elem_off = self.s.m.undef(self.s.t.i32);
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let (idx, elem_off) = match st {
-                    Some(st) => (
-                        self.s.m.bin(c, Bin::UDiv, a, st),
-                        self.s.m.bin(c, Bin::URem, a, st),
-                    ),
-                    None => (a, self.s.m.undef(self.s.t.i32)),
-                };
                 let mask = self.s.m.i8(1);
                 let al = self.s.m.i32(4);
                 let r = self.s.op(
@@ -5798,7 +5782,7 @@ impl<'a> Lower<'a> {
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, idx, elem_off, mask, al],
+                    &[h, a, elem_off, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -5947,13 +5931,7 @@ impl<'a> Lower<'a> {
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                (props, None)
+                ((11 | u, 0), None)
             }
             Fields::Smem { .. } => {
                 return Err("a descriptor read as data and by a scalar load");
