@@ -186,6 +186,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             let len = shadow.left(address).min(1 << 16);
             if gpu.is_multiple_of(256) {
                 shadow.refresh(list, address, len);
+                list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
                 return Some(gpu);
             }
             let (gpu, to) = list.scratch(len)?;
@@ -198,6 +199,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             }
             let len = shadow.left(address);
             shadow.refresh(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             Some(gpu)
         }
         RootView::Uav => {
@@ -207,6 +209,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             let len = shadow.left(address);
             shadow.refresh(list, address, len);
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
             Some(gpu)
         }
     }
@@ -461,6 +464,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -479,6 +484,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1401,6 +1407,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {

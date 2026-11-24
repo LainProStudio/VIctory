@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{BUFFER_READ, BUFFER_WRITE, HostList, host};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -270,6 +270,10 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    list.buffer_state(src.0, crate::host::BUFFER_READ);
+    if let Some((c, _)) = count {
+        list.buffer_state(c, crate::host::BUFFER_READ);
+    }
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
@@ -329,8 +333,8 @@ fn record_clamp(
     };
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
-    // count, scratch destination, and budget buffers. `src` and `count` stay
-    // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
+    // count, scratch destination, and budget buffers. `src` and `count` are
+    // transitioned to `BUFFER_READ` via `HostList::buffer_state`, while `dst`
     // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -378,6 +382,34 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_COMMON,
         )])
+    };
+}
+
+/// Runs `max` records of `signature` from `args` at `offset`, with their count
+/// at `counter` if there is one (used by buffer-state tests when `args` is a
+/// tracked buffer rather than a pre-bounded scratch buffer).
+#[cfg(test)]
+pub(crate) fn execute(
+    list: &HostList,
+    signature: &ID3D12CommandSignature,
+    max: u32,
+    (args, offset): (&ID3D12Resource, u64),
+    counter: Option<(&ID3D12Resource, u64)>,
+) {
+    list.buffer_state(args, crate::host::BUFFER_READ);
+    if let Some((c, _)) = counter {
+        list.buffer_state(c, crate::host::BUFFER_READ);
+    }
+    // SAFETY: an open list with everything set; live buffers and signature.
+    unsafe {
+        list.list.ExecuteIndirect(
+            signature,
+            max,
+            args,
+            offset,
+            counter.map(|(c, _)| c),
+            counter.map_or(0, |(_, at)| at),
+        )
     };
 }
 
