@@ -736,6 +736,9 @@ impl Shader {
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
         }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
+        }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= flags::FEATURE_RESOURCE_HEAP;
         }
