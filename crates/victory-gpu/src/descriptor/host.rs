@@ -8,7 +8,7 @@
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -46,9 +46,11 @@ pub(crate) struct HostHeap {
     /// Incremented whenever `bindless.slots` changes.
     revision: AtomicU64,
     /// Incremented only when `bindless.placed_tex` changes (not buffers/CBVs).
+    #[cfg(test)]
     placed_revision: AtomicU64,
     /// Number of placed textures currently tracked in `bindless.placed_tex`.
-    placed_count: AtomicU32,
+    #[cfg(test)]
+    placed_count: std::sync::atomic::AtomicU32,
 }
 
 // SAFETY: D3D12 descriptor heaps and resources are free-threaded; mutable
@@ -83,7 +85,10 @@ enum ResolvedSlot {
         res: ID3D12Resource,
     },
     PlacedTex {
-        res: ID3D12Resource,
+        resource: usize,
+        copy: Arc<crate::resource::HostTexture>,
+        staging: Option<Arc<crate::texture::Staging>>,
+        srv_state: u32,
         address: u64,
         end: u64,
     },
@@ -132,6 +137,7 @@ struct Bindless {
     /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
     slots: BTreeMap<u32, (u32, u32)>,
     /// Subset of `slots` holding placed textures (`View::Placed(false, r, _)` with `r[0] != 1`).
+    #[cfg_attr(not(test), allow(dead_code))]
     placed_tex: HashMap<u32, (u32, u32)>,
     /// Persistent 256-byte-aligned bounce slices by `slot_index`.
     cbv_bounce: HashMap<u32, BounceSlot>,
@@ -146,10 +152,12 @@ struct Bindless {
     plan: Option<((u64, u64, u64, u64), Arc<BindlessPlan>)>,
     /// The placed-texture slots draws prepare at recording, keyed only by
     /// `(placed_revision, VIEWED_FORGET)`.
+    #[cfg(test)]
     placed: Option<((u64, u64), PlacedSlots)>,
 }
 
 /// Bindless slots viewing placed textures: slot, view index and generation.
+#[cfg(test)]
 type PlacedSlots = Arc<Vec<(u32, (u32, u32))>>;
 
 const REMAP_LOG_CAP: usize = 8192;
@@ -209,6 +217,20 @@ const WRITE_CAP: usize = 8 << 20;
 /// write-watch answers by 64 KiB page, and fewer, larger askings cost less.
 const READ_GAP: usize = 1 << 20;
 
+/// Deduplicated placed texture referenced by a [`BindlessPlan`].
+pub(crate) struct PlacedTextureTarget {
+    /// Title `ID3D12Resource` handle address (`This as usize`) for `host_written` checks.
+    pub(crate) resource: usize,
+    /// Host texture copy and shared atomic resource state.
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
+    /// Staging state when this texture is title-written (needs watch/hash refresh).
+    pub(crate) staging: Option<Arc<crate::texture::Staging>>,
+    /// Legal `SHADER_RESOURCE` state bits for `copy.texture`.
+    pub(crate) srv_state: u32,
+    /// Title memory `[start, end)` backing `staging` when present.
+    pub(crate) watch_range: Option<(usize, usize)>,
+}
+
 /// What a submission does for a heap's bindless slots, made again only when
 /// the slots or what they view change ([`HostHeap::bindless_plan`]).
 pub(crate) struct BindlessPlan {
@@ -218,6 +240,10 @@ pub(crate) struct BindlessPlan {
     /// The unordered access slots' ranges (up to [`WRITE_CAP`] each), merged:
     /// copied back after a submission whose shaders may write memory.
     pub(crate) writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Deduplicated placed textures referenced by this heap's bindless slots.
+    pub(crate) placed_textures: Vec<PlacedTextureTarget>,
+    /// Pre-coalesced page-aligned watch spans covering `placed_textures` with staging.
+    pub(crate) placed_watch_spans: Vec<(usize, usize)>,
     /// Misaligned constant buffers: bounce slice, title address, bytes.
     bounces: Vec<(usize, u64, u32)>,
     /// The host resources the slots view, held while a submission runs.
@@ -474,8 +500,10 @@ impl HostHeap {
             strides,
             bindless: Mutex::default(),
             revision: AtomicU64::new(0),
+            #[cfg(test)]
             placed_revision: AtomicU64::new(0),
-            placed_count: AtomicU32::new(0),
+            #[cfg(test)]
+            placed_count: std::sync::atomic::AtomicU32::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -615,6 +643,7 @@ impl HostHeap {
 
     /// Current placed-texture revision, placed-texture, remap, and forget epochs.
     /// Returns `(0, 0, 0, 0)` in O(1) when this heap tracks zero placed textures.
+    #[cfg(test)]
     pub(crate) fn placed_revision(&self) -> (u64, u64, u64, u64) {
         if self.placed_count.load(Ordering::Acquire) == 0 {
             return (0, 0, 0, 0);
@@ -943,11 +972,16 @@ impl HostHeap {
         Some(view)
     }
 
+    #[cfg(test)]
     fn bump_placed(&self, b: &Bindless) {
         self.placed_count
             .store(b.placed_tex.len() as u32, Ordering::Release);
         self.placed_revision.fetch_add(1, Ordering::Release);
     }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn bump_placed(&self, _b: &Bindless) {}
 
     fn track_bindless(&self, index: u32, entry: (u32, u32), is_placed_tex: bool) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
@@ -1175,10 +1209,8 @@ impl HostHeap {
         })
     }
 
-    /// At draw/dispatch recording time: materializes any placed streamed
-    /// textures in the heap and records their upload and state transition on
-    /// `list`. Buffer and constant-buffer views are materialized and refreshed
-    /// at submission from [`HostHeap::bindless_plan`].
+    /// Legacy recording-time placed-texture path retained for probe tests.
+    #[cfg(test)]
     pub(crate) fn prepare_bindless_record(&self, list: &crate::host::HostList) {
         use windows::core::Interface;
         if self.sampler {
@@ -1246,9 +1278,7 @@ impl HostHeap {
         }
     }
 
-    /// The slots viewing placed textures (not buffers), which draws prepare
-    /// as they are recorded; found again only when placed texture slots or
-    /// forget epoch change.
+    #[cfg(test)]
     fn placed_slots(&self) -> PlacedSlots {
         let key = (
             self.placed_revision.load(Ordering::Acquire),
@@ -1465,6 +1495,9 @@ impl HostHeap {
             let mut read_groups: ShadowGroups<'_> = HashMap::new();
             let mut write_groups: ShadowGroups<'_> = HashMap::new();
             let mut bounces = Vec::new();
+            let mut placed_textures = Vec::new();
+            let mut placed_watch_spans = Vec::new();
+            let mut seen_placed_copies = HashSet::<usize>::new();
             let mut seen_res = HashSet::<usize>::new();
             let mut retained = Vec::new();
             let mut push_res = |res: &ID3D12Resource| {
@@ -1507,8 +1540,30 @@ impl HostHeap {
                         bounces.push((*cpu, *address, *len));
                         push_res(res);
                     }
-                    ResolvedSlot::PlacedTex { res, .. } => {
-                        push_res(res);
+                    ResolvedSlot::PlacedTex {
+                        resource,
+                        copy,
+                        staging,
+                        srv_state,
+                        ..
+                    } => {
+                        push_res(&copy.texture);
+                        if seen_placed_copies.insert(Arc::as_ptr(copy) as usize) {
+                            let watch_range = staging
+                                .as_ref()
+                                .map(|s| s.memory_range())
+                                .filter(|&(from, to)| from < to);
+                            if let Some(span) = watch_range {
+                                placed_watch_spans.push(span);
+                            }
+                            placed_textures.push(PlacedTextureTarget {
+                                resource: *resource,
+                                copy: copy.clone(),
+                                staging: staging.clone(),
+                                srv_state: *srv_state,
+                                watch_range,
+                            });
+                        }
                     }
                     ResolvedSlot::Buffer { read, write, res, .. } => {
                         if let Some((shadow, addr, len)) = read {
@@ -1524,6 +1579,7 @@ impl HostHeap {
                     ResolvedSlot::Null { .. } => {}
                 }
             }
+            crate::host::coalesce_ranges(&mut placed_watch_spans, crate::watch::PAGE);
             let plan_key = (
                 self.revision.load(Ordering::Acquire),
                 current_global.0,
@@ -1533,6 +1589,8 @@ impl HostHeap {
             let plan = Arc::new(BindlessPlan {
                 reads: merge_shadow_ranges(read_groups, READ_GAP),
                 writes: merge_shadow_ranges(write_groups, 0),
+                placed_textures,
+                placed_watch_spans,
                 bounces,
                 _retained: retained,
             });
@@ -1586,12 +1644,21 @@ impl HostHeap {
                 }
                 if let Some(placed) = placed_texture(&view)
                     && let View::Shader(tex_res, _) = placed.view
-                    && let Some(host_tex) =
-                        crate::resource::host_resource(tex_res as crate::object::This)
+                    && let Some(copy) =
+                        crate::resource::host_copy(tex_res as crate::object::This)
                 {
+                    let tex_this = tex_res as crate::object::This;
+                    let host_tex = &copy.texture;
                     self.ensure_placed_slot(index, slot_key, &placed.view, host_tex.as_raw());
+                    let staging = crate::texture::title_written(host_tex)
+                        .then(|| crate::texture::staging_for(tex_this, host_tex))
+                        .flatten();
+                    let srv_state = crate::host::legal_state(host_tex, 0x40 | 0x80);
                     Some(ResolvedSlot::PlacedTex {
-                        res: host_tex.clone(),
+                        resource: tex_this as usize,
+                        copy,
+                        staging,
+                        srv_state,
                         address,
                         end: placed.end,
                     })
@@ -4083,6 +4150,130 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         crate::shadow::unregister(0x30_0002, mem.address());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    #[test]
+    fn bindless_placed_texture_uploads_at_submission_without_recording_pass() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (title_heap, base) = make_shader_heap(8);
+        let slot_handle = |i: u64| base + i * 32;
+        let mem = crate::resource::Memory::zeroed(128 << 10, 64 << 10).unwrap();
+        let uav_addr = mem.address();
+        let placed_tex_addr = mem.address() + (64 << 10);
+        let uav_res = make_title_buffer(uav_addr, 256, true);
+        // SAFETY: offsets lie within `mem`.
+        unsafe {
+            (uav_addr as *mut [u32; 8]).write([0; 8]);
+            (placed_tex_addr as *mut [u8; 4]).write([0x11, 0x22, 0x33, 0x44]);
+        }
+
+        let uav_desc_host = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: POD descriptor is 40 bytes (`[u32; 10]`).
+        let raw_uav_words: [u32; 10] = unsafe {
+            std::ptr::from_ref(&uav_desc_host)
+                .cast::<[u32; 10]>()
+                .read()
+        };
+        create_uav(
+            std::ptr::null(),
+            uav_res,
+            std::ptr::null(),
+            &raw_uav_words,
+            slot_handle(3),
+        );
+
+        let placed_res_words: [u32; 14] = [
+            3, 0, 0, 0, 4, 0, 4, 0x0001_0001, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1, 0, 0x100, 0,
+            0,
+        ];
+        let tex_srv_host = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        let mut placed_view_words = [0u32; 16];
+        // SAFETY: POD descriptor is 40 bytes (`[u32; 10]`).
+        placed_view_words[..10].copy_from_slice(&unsafe {
+            std::ptr::from_ref(&tex_srv_host)
+                .cast::<[u32; 10]>()
+                .read()
+        });
+        placed_view_words[10] = placed_tex_addr as u32;
+        placed_view_words[11] = (placed_tex_addr >> 32) as u32;
+        create_placed_srv(
+            std::ptr::null(),
+            &placed_res_words,
+            &placed_view_words,
+            slot_handle(2),
+        );
+
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let (root, pso) = compile_probe_cs(&host.device);
+        let list = host.new_list().unwrap();
+        let record_probe = |list: &crate::host::HostList| {
+            list.defer_bindless(&host_heap, true);
+            // SAFETY: open command list, shader-visible heap, and matching root/PSO.
+            unsafe {
+                let gpu_start = host_heap.heap.GetGPUDescriptorHandleForHeapStart().ptr;
+                let gpu_at = |slot_idx: u32| D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: gpu_start + u64::from(slot_idx) * u64::from(host_heap.step),
+                };
+                list.list
+                    .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                for slot_idx in 0..6u32 {
+                    list.list
+                        .SetComputeRootDescriptorTable(slot_idx, gpu_at(slot_idx));
+                }
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+        };
+
+        record_probe(&list);
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: GPU finished and wrote back `uav_addr`.
+        let out1 = unsafe { (uav_addr as *const [u32; 5]).read_volatile() };
+        assert_eq!(out1[2], 0x4433_2211);
+
+        // SAFETY: within `mem`; write-watch tracks this dirty page cleanly.
+        unsafe {
+            (placed_tex_addr as *mut [u8; 4]).write_volatile([0x55, 0x66, 0x77, 0x88]);
+        }
+        record_probe(&list);
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: GPU finished and wrote back `uav_addr`.
+        let out2 = unsafe { (uav_addr as *const [u32; 5]).read_volatile() };
+        assert_eq!(out2[2], 0x8877_6655);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(uav_res), 0);
         assert_eq!(release(title_heap), 0);
     }
 }

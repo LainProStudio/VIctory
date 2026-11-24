@@ -96,8 +96,6 @@ pub(crate) struct State {
     lease: std::sync::Arc<crate::descriptor::lease::Lease>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-    /// Last bindless view heap prepared on this list: `(heap, placed_revision, copy_epoch)`.
-    bindless_prepared: Option<(usize, (u64, u64, u64, u64), u64)>,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
@@ -343,7 +341,6 @@ impl State {
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
-        self.bindless_prepared = None;
         for &h in heaps {
             if !h.is_null() {
                 let samplers = crate::descriptor::heap(h).samplers();
@@ -682,15 +679,6 @@ impl State {
             && self.heaps[0] != 0
             && let Some(host_heap) = crate::descriptor::heap(self.heaps[0] as This).host_arc()
         {
-            let placed_rev = host_heap.placed_revision();
-            if placed_rev != (0, 0, 0, 0) {
-                let epoch = list.title_write_epoch();
-                let key = (self.heaps[0], placed_rev, epoch);
-                if self.bindless_prepared != Some(key) {
-                    host_heap.prepare_bindless_record(list);
-                    self.bindless_prepared = Some(key);
-                }
-            }
             let writes = p.stages.iter().any(|s| s.translated().writes_memory);
             list.defer_bindless(&host_heap, writes);
         }

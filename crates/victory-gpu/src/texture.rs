@@ -45,6 +45,9 @@ pub(crate) struct Staging {
     /// widened to R8G8B8A8_UNORM, so detiled 2-byte texels expand into the
     /// 4-byte staging buffer.
     widened_from: Option<u32>,
+    /// Lock-free mirror of `Last::asked` so clean watched textures skip locking
+    /// `last` altogether when using pre-fetched batch write-watch results.
+    last_asked: std::sync::atomic::AtomicU64,
     last: Mutex<Last>,
     #[cfg(test)]
     gpu_uploads: std::sync::atomic::AtomicU64,
@@ -188,6 +191,15 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// Whether `resource` was previously marked as host-written (copy/resolve target).
+pub(crate) fn is_host_written(resource: usize) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&resource))
+}
+
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
@@ -201,20 +213,15 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// only when its contents changed (including first upload), copied into its
 /// host texture on the list's prelude command list.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    if is_host_written(resource as usize) || !list.first_use(resource as usize) {
         return;
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
-    let Some(staging) = staging(resource, texture) else {
+    let Some(staging) = staging_for(resource, texture) else {
         return;
     };
     // Once per submission however many of its lists sample the texture;
@@ -224,7 +231,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging, copy);
 }
 
-fn hash_textures() -> bool {
+pub(crate) fn hash_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_HASH_TEXTURES"))
 }
@@ -271,10 +278,9 @@ impl Staging {
         pool: &mut UploadPool,
         prefetched: Option<(u64, &[(usize, u64)])>,
     ) -> (usize, Option<(ID3D12Resource, u64)>) {
+        use std::sync::atomic::Ordering;
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let last = &mut *last;
         let watched_answer = if let (false, Some((now, all_written))) = (hash_textures(), prefetched)
         {
             let first = start / crate::watch::PAGE;
@@ -287,7 +293,15 @@ impl Staging {
                 .map(|(now, v)| (now, std::borrow::Cow::Owned(v)))
         };
         if let Some((now, written)) = watched_answer {
+            // Lock-free clean fast path: if our last detiled watch epoch already
+            // covers every write in this texture's pages, skip the mutex.
+            let asked = self.last_asked.load(Ordering::Acquire);
+            if asked != 0 && written.iter().all(|&(_, w)| w <= asked) {
+                return (0, None);
+            }
+            let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                self.last_asked.store(last.asked, Ordering::Release);
                 return (0, None);
             }
             // Read through the copy, which stands unmapped pages: memory of
@@ -303,6 +317,7 @@ impl Staging {
                 return (0, None);
             };
             last.asked = now;
+            self.last_asked.store(now, Ordering::Release);
             read.resize(size, 0);
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
             {
@@ -315,6 +330,8 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, Some((upload_buf, base_offset)));
         }
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
         // Copy the whole texture out first: asking `committed` (VirtualQuery
         // per region) is slow, especially under Wine, while the read fails by
         // itself if any page is not committed.
@@ -514,7 +531,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 }
 
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+pub(crate) fn staging_for(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
@@ -590,6 +607,7 @@ fn create_staging(
         mips: u32::from(d.MipLevels),
         memory,
         widened_from,
+        last_asked: std::sync::atomic::AtomicU64::new(0),
         last: Mutex::default(),
         #[cfg(test)]
         gpu_uploads: std::sync::atomic::AtomicU64::new(0),
