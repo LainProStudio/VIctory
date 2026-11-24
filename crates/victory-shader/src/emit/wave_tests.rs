@@ -5,7 +5,7 @@ use super::bitcode::{Attr, Term};
 use super::container::SigElement;
 use super::host::{Dispatch, Draw, Host, Root, View};
 use super::shader::Shader;
-use super::{HostShader, WaveRange, lower, validator};
+use super::{HostShader, TranslateOptions, Wave64Mode, lower, validator};
 use crate::dxbc::{Container, FourCC, u32_at};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -95,7 +95,7 @@ fn psv_wave_size(shader: &HostShader) -> (u32, u32) {
 fn lower_and_validate(
     native: &NativeProgram,
     outputs: Vec<SigElement>,
-    host_waves: Option<WaveRange>,
+    wave64: Wave64Mode,
 ) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
@@ -111,7 +111,7 @@ fn lower_and_validate(
         outputs,
         prims: Vec::new(),
         mesh_stride: 0,
-        host_waves,
+        options: TranslateOptions { wave64 },
     })
     .expect("lower");
 
@@ -141,7 +141,7 @@ fn build_cs(
     threads: [u32; 3],
     lds_granules: u32,
     body: &[u32],
-    host_waves: Option<WaveRange>,
+    mode: Wave64Mode,
 ) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
@@ -188,7 +188,7 @@ fn build_cs(
         io: StageIo::Cs(ComputeIo { rsrc2, threads }),
         code,
     };
-    lower_and_validate(&native, Vec::new(), host_waves)
+    lower_and_validate(&native, Vec::new(), mode)
 }
 
 fn dispatch_on_all(
@@ -299,25 +299,10 @@ fn wave64_small_group_runs_on_wave32_host() {
     body.push(vop2(0x1A, 5, iconst(2), 2)); // v_lshlrev_b32 v5, 2, v2
     body.extend_from_slice(&buffer_store_dword(4, 5, 8, true));
 
-    // Without device capabilities (or on Wave64-only GCN/Vega), fall back to 64.
-    let fallback = build_cs(true, [8, 4, 1], 0, &body, None);
-    assert_eq!(psv_wave_size(&fallback), (64, 64));
-    let gcn = build_cs(
-        true,
-        [8, 4, 1],
-        0,
-        &body,
-        Some(WaveRange { min: 64, max: 64 }),
-    );
+    // Native mode keeps 64; Wave32 narrows small groups to 32.
+    let gcn = build_cs(true, [8, 4, 1], 0, &body, Wave64Mode::Native);
     assert_eq!(psv_wave_size(&gcn), (64, 64));
-    // On a Wave32-only GPU (e.g. NVIDIA), pick 32.
-    let nv = build_cs(
-        true,
-        [8, 4, 1],
-        0,
-        &body,
-        Some(WaveRange { min: 32, max: 32 }),
-    );
+    let nv = build_cs(true, [8, 4, 1], 0, &body, Wave64Mode::Wave32);
     assert_eq!(psv_wave_size(&nv), (32, 32));
 
     let base = 100u32;
@@ -326,16 +311,14 @@ fn wave64_small_group_runs_on_wave32_host() {
         let Ok(host) = Host::new(warp) else {
             continue;
         };
-        let Some(range) = host.wave_range() else {
-            continue;
+        let mode = host.recommended_wave64_mode();
+        let shader = build_cs(true, [8, 4, 1], 0, &body, mode);
+        let expected = match mode {
+            Wave64Mode::Native => (64, 64),
+            Wave64Mode::Wave32 => (32, 32),
+            Wave64Mode::Emulate => (0, u32::MAX),
         };
-        let chosen = range.choose(64, 32);
-        if range.min > chosen || chosen > range.max {
-            eprintln!("{label}: wave range {range:?} cannot hold 32 lanes in one wave; skipped");
-            continue;
-        }
-        let shader = build_cs(true, [8, 4, 1], 0, &body, Some(range));
-        assert_eq!(psv_wave_size(&shader), (chosen, chosen));
+        assert_eq!(psv_wave_size(&shader), expected);
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -387,7 +370,7 @@ fn wave64_64thread_sgpr_spills_run_on_wave32_host() {
     body.push(vop1(0x001, 2, sgpr(6))); // v_mov_b32 v2, s6
     body.extend_from_slice(&buffer_store_dword(2, 0, 8, false));
 
-    let shader = build_cs(true, [8, 8, 1], 0, &body, None);
+    let shader = build_cs(true, [8, 8, 1], 0, &body, Wave64Mode::Native);
     assert_eq!(psv_wave_size(&shader), (0, u32::MAX));
     for (label, words) in dispatch_on_all(&shader, [0x1234_0000, 0x0000_5678, 0, 0], 1) {
         assert_eq!(words[0], 0x1234_5678, "{label}: spilled SGPR sum mismatch");
@@ -403,7 +386,7 @@ fn wave64_64thread_sgpr_spills_run_on_wave32_host() {
     aliased.push(vop1(0x001, 2, sgpr(6)));
     aliased.extend_from_slice(&buffer_store_dword(2, 0, 8, false));
 
-    let aliased_shader = build_cs(true, [8, 8, 1], 0, &aliased, None);
+    let aliased_shader = build_cs(true, [8, 8, 1], 0, &aliased, Wave64Mode::Native);
     assert_eq!(psv_wave_size(&aliased_shader), (0, u32::MAX));
     for (label, words) in dispatch_on_all(&aliased_shader, [0xAAAA_AAAA, 0x5555_5555, 0, 0], 1) {
         assert_eq!(
@@ -421,7 +404,7 @@ fn wave64_unused_lds_header_does_not_force_wave64() {
     body.push(vop1(0x001, 2, sgpr(0))); // v_mov_b32 v2, s0
     body.extend_from_slice(&buffer_store_dword(2, 0, 8, false));
 
-    let shader = build_cs(true, [8, 8, 1], 1, &body, None); // 512 bytes LDS declared, unused
+    let shader = build_cs(true, [8, 8, 1], 1, &body, Wave64Mode::Native); // 512 bytes LDS declared, unused
     assert_eq!(psv_wave_size(&shader), (0, u32::MAX));
     for (label, words) in dispatch_on_all(&shader, [0xDEAD_BEEF, 0, 0, 0], 1) {
         assert_eq!(words[0], 0xDEAD_BEEF, "{label}: output mismatch");
@@ -479,7 +462,7 @@ fn pixel_shader_sgpr_spill_lowers_and_draws() {
         usage: 15,
         half: false,
     }];
-    let ps = lower_and_validate(&native, outputs, None);
+    let ps = lower_and_validate(&native, outputs, Wave64Mode::Native);
     let vs = passthrough_vs();
     let vertices = [
         -1.0f32, -1.0, 0.5, 1.0, //

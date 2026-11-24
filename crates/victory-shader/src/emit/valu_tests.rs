@@ -136,7 +136,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        host_waves: None,
+        options: super::TranslateOptions::default(),
     })
     .expect("lower");
 
