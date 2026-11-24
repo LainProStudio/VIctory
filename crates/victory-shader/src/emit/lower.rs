@@ -447,7 +447,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -6516,7 +6516,7 @@ impl<'a> Lower<'a> {
                 // The element type is part of the key: one UAV read as float
                 // and used atomically needs two handles (an atomic on a float
                 // handle is invalid and crashed the NVIDIA compiler).
-                let key = (self.cur, *load, *first, sampler, props.0, props.1);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -9208,7 +9208,12 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let atomic = name.starts_with("image_atomic_");
+        // A typed view's element: four F32 (9) components, or for atomics one
+        // U32 (5), which they need: a host that takes the element type from
+        // the annotation (vkd3d-proton) otherwise makes float atomics.
+        let element = if atomic { 0x105 } else { 0x409 };
+        let props = (kind | if uav || atomic { 0x1000 } else { 0 }, element);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
