@@ -147,14 +147,48 @@ impl Tally {
     }
 }
 
-/// Emitted shaders by label, shared between threads.
-type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
+/// The first emitted shader matching each requested label substring.
+struct PairShaders<'a> {
+    pending: Vec<&'a str>,
+    matches: Vec<(String, emit::HostShader)>,
+}
+
+impl<'a> PairShaders<'a> {
+    fn new(pairs: &'a [(String, String)]) -> Self {
+        Self {
+            pending: pairs
+                .iter()
+                .flat_map(|(v, p)| [v.as_str(), p.as_str()])
+                .collect(),
+            matches: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, label: impl FnOnce() -> String, shader: &emit::HostShader) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let label = label();
+        let before = self.pending.len();
+        self.pending.retain(|name| !label.contains(*name));
+        if self.pending.len() < before {
+            self.matches.push((label, shader.clone()));
+        }
+    }
+
+    fn find(&self, name: &str) -> Option<&emit::HostShader> {
+        self.matches
+            .iter()
+            .find(|(label, _)| label.contains(name))
+            .map(|(_, shader)| shader)
+    }
+}
 
 /// The optional checks and outputs after emission, one set per worker thread.
 struct Checks<'a> {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
-    keep: Option<Kept>,
+    keep: Option<&'a Mutex<PairShaders<'a>>>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
     /// Shared shader cache for `--write-cache` AOT warming.
@@ -282,7 +316,7 @@ pub fn run(
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
-    let kept = Arc::new(Mutex::new(Vec::new()));
+    let kept = Mutex::new(PairShaders::new(&pairs));
     let threads = jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
         .max(1);
@@ -299,7 +333,7 @@ pub fn run(
                     ..Tally::default()
                 };
                 let mut checks = Checks {
-                    keep: (!pairs.is_empty()).then(|| kept.clone()),
+                    keep: (!pairs.is_empty()).then_some(&kept),
                     validator: validate
                         .then(|| Validator::load(dll.as_deref()).ok())
                         .flatten(),
@@ -421,10 +455,9 @@ pub fn run(
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+            let made = match (kept.find(v), kept.find(p)) {
+                (Some(vs), Some(ps)) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
@@ -610,8 +643,8 @@ fn check(
     checks: &mut Checks<'_>,
     label: impl Fn() -> String,
 ) {
-    if let Some(keep) = &checks.keep {
-        lock(keep).push((label(), shader.clone()));
+    if let Some(keep) = checks.keep {
+        lock(keep).record(&label, &shader);
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
@@ -862,6 +895,58 @@ mod tests {
     use super::*;
     use victory_shader::RootParam;
     use victory_shader::native::{ComputeIo, StageIo};
+
+    #[test]
+    fn pair_scan_keeps_only_first_matches_and_shares_overlaps() {
+        let pairs = [
+            ("light".into(), "light_ps".into()),
+            ("world".into(), "light_ps".into()),
+            ("world".into(), "missing".into()),
+        ];
+        let kept = Mutex::new(PairShaders::new(&pairs));
+        let mut checks = Checks {
+            keep: Some(&kept),
+            validator: None,
+            host: None,
+            cache: None,
+        };
+        let mut tally = Tally::default();
+        let shader = host::stub_ps();
+        for name in [
+            "sky",
+            "lighting/light_ps",
+            "other/light_ps",
+            "sun",
+            "world_vs",
+            "world_ms",
+        ] {
+            check(shader.clone(), &mut tally, &mut checks, || name.to_owned());
+        }
+        let kept = lock(&kept);
+        let labels: Vec<_> = kept
+            .matches
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect();
+        assert_eq!(labels, ["lighting/light_ps", "world_vs"]);
+        assert!(std::ptr::eq(
+            kept.find("light").unwrap(),
+            kept.find("light_ps").unwrap()
+        ));
+        assert!(kept.find("world").is_some());
+        assert!(kept.find("missing").is_none());
+    }
+
+    #[test]
+    fn completed_pair_skips_subsequent_labels() {
+        let pairs = [(String::new(), "sky".into())];
+        let mut kept = PairShaders::new(&pairs);
+        let shader = host::stub_ps();
+        kept.record(|| "sky_ps".into(), &shader);
+        kept.record(|| panic!("all selectors already matched"), &shader);
+        assert_eq!(kept.matches.len(), 1);
+        assert!(kept.find("").is_some());
+    }
 
     fn track_compute_load(root: RootType, user_data: u8, sgprs: u32) -> resource::Resources {
         // s_load_dwordx4 s[8:11], s[0:1], 0; s_endpgm
