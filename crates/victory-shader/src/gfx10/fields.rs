@@ -807,6 +807,9 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     }
     if a16 {
         whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    } else if name.ends_with("_g16") {
+        // 16-bit derivatives only, two per dword, each direction its own.
+        whole + 2 * derivs.div_ceil(2) + packed
     } else {
         whole + 2 * derivs + packed
     }
