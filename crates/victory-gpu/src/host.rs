@@ -1941,6 +1941,14 @@ impl Host {
         readback_arena.reset(StagingKind::Readback);
         #[cfg(feature = "diagnostics")]
         {
+            crate::descriptor::host::attribution::finish_submission(
+                this_submission,
+                runs,
+                bindless_timings.plan_us,
+                bindless_timings.flush_us,
+                bindless_timings.placed_us,
+                total_cb_bytes,
+            );
             let prep_ms = (prepared - started).as_millis() as u64;
             let gpu_ms = gpu.as_millis() as u64;
             let copyback_ms = copying.elapsed().as_millis() as u64;
