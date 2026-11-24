@@ -897,6 +897,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     let base = address as usize;
     let mut physical = physical();
+    let _remap = RemapGuard::enter();
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -952,6 +953,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     let page_at = |idx: usize| pages.map_or(0, |p| p[idx]);
 
     let mut physical = physical();
+    let _remap = RemapGuard::enter();
     let mut i = 0;
     while i < n {
         let base = addresses[i] as usize;
@@ -1033,6 +1035,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         return true;
     }
     let mut physical = physical();
+    let _remap = RemapGuard::enter();
     unmap(&mut physical, to, len);
     if from == 0 {
         return true;
@@ -1092,6 +1095,9 @@ fn map_or_split(physical: &mut Physical, base: usize, len: usize, slice: Slice) 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, warn_on_fail: bool) -> bool {
+    if !slice.section.ensure_committed(slice.index, len / PAGE) {
+        return false;
+    }
     // SAFETY: coalesces adjacent placeholders if split, splits the placeholder
     // around the range (failing harmlessly when the range is the whole
     // placeholder), then maps the section there; all act only on placeholders.
@@ -1129,11 +1135,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, warn_on_f
                 "mapping physical pages failed (not a placeholder?)"
             );
         }
-        return false;
-    }
-    if !slice.section.ensure_committed(slice.index, len / PAGE) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
@@ -1254,11 +1255,35 @@ fn commit_limit_message(
     message
 }
 
-/// Non-zero while `unmap` is splitting a coalesced view and temporarily has its
-/// untouched neighbours unmapped; concurrent threads hitting those placeholders
-/// wait for `PHYSICAL` and retry once the neighbours are mapped again.
+/// Non-zero while `PHYSICAL` holds an active view split or whole-view
+/// replacement (`UnmapViewOfFile2(..., MEM_PRESERVE_PLACEHOLDER)` ->
+/// `MapViewOfFile3`), during which pages are temporarily placeholders;
+/// concurrent threads hitting them wait for `PHYSICAL` and retry once mapped.
 static SPLITTING: AtomicUsize = AtomicUsize::new(0);
 static SPLITTER_TID: AtomicU32 = AtomicU32::new(0);
+
+/// RAII guard protecting the placeholder window while holding `PHYSICAL`.
+struct RemapGuard {
+    prev_tid: u32,
+}
+
+impl RemapGuard {
+    fn enter() -> Self {
+        install_split_handler();
+        // SAFETY: plain query of the calling thread id.
+        let tid = unsafe { GetCurrentThreadId() };
+        let prev_tid = SPLITTER_TID.swap(tid, Ordering::AcqRel);
+        SPLITTING.fetch_add(1, Ordering::SeqCst);
+        Self { prev_tid }
+    }
+}
+
+impl Drop for RemapGuard {
+    fn drop(&mut self) {
+        SPLITTER_TID.store(self.prev_tid, Ordering::Release);
+        SPLITTING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 unsafe extern "system" fn on_split_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
@@ -1328,6 +1353,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    if hit.is_empty() {
+        return;
+    }
+    let _remap = RemapGuard::enter();
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -1344,13 +1373,6 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
-        let splitting = at < base || at + size > end;
-        if splitting {
-            install_split_handler();
-            // SAFETY: plain query of the calling thread id.
-            SPLITTER_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
-            SPLITTING.fetch_add(1, Ordering::SeqCst);
-        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1377,10 +1399,6 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let hole_start = base.max(at);
         let hole_end = end.min(at + size);
         victory_gpu::title_memory_remapped(hole_start, hole_end.saturating_sub(hole_start));
-        if splitting {
-            SPLITTER_TID.store(0, Ordering::Release);
-            SPLITTING.fetch_sub(1, Ordering::SeqCst);
-        }
     }
 }
 
@@ -2232,5 +2250,113 @@ mod tests {
         }
         assert_eq!(XMemFreePhysicalPages(a_pages.len(), a_pages.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(b_pages.len(), b_pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn concurrent_access_survives_whole_view_replacement() {
+        use std::sync::atomic::AtomicBool;
+
+        let pages_a = allocate(1);
+        let pages_b = allocate(1);
+        let pages_c = allocate(1);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let target = reserve();
+        let alias_src = reserve();
+        assert!(!target.is_null() && !alias_src.is_null());
+
+        let write_sentinel = |page: usize, val: u32| {
+            let mut bytes = [0u8; PAGE];
+            bytes[..4].copy_from_slice(&val.to_ne_bytes());
+            bytes[PAGE - 4..].copy_from_slice(&val.to_ne_bytes());
+            assert!(write_physical(&[page], 0, &bytes));
+        };
+        const VAL_A: u32 = 0x1111_2222;
+        const VAL_B: u32 = 0x3333_4444;
+        const VAL_C: u32 = 0x5555_6666;
+        write_sentinel(pages_a[0], VAL_A);
+        write_sentinel(pages_b[0], VAL_B);
+        write_sentinel(pages_c[0], VAL_C);
+
+        assert_eq!(XMemMapPhysicalPages(target, 1, pages_a.as_ptr()), target);
+        assert_eq!(
+            XMemMapPhysicalPages(alias_src, 1, pages_c.as_ptr()),
+            alias_src
+        );
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let target_addr = target as usize;
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let started = started.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut iters = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        // SAFETY: `target_addr` is continuously replaced with committed
+                        // 64 KiB physical views while `RemapGuard` serializes faults.
+                        unsafe {
+                            let head = (target_addr as *const u32).read_volatile();
+                            let tail = ((target_addr + PAGE - 4) as *const u32).read_volatile();
+                            assert!(
+                                head == VAL_A || head == VAL_B || head == VAL_C,
+                                "unexpected head {head:#x}"
+                            );
+                            assert!(
+                                tail == VAL_A || tail == VAL_B || tail == VAL_C,
+                                "unexpected tail {tail:#x}"
+                            );
+                        }
+                        if iters == 0 {
+                            started.fetch_add(1, Ordering::Release);
+                        }
+                        iters += 1;
+                    }
+                    iters
+                })
+            })
+            .collect();
+
+        while started.load(Ordering::Acquire) < readers.len() {
+            std::thread::yield_now();
+        }
+
+        for round in 0..200u32 {
+            match round % 3 {
+                0 => assert_eq!(XMemMapPhysicalPages(target, 1, pages_b.as_ptr()), target),
+                1 => assert!(map_alias(target as u64, alias_src as u64, PAGE as u64)),
+                _ => assert_eq!(XMemMapPhysicalPages(target, 1, pages_a.as_ptr()), target),
+            }
+        }
+
+        stop.store(true, Ordering::Release);
+        for reader in readers {
+            let iters = reader
+                .join()
+                .expect("reader must survive whole-view replacement without access violations");
+            assert!(iters > 0);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(target, 1, std::ptr::null()), target);
+        assert_eq!(
+            XMemMapPhysicalPages(alias_src, 1, std::ptr::null()),
+            alias_src
+        );
+        // SAFETY: our own reservations.
+        unsafe {
+            assert_ne!(VirtualFree(target, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(alias_src, 0, MEM_RELEASE), 0);
+        }
+        assert_eq!(XMemFreePhysicalPages(1, pages_a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, pages_b.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, pages_c.as_ptr()), 1);
     }
 }

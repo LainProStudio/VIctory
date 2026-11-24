@@ -42,6 +42,11 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            // The RPC runtime: titles ask it for UUIDs (UuidCreate,
+            // UuidFromString) and the console's rpcrt4 carries the same
+            // calls. Refused, those imports answer zero and a title that
+            // builds its identifiers with them gets the null GUID.
+            "rpcrt4.dll",
             "advapi32.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
@@ -144,5 +149,21 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostPolicy;
+
+    // #510: the title loads rpcrt4.dll for its UUID calls and the loader
+    // refused it, so the title's own identifiers came out as the null GUID.
+    #[test]
+    fn the_default_policy_passes_the_rpc_runtime_through() {
+        assert!(HostPolicy::default().allows("rpcrt4.dll"));
+        // DLL names from a title are not case-normalised before the lookup.
+        assert!(HostPolicy::default().allows("RPCRT4.DLL"));
+        // A strict policy still refuses it, as it refuses every host DLL.
+        assert!(!HostPolicy::none().allows("rpcrt4.dll"));
     }
 }
