@@ -154,12 +154,19 @@ impl ResolvedSlot {
 #[derive(Default)]
 struct Bindless {
     /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
-    slots: BTreeMap<u32, (u32, u32)>,
+    slots: HashMap<u32, (u32, u32)>,
     /// Subset of `slots` holding placed textures (`View::Placed(false, r, _)` with `r[0] != 1`).
     #[cfg_attr(not(test), allow(dead_code))]
     placed_tex: HashMap<u32, (u32, u32)>,
     /// Incremental resolution cache per tracked slot for unchanged slots.
     resolved: HashMap<u32, ResolvedSlot>,
+    /// Slots in `slots` that need resolution (not yet in `resolved`).
+    dirty: HashSet<u32>,
+    /// Slots backed by resource-dependent views (`View::Shader` / `View::Unordered`)
+    /// or unresolved slots that could become stale on `descriptor::forget`.
+    forgettable: HashSet<u32>,
+    /// Incrementally maintained `BindlessPlan` aggregates.
+    incremental: IncrementalPlan,
     /// Global `(placed_epoch, remap_epoch, forget_epoch)` under which `resolved` was built.
     resolved_global: (u64, u64, u64),
     /// What submissions do for the slots, cached with the revision key it was
@@ -169,6 +176,52 @@ struct Bindless {
     /// `(placed_revision, VIEWED_FORGET)`.
     #[cfg(test)]
     placed: Option<((u64, u64), PlacedSlots)>,
+}
+
+impl Bindless {
+    fn set_resolved(&mut self, index: u32, slot: ResolvedSlot) {
+        if let Some(old) = self.resolved.insert(index, slot) {
+            self.incremental.remove_slot(index, &old);
+        }
+        if let Some(cur) = self.resolved.get(&index) {
+            self.incremental.add_slot(index, cur);
+        }
+        self.dirty.remove(&index);
+    }
+
+    fn remove_resolved(&mut self, index: u32) {
+        if let Some(old) = self.resolved.remove(&index) {
+            self.incremental.remove_slot(index, &old);
+        }
+    }
+
+    fn clear_resolved(&mut self) {
+        self.resolved.clear();
+        self.incremental.clear();
+        self.dirty.clear();
+        self.dirty.extend(self.slots.keys().copied());
+        self.forgettable.clear();
+        self.forgettable.extend(self.slots.keys().copied());
+    }
+
+    /// Re-synchronizes `dirty` and `incremental` if `resolved` was mutated
+    /// directly outside `Bindless` helpers (such as in unit tests).
+    fn ensure_synced(&mut self) {
+        if self.resolved.len() == self.incremental.slot_count {
+            return;
+        }
+        self.incremental.clear();
+        for (&index, slot) in &self.resolved {
+            self.incremental.add_slot(index, slot);
+        }
+        self.dirty.clear();
+        for &index in self.slots.keys() {
+            if !self.resolved.contains_key(&index) {
+                self.dirty.insert(index);
+                self.forgettable.insert(index);
+            }
+        }
+    }
 }
 
 /// Bindless slots viewing placed textures: slot, view index and generation.
@@ -249,6 +302,7 @@ const WRITE_CAP: usize = 8 << 20;
 const READ_GAP: usize = 1 << 20;
 
 /// Deduplicated placed texture referenced by a [`BindlessPlan`].
+#[derive(Clone)]
 pub(crate) struct PlacedTextureTarget {
     /// Title `ID3D12Resource` handle address (`This as usize`) for `host_written` checks.
     pub(crate) resource: usize,
@@ -262,23 +316,28 @@ pub(crate) struct PlacedTextureTarget {
     pub(crate) watch_range: Option<(usize, usize)>,
 }
 
+type ShadowSpanList = Arc<Vec<(Arc<crate::shadow::Shadow>, usize, usize)>>;
+type PlacedCache = (Arc<Vec<PlacedTextureTarget>>, Arc<Vec<(usize, usize)>>);
+type ResolveChunk = (Vec<(SendResolved, bool)>, Vec<u32>, Vec<SendResource>);
+type ForgetScan = (bool, Vec<(u32, (u32, u32))>);
+
 /// What a submission does for a heap's bindless slots, made again only when
 /// the slots or what they view change ([`HostHeap::bindless_plan`]).
 pub(crate) struct BindlessPlan {
     /// Title memory the slots read, merged per host copy (address, bytes):
     /// refreshed at each submission using the heap.
-    pub(crate) reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    pub(crate) reads: ShadowSpanList,
     /// The unordered access slots' ranges (up to [`WRITE_CAP`] each), merged:
     /// copied back after a submission whose shaders may write memory.
-    pub(crate) writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    pub(crate) writes: ShadowSpanList,
     /// Deduplicated placed textures referenced by this heap's bindless slots.
-    pub(crate) placed_textures: Vec<PlacedTextureTarget>,
+    pub(crate) placed_textures: Arc<Vec<PlacedTextureTarget>>,
     /// Pre-coalesced page-aligned watch spans covering `placed_textures` with staging.
-    pub(crate) placed_watch_spans: Vec<(usize, usize)>,
+    pub(crate) placed_watch_spans: Arc<Vec<(usize, usize)>>,
     /// Misaligned constant buffers: bounce slice, title address, bytes.
-    bounces: Vec<(usize, u64, u32)>,
+    bounces: Arc<Vec<(usize, u64, u32)>>,
     /// The host resources the slots view, held while a submission runs.
-    _retained: Vec<ID3D12Resource>,
+    _retained: Arc<Vec<ID3D12Resource>>,
 }
 
 // SAFETY: D3D12 resources are free-threaded; the rest is plain data.
@@ -289,52 +348,448 @@ unsafe impl Sync for BindlessPlan {}
 impl BindlessPlan {
     /// Copies the misaligned constant buffers into their bounce slices.
     pub(crate) fn copy_constants(&self) {
-        for &(cpu, address, len) in &self.bounces {
-            let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::Copies, 1);
-                add(C::CopyBytes, u64::from(len));
-            }
-            crate::host::copy_mapped(cpu as *mut u8, address as *const u8, len as usize, false);
-            let us = started.elapsed().as_micros() as u64;
-            crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            crate::host::PREPARING[1].fetch_add(u64::from(len), Ordering::Relaxed);
+        if self.bounces.is_empty() {
+            return;
         }
+        let started = std::time::Instant::now();
+        let mut total_bytes = 0u64;
+        for &(_, _, len) in self.bounces.iter() {
+            total_bytes += u64::from(len);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Copies, self.bounces.len() as u64);
+            add(C::CopyBytes, total_bytes);
+        }
+        if self.bounces.len() >= 16 {
+            let workers = std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .min(8)
+                .min(self.bounces.len() / 8)
+                .max(1);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        loop {
+                            let idx = next.fetch_add(1, Ordering::Relaxed);
+                            if idx >= self.bounces.len() {
+                                break;
+                            }
+                            let (cpu, address, len) = self.bounces[idx];
+                            crate::host::copy_mapped(
+                                cpu as *mut u8,
+                                address as *const u8,
+                                len as usize,
+                                false,
+                            );
+                        }
+                    });
+                }
+            });
+        } else {
+            for &(cpu, address, len) in self.bounces.iter() {
+                crate::host::copy_mapped(cpu as *mut u8, address as *const u8, len as usize, false);
+            }
+        }
+        let us = started.elapsed().as_micros() as u64;
+        crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        crate::host::PREPARING[1].fetch_add(total_bytes, Ordering::Relaxed);
     }
 }
 
-type ShadowGroups<'a> = HashMap<usize, (&'a Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>;
+fn span_covered(merged: &[(usize, usize)], addr: usize, end: usize) -> bool {
+    let idx = merged.partition_point(|&(a, _)| a <= addr);
+    idx.checked_sub(1).is_some_and(|i| merged[i].1 >= end)
+}
 
-/// Sorts and merges `[addr, end)` spans grouped by shadow identity where adjacent
-/// spans lie within `gap` bytes of each other, cloning each `Arc<Shadow>` once per
-/// coalesced output range.
-fn merge_shadow_ranges(
-    mut groups: ShadowGroups<'_>,
-    gap: usize,
-) -> Vec<(Arc<crate::shadow::Shadow>, usize, usize)> {
-    let mut keys: Vec<usize> = groups.keys().copied().collect();
-    keys.sort_unstable();
-    let mut out = Vec::new();
-    for k in keys {
-        let (shadow, mut spans) = groups.remove(&k).expect("key from groups");
-        spans.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
-        for (addr, end) in spans {
-            if let Some((_, prev_end)) = merged.last_mut()
-                && addr <= *prev_end + gap
-            {
-                *prev_end = (*prev_end).max(end);
-                continue;
-            }
-            merged.push((addr, end));
+fn merge_sorted_spans(spans: &BTreeMap<(usize, usize), u32>, gap: usize) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for &(addr, end) in spans.keys() {
+        if let Some((_, prev_end)) = merged.last_mut()
+            && addr <= prev_end.saturating_add(gap)
+        {
+            *prev_end = (*prev_end).max(end);
+            continue;
         }
-        for (addr, end) in merged {
-            out.push((shadow.clone(), addr, end - addr));
+        merged.push((addr, end));
+    }
+    merged
+}
+
+struct ShadowSpanSet {
+    shadow: Arc<crate::shadow::Shadow>,
+    gap: usize,
+    spans: BTreeMap<(usize, usize), u32>,
+    merged: Option<Vec<(usize, usize)>>,
+}
+
+impl ShadowSpanSet {
+    fn new(shadow: Arc<crate::shadow::Shadow>, gap: usize) -> Self {
+        Self {
+            shadow,
+            gap,
+            spans: BTreeMap::new(),
+            merged: None,
         }
     }
-    out
+
+    fn insert(&mut self, addr: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = addr.saturating_add(len);
+        let count = self.spans.entry((addr, end)).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            let covered = self
+                .merged
+                .as_deref()
+                .is_some_and(|m| span_covered(m, addr, end));
+            if !covered {
+                self.merged = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove(&mut self, addr: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = addr.saturating_add(len);
+        if let Some(count) = self.spans.get_mut(&(addr, end)) {
+            *count -= 1;
+            if *count == 0 {
+                self.spans.remove(&(addr, end));
+                self.merged = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    fn merged_spans(&mut self) -> (&Arc<crate::shadow::Shadow>, &[(usize, usize)]) {
+        if self.merged.is_none() {
+            self.merged = Some(merge_sorted_spans(&self.spans, self.gap));
+        }
+        (&self.shadow, self.merged.as_deref().unwrap_or(&[]))
+    }
+}
+
+#[derive(Default)]
+struct IncrementalPlan {
+    slot_count: usize,
+    reads: BTreeMap<usize, ShadowSpanSet>,
+    writes: BTreeMap<usize, ShadowSpanSet>,
+    bounces: HashMap<u32, (usize, u64, u32)>,
+    placed: HashMap<usize, (PlacedTextureTarget, u32)>,
+    retained: HashMap<usize, (ID3D12Resource, u32)>,
+    reads_cache: Option<ShadowSpanList>,
+    writes_cache: Option<ShadowSpanList>,
+    bounces_cache: Option<Arc<Vec<(usize, u64, u32)>>>,
+    placed_cache: Option<PlacedCache>,
+    retained_cache: Option<Arc<Vec<ID3D12Resource>>>,
+}
+
+// SAFETY: all contained D3D12 resources and `Arc` wrappers are free-threaded.
+unsafe impl Send for IncrementalPlan {}
+
+impl IncrementalPlan {
+    fn clear(&mut self) {
+        self.slot_count = 0;
+        self.reads.clear();
+        self.writes.clear();
+        self.bounces.clear();
+        self.placed.clear();
+        self.retained.clear();
+        self.reads_cache = None;
+        self.writes_cache = None;
+        self.bounces_cache = None;
+        self.placed_cache = None;
+        self.retained_cache = None;
+    }
+
+    fn add_retained(&mut self, res: &ID3D12Resource) {
+        use windows::core::Interface;
+        let key = res.as_raw() as usize;
+        if let Some((_, count)) = self.retained.get_mut(&key) {
+            *count += 1;
+        } else {
+            self.retained.insert(key, (res.clone(), 1));
+            self.retained_cache = None;
+        }
+    }
+
+    fn remove_retained(&mut self, res: &ID3D12Resource) {
+        use windows::core::Interface;
+        let key = res.as_raw() as usize;
+        if let Some((_, count)) = self.retained.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.retained.remove(&key);
+                self.retained_cache = None;
+            }
+        }
+    }
+
+    fn add_span(
+        map: &mut BTreeMap<usize, ShadowSpanSet>,
+        cache: &mut Option<ShadowSpanList>,
+        shadow: &Arc<crate::shadow::Shadow>,
+        addr: usize,
+        len: usize,
+        gap: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let key = Arc::as_ptr(shadow) as usize;
+        let set = map
+            .entry(key)
+            .or_insert_with(|| ShadowSpanSet::new(shadow.clone(), gap));
+        if set.insert(addr, len) {
+            *cache = None;
+        }
+    }
+
+    fn remove_span(
+        map: &mut BTreeMap<usize, ShadowSpanSet>,
+        cache: &mut Option<ShadowSpanList>,
+        shadow: &Arc<crate::shadow::Shadow>,
+        addr: usize,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let key = Arc::as_ptr(shadow) as usize;
+        if let Some(set) = map.get_mut(&key)
+            && set.remove(addr, len)
+        {
+            *cache = None;
+            if set.is_empty() {
+                map.remove(&key);
+            }
+        }
+    }
+
+    fn add_slot(&mut self, index: u32, slot: &ResolvedSlot) {
+        self.slot_count += 1;
+        match slot {
+            ResolvedSlot::CbvDirect {
+                shadow,
+                address,
+                len,
+                res,
+            } => {
+                Self::add_span(
+                    &mut self.reads,
+                    &mut self.reads_cache,
+                    shadow,
+                    *address,
+                    *len,
+                    READ_GAP,
+                );
+                self.add_retained(res);
+            }
+            ResolvedSlot::CbvBounce {
+                cpu,
+                address,
+                len,
+                res,
+            } => {
+                self.bounces.insert(index, (*cpu, *address, *len));
+                self.bounces_cache = None;
+                self.add_retained(res);
+            }
+            ResolvedSlot::PlacedTex {
+                resource,
+                copy,
+                staging,
+                srv_state,
+                ..
+            } => {
+                self.add_retained(&copy.texture);
+                let key = Arc::as_ptr(copy) as usize;
+                if let Some((_, count)) = self.placed.get_mut(&key) {
+                    *count += 1;
+                } else {
+                    let watch_range = staging
+                        .as_ref()
+                        .map(|s| s.memory_range())
+                        .filter(|&(from, to)| from < to);
+                    self.placed.insert(
+                        key,
+                        (
+                            PlacedTextureTarget {
+                                resource: *resource,
+                                copy: copy.clone(),
+                                staging: staging.clone(),
+                                srv_state: *srv_state,
+                                watch_range,
+                            },
+                            1,
+                        ),
+                    );
+                    self.placed_cache = None;
+                }
+            }
+            ResolvedSlot::Buffer {
+                read, write, res, ..
+            } => {
+                if let Some((shadow, addr, len)) = read {
+                    Self::add_span(
+                        &mut self.reads,
+                        &mut self.reads_cache,
+                        shadow,
+                        *addr,
+                        *len,
+                        READ_GAP,
+                    );
+                }
+                if let Some((shadow, addr, len)) = write {
+                    Self::add_span(
+                        &mut self.writes,
+                        &mut self.writes_cache,
+                        shadow,
+                        *addr,
+                        *len,
+                        0,
+                    );
+                }
+                if let Some(res) = res {
+                    self.add_retained(res);
+                }
+            }
+            ResolvedSlot::Null { .. } => {}
+        }
+    }
+
+    fn remove_slot(&mut self, index: u32, slot: &ResolvedSlot) {
+        self.slot_count -= 1;
+        match slot {
+            ResolvedSlot::CbvDirect {
+                shadow,
+                address,
+                len,
+                res,
+            } => {
+                Self::remove_span(
+                    &mut self.reads,
+                    &mut self.reads_cache,
+                    shadow,
+                    *address,
+                    *len,
+                );
+                self.remove_retained(res);
+            }
+            ResolvedSlot::CbvBounce { res, .. } => {
+                if self.bounces.remove(&index).is_some() {
+                    self.bounces_cache = None;
+                }
+                self.remove_retained(res);
+            }
+            ResolvedSlot::PlacedTex { copy, .. } => {
+                self.remove_retained(&copy.texture);
+                let key = Arc::as_ptr(copy) as usize;
+                if let Some((_, count)) = self.placed.get_mut(&key) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.placed.remove(&key);
+                        self.placed_cache = None;
+                    }
+                }
+            }
+            ResolvedSlot::Buffer {
+                read, write, res, ..
+            } => {
+                if let Some((shadow, addr, len)) = read {
+                    Self::remove_span(
+                        &mut self.reads,
+                        &mut self.reads_cache,
+                        shadow,
+                        *addr,
+                        *len,
+                    );
+                }
+                if let Some((shadow, addr, len)) = write {
+                    Self::remove_span(
+                        &mut self.writes,
+                        &mut self.writes_cache,
+                        shadow,
+                        *addr,
+                        *len,
+                    );
+                }
+                if let Some(res) = res {
+                    self.remove_retained(res);
+                }
+            }
+            ResolvedSlot::Null { .. } => {}
+        }
+    }
+
+    fn build_merged(map: &mut BTreeMap<usize, ShadowSpanSet>) -> ShadowSpanList {
+        let mut out = Vec::new();
+        for set in map.values_mut() {
+            let (shadow, spans) = set.merged_spans();
+            for &(addr, end) in spans {
+                out.push((shadow.clone(), addr, end - addr));
+            }
+        }
+        Arc::new(out)
+    }
+
+    fn build_plan(&mut self) -> Arc<BindlessPlan> {
+        let reads = self
+            .reads_cache
+            .get_or_insert_with(|| Self::build_merged(&mut self.reads))
+            .clone();
+        let writes = self
+            .writes_cache
+            .get_or_insert_with(|| Self::build_merged(&mut self.writes))
+            .clone();
+        let bounces = self
+            .bounces_cache
+            .get_or_insert_with(|| Arc::new(self.bounces.values().copied().collect()))
+            .clone();
+        let (placed_textures, placed_watch_spans) = self
+            .placed_cache
+            .get_or_insert_with(|| {
+                let mut targets = Vec::with_capacity(self.placed.len());
+                let mut spans = Vec::new();
+                for (target, _) in self.placed.values() {
+                    if let Some(span) = target.watch_range {
+                        spans.push(span);
+                    }
+                    targets.push(target.clone());
+                }
+                crate::host::coalesce_ranges(&mut spans, crate::watch::PAGE);
+                (Arc::new(targets), Arc::new(spans))
+            })
+            .clone();
+        let _retained = self
+            .retained_cache
+            .get_or_insert_with(|| {
+                Arc::new(self.retained.values().map(|(r, _)| r.clone()).collect())
+            })
+            .clone();
+        Arc::new(BindlessPlan {
+            reads,
+            writes,
+            placed_textures,
+            placed_watch_spans,
+            bounces,
+            _retained,
+        })
+    }
 }
 
 struct StrideTable {
@@ -1172,9 +1627,12 @@ impl HostHeap {
         let removed_slot;
         {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            b.ensure_synced();
             removed_slot = b.slots.insert(index, entry) != Some(entry);
             if removed_slot {
-                b.resolved.remove(&index);
+                b.remove_resolved(index);
+                b.dirty.insert(index);
+                b.forgettable.insert(index);
                 self.revision.fetch_add(1, Ordering::Release);
             }
             if is_placed_tex {
@@ -1194,9 +1652,12 @@ impl HostHeap {
         let removed_slot;
         {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            b.ensure_synced();
             removed_slot = b.slots.remove(&index).is_some();
             if removed_slot {
-                b.resolved.remove(&index);
+                b.remove_resolved(index);
+                b.dirty.remove(&index);
+                b.forgettable.remove(&index);
                 self.revision.fetch_add(1, Ordering::Release);
             }
             if b.placed_tex.remove(&index).is_some() {
@@ -1508,10 +1969,13 @@ impl HostHeap {
         crate::host::retire_batch(retired);
         if !stale.is_empty() {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            b.ensure_synced();
             let mut placed_changed = false;
             for idx in &stale {
-                b.resolved.remove(idx);
+                b.remove_resolved(*idx);
                 b.slots.remove(idx);
+                b.dirty.remove(idx);
+                b.forgettable.remove(idx);
                 if b.placed_tex.remove(idx).is_some() {
                     placed_changed = true;
                 }
@@ -1549,7 +2013,6 @@ impl HostHeap {
     /// releasing individual resources prunes only stale slots in one `VIEWS`
     /// pass without invalidating live cached slots.
     pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
-        use windows::core::Interface;
         if self.sampler {
             return None;
         }
@@ -1558,8 +2021,9 @@ impl HostHeap {
             let global = (key.1, key.2, key.3);
             let mut remap_invalidated = false;
             let mut remap_checked_eviction = false;
-            let (check_forget, entries_or_dirty): (bool, Vec<(u32, (u32, u32))>) = {
+            let (check_forget, entries_or_dirty): ForgetScan = {
                 let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+                b.ensure_synced();
                 if let Some((cached_key, plan)) = &b.plan
                     && *cached_key == key
                 {
@@ -1570,7 +2034,7 @@ impl HostHeap {
                         b.placed_tex.clear();
                         self.bump_placed(&b);
                     }
-                    b.resolved.clear();
+                    b.clear_resolved();
                     b.resolved_global = global;
                     b.plan = None;
                     return None;
@@ -1579,24 +2043,31 @@ impl HostHeap {
                 if prev.1 != global.1 {
                     let before = b.resolved.len();
                     if let Some(remaps) = remaps_since(prev.1, global.1) {
-                        b.resolved.retain(|_, v| !v.overlaps(&remaps));
+                        if !remaps.is_empty() {
+                            let evicted: Vec<u32> = b
+                                .resolved
+                                .iter()
+                                .filter(|(_, v)| v.overlaps(&remaps))
+                                .map(|(&idx, _)| idx)
+                                .collect();
+                            for idx in evicted {
+                                b.remove_resolved(idx);
+                                if b.slots.contains_key(&idx) {
+                                    b.dirty.insert(idx);
+                                }
+                            }
+                        }
                         remap_checked_eviction = true;
                     } else {
-                        b.resolved.clear();
+                        b.clear_resolved();
                     }
                     remap_invalidated = b.resolved.len() != before;
                 }
                 let need_forget = prev.2 != global.2;
                 b.resolved_global = global;
-                let dirty: Vec<(u32, (u32, u32))> = b
-                    .slots
-                    .iter()
-                    .filter(|(idx, _)| !b.resolved.contains_key(idx))
-                    .map(|(&idx, &v)| (idx, v))
-                    .collect();
                 if !need_forget
                     && !remap_invalidated
-                    && dirty.is_empty()
+                    && b.dirty.is_empty()
                     && let Some((cached_key, plan)) = &mut b.plan
                     && cached_key.0 == key.0
                     && (cached_key.1 == global.0 || remap_checked_eviction)
@@ -1605,59 +2076,69 @@ impl HostHeap {
                     return Some(plan.clone());
                 }
                 let list = if need_forget {
-                    b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
+                    b.forgettable
+                        .iter()
+                        .filter_map(|idx| b.slots.get(idx).map(|&v| (*idx, v)))
+                        .collect()
                 } else {
-                    dirty
+                    b.dirty
+                        .iter()
+                        .filter_map(|idx| b.slots.get(idx).map(|&v| (*idx, v)))
+                        .collect()
                 };
                 (need_forget, list)
             };
 
             let dirty: Vec<(u32, (u32, u32))> = if check_forget {
-                let stale_forgotten = crate::descriptor::stale_slots(&entries_or_dirty);
+                let stale_forgotten = if entries_or_dirty.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::descriptor::stale_slots(&entries_or_dirty)
+                };
                 let had_stale = !stale_forgotten.is_empty();
-                let mut retired = Vec::new();
-                for &idx in &stale_forgotten {
-                    self.clear_stale_slot_into(idx, &mut retired);
-                }
-                crate::host::retire_batch(retired);
-                {
-                    let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-                    let mut placed_changed = false;
+                if had_stale {
+                    let mut retired = Vec::new();
                     for &idx in &stale_forgotten {
-                        b.resolved.remove(&idx);
-                        b.slots.remove(&idx);
-                        if b.placed_tex.remove(&idx).is_some() {
-                            placed_changed = true;
+                        self.clear_stale_slot_into(idx, &mut retired);
+                    }
+                    crate::host::retire_batch(retired);
+                    {
+                        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+                        b.ensure_synced();
+                        let mut placed_changed = false;
+                        for &idx in &stale_forgotten {
+                            b.remove_resolved(idx);
+                            b.slots.remove(&idx);
+                            b.dirty.remove(&idx);
+                            b.forgettable.remove(&idx);
+                            if b.placed_tex.remove(&idx).is_some() {
+                                placed_changed = true;
+                            }
                         }
-                    }
-                    if placed_changed {
-                        self.bump_placed(&b);
-                    }
-                    if b.slots.is_empty() {
-                        if !b.placed_tex.is_empty() {
-                            b.placed_tex.clear();
+                        if placed_changed {
                             self.bump_placed(&b);
                         }
-                        b.resolved.clear();
-                        b.plan = None;
-                        drop(b);
-                        for idx in stale_forgotten {
-                            self.deactivate_bounce(idx);
+                        if b.slots.is_empty() {
+                            if !b.placed_tex.is_empty() {
+                                b.placed_tex.clear();
+                                self.bump_placed(&b);
+                            }
+                            b.clear_resolved();
+                            b.plan = None;
+                            drop(b);
+                            for idx in stale_forgotten {
+                                self.deactivate_bounce(idx);
+                            }
+                            return None;
                         }
-                        return None;
+                    }
+                    for &idx in &stale_forgotten {
+                        self.deactivate_bounce(idx);
                     }
                 }
-                for &idx in &stale_forgotten {
-                    self.deactivate_bounce(idx);
-                }
                 let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-                let dirty: Vec<(u32, (u32, u32))> = b
-                    .slots
-                    .iter()
-                    .filter(|(idx, _)| !b.resolved.contains_key(idx))
-                    .map(|(&idx, &v)| (idx, v))
-                    .collect();
-                if !had_stale && !remap_invalidated && dirty.is_empty() {
+                b.ensure_synced();
+                if !had_stale && !remap_invalidated && b.dirty.is_empty() {
                     let current_global = (
                         crate::resource::placed_epoch(),
                         VIEWED_REMAP.load(Ordering::Acquire),
@@ -1677,7 +2158,10 @@ impl HostHeap {
                         return Some(plan.clone());
                     }
                 }
-                dirty
+                b.dirty
+                    .iter()
+                    .filter_map(|idx| b.slots.get(idx).map(|&v| (*idx, v)))
+                    .collect()
             } else {
                 entries_or_dirty
             };
@@ -1690,12 +2174,15 @@ impl HostHeap {
             }
 
             let looked_up = crate::descriptor::views_at(&dirty);
-            let mut work: Vec<(u32, (u32, u32), View)> = Vec::with_capacity(looked_up.len());
+            let mut work: Vec<(u32, (u32, u32), View, bool)> = Vec::with_capacity(looked_up.len());
             let mut stale = Vec::new();
             let mut to_retire: Vec<SendResource> = Vec::new();
             for (index, entry, view) in looked_up {
                 match view {
-                    Some(v) if v.is_buffer() => work.push((index, entry, v)),
+                    Some(v) if v.is_buffer() => {
+                        let forgettable = matches!(v, View::Shader(..) | View::Unordered(..));
+                        work.push((index, entry, v, forgettable));
+                    }
                     Some(_) => stale.push(index),
                     None => {
                         self.clear_stale_slot_into(index, &mut to_retire);
@@ -1704,10 +2191,10 @@ impl HostHeap {
                 }
             }
 
-            let newly_resolved: Vec<(u32, (u32, u32), ResolvedSlot)> = if work.len() < 64 {
+            let newly_resolved: Vec<(u32, (u32, u32), ResolvedSlot, bool)> = if work.len() < 64 {
                 let mut committed = CommittedCache::default();
                 let mut out = Vec::with_capacity(work.len());
-                for (index, (vi, generation), view) in work {
+                for (index, (vi, generation), view, forgettable) in work {
                     match self.resolve_bindless_slot(
                         index,
                         vi,
@@ -1716,7 +2203,7 @@ impl HostHeap {
                         &mut committed,
                         &mut to_retire,
                     ) {
-                        Some(slot) => out.push((index, (vi, generation), slot)),
+                        Some(slot) => out.push((index, (vi, generation), slot, forgettable)),
                         None => stale.push(index),
                     }
                 }
@@ -1728,7 +2215,7 @@ impl HostHeap {
                     .min(work.len() / 16)
                     .max(1);
                 let next = std::sync::atomic::AtomicUsize::new(0);
-                let chunks: Vec<(Vec<SendResolved>, Vec<u32>, Vec<SendResource>)> =
+                let chunks: Vec<ResolveChunk> =
                     std::thread::scope(|s| {
                         let handles: Vec<_> = (0..workers)
                             .map(|_| {
@@ -1743,7 +2230,9 @@ impl HostHeap {
                                             break;
                                         }
                                         let end = (start + 16).min(work.len());
-                                        for (index, (vi, generation), view) in work[start..end].iter() {
+                                        for (index, (vi, generation), view, forgettable) in
+                                            work[start..end].iter()
+                                        {
                                             match self.resolve_bindless_slot(
                                                 *index,
                                                 *vi,
@@ -1752,10 +2241,9 @@ impl HostHeap {
                                                 &mut committed,
                                                 &mut local_retired,
                                             ) {
-                                                Some(slot) => resolved.push(SendResolved(
-                                                    *index,
-                                                    (*vi, *generation),
-                                                    slot,
+                                                Some(slot) => resolved.push((
+                                                    SendResolved(*index, (*vi, *generation), slot),
+                                                    *forgettable,
                                                 )),
                                                 None => local_stale.push(*index),
                                             }
@@ -1772,7 +2260,11 @@ impl HostHeap {
                     });
                 let mut out = Vec::with_capacity(work.len());
                 for (resolved, local_stale, local_retired) in chunks {
-                    out.extend(resolved.into_iter().map(|SendResolved(i, e, r)| (i, e, r)));
+                    out.extend(
+                        resolved
+                            .into_iter()
+                            .map(|(SendResolved(i, e, r), f)| (i, e, r, f)),
+                    );
                     stale.extend(local_stale);
                     to_retire.extend(local_retired);
                 }
@@ -1786,10 +2278,13 @@ impl HostHeap {
                 }
             }
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            b.ensure_synced();
             let mut placed_changed = false;
             for idx in stale {
-                b.resolved.remove(&idx);
+                b.remove_resolved(idx);
                 b.slots.remove(&idx);
+                b.dirty.remove(&idx);
+                b.forgettable.remove(&idx);
                 if b.placed_tex.remove(&idx).is_some() {
                     placed_changed = true;
                 }
@@ -1806,20 +2301,43 @@ impl HostHeap {
             let remap_changed = b.resolved_global.1 != current_global.1;
             if remap_changed {
                 if let Some(remaps) = remaps_since(b.resolved_global.1, current_global.1) {
-                    b.resolved.retain(|_, v| !v.overlaps(&remaps));
-                    for (index, entry, resolved) in newly_resolved {
+                    if !remaps.is_empty() {
+                        let evicted: Vec<u32> = b
+                            .resolved
+                            .iter()
+                            .filter(|(_, v)| v.overlaps(&remaps))
+                            .map(|(&idx, _)| idx)
+                            .collect();
+                        for idx in evicted {
+                            b.remove_resolved(idx);
+                            if b.slots.contains_key(&idx) {
+                                b.dirty.insert(idx);
+                            }
+                        }
+                    }
+                    for (index, entry, resolved, forgettable) in newly_resolved {
                         if b.slots.get(&index) == Some(&entry) && !resolved.overlaps(&remaps) {
-                            b.resolved.insert(index, resolved);
+                            b.set_resolved(index, resolved);
+                            if forgettable {
+                                b.forgettable.insert(index);
+                            } else {
+                                b.forgettable.remove(&index);
+                            }
                         }
                     }
                 } else {
-                    b.resolved.clear();
+                    b.clear_resolved();
                 }
                 b.resolved_global.1 = current_global.1;
             } else {
-                for (index, entry, resolved) in newly_resolved {
+                for (index, entry, resolved, forgettable) in newly_resolved {
                     if b.slots.get(&index) == Some(&entry) {
-                        b.resolved.insert(index, resolved);
+                        b.set_resolved(index, resolved);
+                        if forgettable {
+                            b.forgettable.insert(index);
+                        } else {
+                            b.forgettable.remove(&index);
+                        }
                     }
                 }
             }
@@ -1832,113 +2350,18 @@ impl HostHeap {
                     b.placed_tex.clear();
                     self.bump_placed(&b);
                 }
-                b.resolved.clear();
+                b.clear_resolved();
                 b.plan = None;
                 return None;
             }
 
-            let mut read_groups: ShadowGroups<'_> = HashMap::new();
-            let mut write_groups: ShadowGroups<'_> = HashMap::new();
-            let mut bounces = Vec::new();
-            let mut placed_textures = Vec::new();
-            let mut placed_watch_spans = Vec::new();
-            let mut seen_placed_copies = HashSet::<usize>::new();
-            let mut seen_res = HashSet::<usize>::new();
-            let mut retained = Vec::new();
-            let mut push_res = |res: &ID3D12Resource| {
-                if seen_res.insert(res.as_raw() as usize) {
-                    retained.push(res.clone());
-                }
-            };
-            fn add_span<'a>(
-                groups: &mut ShadowGroups<'a>,
-                shadow: &'a Arc<crate::shadow::Shadow>,
-                addr: usize,
-                len: usize,
-            ) {
-                if len == 0 {
-                    return;
-                }
-                groups
-                    .entry(Arc::as_ptr(shadow) as usize)
-                    .or_insert_with(|| (shadow, Vec::new()))
-                    .1
-                    .push((addr, addr.saturating_add(len)));
-            }
-            for resolved in b.resolved.values() {
-                match resolved {
-                    ResolvedSlot::CbvDirect {
-                        shadow,
-                        address,
-                        len,
-                        res,
-                    } => {
-                        add_span(&mut read_groups, shadow, *address, *len);
-                        push_res(res);
-                    }
-                    ResolvedSlot::CbvBounce {
-                        cpu,
-                        address,
-                        len,
-                        res,
-                    } => {
-                        bounces.push((*cpu, *address, *len));
-                        push_res(res);
-                    }
-                    ResolvedSlot::PlacedTex {
-                        resource,
-                        copy,
-                        staging,
-                        srv_state,
-                        ..
-                    } => {
-                        push_res(&copy.texture);
-                        if seen_placed_copies.insert(Arc::as_ptr(copy) as usize) {
-                            let watch_range = staging
-                                .as_ref()
-                                .map(|s| s.memory_range())
-                                .filter(|&(from, to)| from < to);
-                            if let Some(span) = watch_range {
-                                placed_watch_spans.push(span);
-                            }
-                            placed_textures.push(PlacedTextureTarget {
-                                resource: *resource,
-                                copy: copy.clone(),
-                                staging: staging.clone(),
-                                srv_state: *srv_state,
-                                watch_range,
-                            });
-                        }
-                    }
-                    ResolvedSlot::Buffer { read, write, res, .. } => {
-                        if let Some((shadow, addr, len)) = read {
-                            add_span(&mut read_groups, shadow, *addr, *len);
-                        }
-                        if let Some((shadow, addr, len)) = write {
-                            add_span(&mut write_groups, shadow, *addr, *len);
-                        }
-                        if let Some(res) = res {
-                            push_res(res);
-                        }
-                    }
-                    ResolvedSlot::Null { .. } => {}
-                }
-            }
-            crate::host::coalesce_ranges(&mut placed_watch_spans, crate::watch::PAGE);
             let plan_key = (
                 self.revision.load(Ordering::Acquire),
                 current_global.0,
                 current_global.1,
                 current_global.2,
             );
-            let plan = Arc::new(BindlessPlan {
-                reads: merge_shadow_ranges(read_groups, READ_GAP),
-                writes: merge_shadow_ranges(write_groups, 0),
-                placed_textures,
-                placed_watch_spans,
-                bounces,
-                _retained: retained,
-            });
+            let plan = b.incremental.build_plan();
             b.plan = Some((plan_key, plan.clone()));
             return Some(plan);
         }
@@ -4755,5 +5178,19 @@ void main(uint3 id : SV_DispatchThreadID) {
         if let Some(heap) = HostHeap::new(false, 1_048_576) {
             assert!(heap.count + heap.dynamic <= PORTABLE_VIEWS);
         }
+    }
+
+    #[test]
+    fn incremental_span_merge_and_coverage_helpers() {
+        let mut spans = BTreeMap::new();
+        spans.insert((0x1000, 0x1100), 1);
+        spans.insert((0x1200, 0x1400), 1);
+        spans.insert((0x20_0000, 0x20_1000), 1);
+        let merged = merge_sorted_spans(&spans, READ_GAP);
+        assert_eq!(merged, vec![(0x1000, 0x1400), (0x20_0000, 0x20_1000)]);
+        assert!(span_covered(&merged, 0x1080, 0x1300));
+        assert!(!span_covered(&merged, 0x1300, 0x1500));
+        assert!(span_covered(&merged, 0x20_0000, 0x20_1000));
+        assert!(!span_covered(&merged, 0x20_0000, 0x20_2000));
     }
 }

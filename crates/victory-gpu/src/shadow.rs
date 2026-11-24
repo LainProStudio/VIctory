@@ -36,6 +36,14 @@ pub(crate) struct UploadCopy {
     pub(crate) len: u64,
 }
 
+/// One CPU->upload-staging byte copy collected during `Shadow` staging so
+/// multiple staging copies can run concurrently across worker threads.
+pub(crate) struct StagedCopy {
+    pub(crate) dst: usize,
+    pub(crate) src: usize,
+    pub(crate) len: usize,
+}
+
 /// A title buffer's host copy in `D3D12_HEAP_TYPE_DEFAULT` memory.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -376,13 +384,16 @@ impl Shadow {
 
     /// Updates `[address, address + len)` using a pre-fetched cross-shadow
     /// write-watch answer when eligible, otherwise falls back to [`Shadow::update`].
-    pub(crate) fn update_with_watch(
+    /// When `deferred` is `Some`, staging memory is allocated and queued in
+    /// `deferred` without executing `copy_mapped` inline.
+    pub(crate) fn update_with_watch_into(
         self: &Arc<Self>,
         address: usize,
         len: usize,
         prefetched: Option<(u64, &[(usize, u64)])>,
         alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
         out: &mut Vec<UploadCopy>,
+        deferred: Option<&mut Vec<StagedCopy>>,
     ) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), address.saturating_add(len).min(end));
@@ -393,7 +404,7 @@ impl Shadow {
             && self.can_use_prefetched(from, to)
         {
             self.watched.store(1, Ordering::Relaxed);
-            let copied = self.copy_stale(from, to, now, written, alloc, out);
+            let copied = self.copy_stale_into(from, to, now, written, alloc, out, deferred);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -402,19 +413,31 @@ impl Shadow {
             }
             return copied;
         }
-        self.update(from, to - from, alloc, out)
+        self.update_into(from, to - from, alloc, out, deferred)
     }
 
     /// At submission: stages what changed of `[address, address + len)` since
     /// it was last copied (all of it if the memory is not write-watched) into
     /// upload memory allocated via `alloc`, pushing GPU copy descriptors onto
     /// `out`. Returns the bytes staged.
+    #[cfg(test)]
     pub(crate) fn update(
         self: &Arc<Self>,
         address: usize,
         len: usize,
         alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
         out: &mut Vec<UploadCopy>,
+    ) -> usize {
+        self.update_into(address, len, alloc, out, None)
+    }
+
+    fn update_into(
+        self: &Arc<Self>,
+        address: usize,
+        len: usize,
+        alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
+        out: &mut Vec<UploadCopy>,
+        deferred: Option<&mut Vec<StagedCopy>>,
     ) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), address.saturating_add(len).min(end));
@@ -448,19 +471,20 @@ impl Shadow {
             return if gaps.is_empty() {
                 0
             } else {
-                self.update_gaps(&gaps, alloc, out)
+                self.update_gaps_into(&gaps, alloc, out, deferred)
             };
         }
-        self.update_free(from, to, alloc, out)
+        self.update_free_into(from, to, alloc, out, deferred)
     }
 
     /// [`Shadow::update`] of disjoint non-busy `gaps` (`from < to`, in ascending
     /// order) using a single write-watch query across the bounding span.
-    fn update_gaps(
+    fn update_gaps_into(
         self: &Arc<Self>,
         gaps: &[(usize, usize)],
         alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
         out: &mut Vec<UploadCopy>,
+        mut deferred: Option<&mut Vec<StagedCopy>>,
     ) -> usize {
         #[cfg(feature = "diagnostics")]
         let span: usize = gaps.iter().map(|&(f, t)| t - f).sum();
@@ -470,7 +494,15 @@ impl Shadow {
                 self.watched.store(1, Ordering::Relaxed);
                 let mut copied = 0usize;
                 for &(f, t) in gaps {
-                    copied += self.copy_stale(f, t, now, &written, alloc, out);
+                    copied += self.copy_stale_into(
+                        f,
+                        t,
+                        now,
+                        &written,
+                        alloc,
+                        out,
+                        deferred.as_deref_mut(),
+                    );
                 }
                 #[cfg(feature = "diagnostics")]
                 {
@@ -484,24 +516,25 @@ impl Shadow {
         }
         let mut staged = 0usize;
         for &(f, t) in gaps {
-            staged += self.stage(f, t, alloc, out);
+            staged += self.stage_into(f, t, alloc, out, deferred.as_deref_mut());
         }
         staged
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(
+    fn update_free_into(
         self: &Arc<Self>,
         from: usize,
         to: usize,
         alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
         out: &mut Vec<UploadCopy>,
+        deferred: Option<&mut Vec<StagedCopy>>,
     ) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written, alloc, out);
+                let copied = self.copy_stale_into(from, to, now, &written, alloc, out, deferred);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -512,13 +545,14 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
-        self.stage(from, to, alloc, out)
+        self.stage_into(from, to, alloc, out, deferred)
     }
 
     /// Stages the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(
+    #[allow(clippy::too_many_arguments)]
+    fn copy_stale_into(
         self: &Arc<Self>,
         from: usize,
         to: usize,
@@ -526,6 +560,7 @@ impl Shadow {
         written: &[(usize, u64)],
         alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
         out: &mut Vec<UploadCopy>,
+        mut deferred: Option<&mut Vec<StagedCopy>>,
     ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -551,16 +586,23 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.stage((first * PAGE).max(from), (page * PAGE).min(to), alloc, out);
+                bytes += self.stage_into(
+                    (first * PAGE).max(from),
+                    (page * PAGE).min(to),
+                    alloc,
+                    out,
+                    deferred.as_deref_mut(),
+                );
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.stage(
+            bytes += self.stage_into(
                 (first * PAGE).max(from),
                 ((last + 1) * PAGE).min(to),
                 alloc,
                 out,
+                deferred,
             );
         }
         bytes
@@ -568,13 +610,15 @@ impl Shadow {
 
     /// Copies title memory `[from, to)`, cut to the buffer, into upload
     /// staging memory and records the GPU copy into this default-heap buffer.
-    fn stage(
+    fn stage_into(
         self: &Arc<Self>,
         from: usize,
         to: usize,
         alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
         out: &mut Vec<UploadCopy>,
+        deferred: Option<&mut Vec<StagedCopy>>,
     ) -> usize {
+        const STAGE_STRIPE: usize = 1 << 20;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         let len = to.saturating_sub(from);
@@ -584,7 +628,20 @@ impl Shadow {
         let Some((src, src_offset, dst_ptr)) = alloc(len) else {
             return 0;
         };
-        crate::host::copy_mapped(dst_ptr, from as *const u8, len, false);
+        if let Some(vec) = deferred {
+            let mut off = 0usize;
+            while off < len {
+                let chunk = (len - off).min(STAGE_STRIPE);
+                vec.push(StagedCopy {
+                    dst: dst_ptr as usize + off,
+                    src: from + off,
+                    len: chunk,
+                });
+                off += chunk;
+            }
+        } else {
+            crate::host::copy_mapped(dst_ptr, from as *const u8, len, false);
+        }
         out.push(UploadCopy {
             shadow: self.clone(),
             src,

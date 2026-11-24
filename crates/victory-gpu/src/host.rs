@@ -1140,7 +1140,7 @@ struct StagingArena {
 unsafe impl Send for StagingArena {}
 
 const STAGING_CHUNK: u64 = 4 << 20;
-const MAX_POOLED_STAGING_CHUNKS: usize = 4;
+const MAX_POOLED_STAGING_CHUNKS: usize = 8;
 
 impl StagingArena {
     fn alloc(
@@ -2798,6 +2798,9 @@ impl HostList {
                     }
                 }
                 let mut spans: Ranges = due.iter().map(|&(_, _, r)| r).collect();
+                if due.len() > 1 && !crate::texture::hash_textures() {
+                    crate::watch::sweep_ranges(&spans);
+                }
                 let prefetched: Vec<PrefetchedWatch> = if due.len() > 1 {
                     coalesce_ranges(&mut spans, crate::watch::PAGE);
                     if spans.len() < due.len() {
@@ -2909,6 +2912,8 @@ impl HostList {
 struct Batch {
     /// Per copy, `[from, to)` ranges in the order they came.
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)>,
+    /// Index into `refreshes` by `Arc::as_ptr(shadow) as usize`.
+    refresh_index: std::collections::HashMap<usize, usize>,
     /// Staged GPU upload copies to record on the shadow upload prelude list.
     uploads: Vec<crate::shadow::UploadCopy>,
     /// Staging buffers (by address) refreshed since the last overlapping title
@@ -2950,13 +2955,13 @@ impl Batch {
             return;
         }
         let range = (address, address.saturating_add(len));
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, ranges)) => ranges.push(range),
-            None => self.refreshes.push((shadow.clone(), vec![range])),
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if let Some(&idx) = self.refresh_index.get(&key) {
+            self.refreshes[idx].1.push(range);
+        } else {
+            let idx = self.refreshes.len();
+            self.refreshes.push((shadow.clone(), vec![range]));
+            self.refresh_index.insert(key, idx);
         }
     }
 
@@ -3094,6 +3099,7 @@ impl Batch {
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)> = Vec::new();
         let mut total_due_ranges = 0usize;
         let mut all_spans: Ranges = Vec::new();
+        self.refresh_index.clear();
         for (shadow, ranges) in std::mem::take(&mut self.refreshes) {
             let (mut due, keep): (Ranges, Ranges) = ranges
                 .into_iter()
@@ -3109,8 +3115,14 @@ impl Batch {
                 work.push((shadow.clone(), due));
             }
             if !keep.is_empty() {
+                let idx = self.refreshes.len();
+                self.refresh_index
+                    .insert(std::sync::Arc::as_ptr(&shadow) as usize, idx);
                 self.refreshes.push((shadow, keep));
             }
+        }
+        if all_spans.len() > 1 {
+            crate::watch::sweep_ranges(&all_spans);
         }
         let prefetched: Vec<PrefetchedWatch> = if !all_spans.is_empty() {
             coalesce_ranges(&mut all_spans, crate::watch::PAGE);
@@ -3125,6 +3137,7 @@ impl Batch {
         } else {
             Vec::new()
         };
+        let mut staged_copies: Vec<crate::shadow::StagedCopy> = Vec::new();
         for (shadow, due) in work {
             for (from, to) in due {
                 update_with_prefetched(
@@ -3134,8 +3147,41 @@ impl Batch {
                     &prefetched,
                     &mut |n| upload_arena.alloc(host, StagingKind::Upload, n),
                     &mut self.uploads,
+                    Some(&mut staged_copies),
                 );
             }
+        }
+        let total_bytes: usize = staged_copies.iter().map(|c| c.len).sum();
+        if total_bytes > 0 {
+            let started = std::time::Instant::now();
+            if staged_copies.len() >= 2 && total_bytes >= (128 << 10) {
+                let workers = std::thread::available_parallelism()
+                    .map_or(4, |n| n.get())
+                    .min(8)
+                    .min(staged_copies.len());
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                std::thread::scope(|s| {
+                    for _ in 0..workers {
+                        s.spawn(|| {
+                            loop {
+                                let idx = next.fetch_add(1, Ordering::Relaxed);
+                                if idx >= staged_copies.len() {
+                                    break;
+                                }
+                                let c = &staged_copies[idx];
+                                copy_mapped(c.dst as *mut u8, c.src as *const u8, c.len, false);
+                            }
+                        });
+                    }
+                });
+            } else {
+                for c in &staged_copies {
+                    copy_mapped(c.dst as *mut u8, c.src as *const u8, c.len, false);
+                }
+            }
+            let us = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            PREPARING[1].fetch_add(total_bytes as u64, Ordering::Relaxed);
         }
     }
 
@@ -3161,7 +3207,7 @@ impl Batch {
                 continue;
             };
             plan.copy_constants();
-            for (shadow, address, len) in &plan.reads {
+            for (shadow, address, len) in plan.reads.iter() {
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -3179,6 +3225,25 @@ impl Batch {
 
         #[cfg(feature = "diagnostics")]
         let t_flush = std::time::Instant::now();
+        // Pre-sweep all write-watched buffer and placed-texture ranges together
+        // in one allocation-coalesced batch before flushing.
+        if !self.refreshes.is_empty() || !pending_plans.is_empty() {
+            let mut sweep_spans: Ranges = self
+                .refreshes
+                .iter()
+                .flat_map(|(_, ranges)| ranges.iter().copied())
+                .collect();
+            if !crate::texture::hash_textures() {
+                sweep_spans.extend(
+                    pending_plans
+                        .iter()
+                        .flat_map(|(plan, _)| plan.placed_watch_spans.iter().copied()),
+                );
+            }
+            if sweep_spans.len() > 1 {
+                crate::watch::sweep_ranges(&sweep_spans);
+            }
+        }
         self.flush(host, upload_arena);
         #[cfg(feature = "diagnostics")]
         {
@@ -3194,7 +3259,7 @@ impl Batch {
             if !*writes {
                 continue;
             }
-            for &(ref shadow, address, len) in &plan.writes {
+            for &(ref shadow, address, len) in plan.writes.iter() {
                 if len == 0 {
                     continue;
                 }
@@ -3231,7 +3296,7 @@ impl Batch {
         let mut unique_targets = Vec::new();
         let mut work_items = Vec::new();
         for (plan, _) in &pending_plans {
-            for target in &plan.placed_textures {
+            for target in plan.placed_textures.iter() {
                 if !seen_copies.insert(std::sync::Arc::as_ptr(&target.copy) as usize) {
                     continue;
                 }
@@ -3349,6 +3414,7 @@ fn update_with_prefetched(
     prefetched: &[PrefetchedWatch],
     alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
     out: &mut Vec<crate::shadow::UploadCopy>,
+    deferred: Option<&mut Vec<crate::shadow::StagedCopy>>,
 ) {
     let idx = prefetched.partition_point(|&(sf, _, _)| sf <= from);
     let found = idx
@@ -3358,13 +3424,16 @@ fn update_with_prefetched(
             (st >= to).then_some(res.as_ref()).flatten()
         })
         .map(|(now, list)| (*now, list.as_slice()));
+    let deferred_active = deferred.is_some();
     let started = std::time::Instant::now();
-    let copied = shadow.update_with_watch(from, to - from, found, alloc, out);
+    let copied = shadow.update_with_watch_into(from, to - from, found, alloc, out, deferred);
     let us = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
     crate::copystat::range(from, to - from, us, 0);
-    PREPARING[0].fetch_add(us, Ordering::Relaxed);
-    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    if !deferred_active {
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
 }
 
 /// Copies title memory at submission. The ranges were checked against their

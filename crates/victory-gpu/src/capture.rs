@@ -18,22 +18,43 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 
 static EXTRA_FRAMES: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
-/// When `VICTORY_CAPTURE_WORLD_DRAWS=<min>` is set, automatically schedules
-/// swapchain and target capture for the next frame after world frames 2, 4,
-/// and 7 (capturing full render targets on world frames 3, 5, and 8).
-pub(crate) fn note_world_frame(frame: u64, draws_this_frame: u64) {
+fn parse_positive_u64(v: &str) -> Option<u64> {
+    v.trim().parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+fn min_world_draws(capture_env: Option<&str>, exit_env: Option<&str>) -> Option<u64> {
+    if let Some(min) = capture_env.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return Some(min);
+    }
+    exit_env.and_then(parse_positive_u64).map(|_| 500)
+}
+
+fn exit_after_world_frames() -> Option<u64> {
+    static TARGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var("VICTORY_EXIT_AFTER_WORLD_FRAMES")
+            .ok()
+            .as_deref()
+            .and_then(parse_positive_u64)
+    })
+}
+
+/// When `VICTORY_CAPTURE_WORLD_DRAWS=<min>` is set (or `VICTORY_EXIT_AFTER_WORLD_FRAMES`
+/// is set, defaulting `<min>` to `500`), automatically schedules swapchain and
+/// target capture for the next frame after world frames 2, 4, and 7 (capturing
+/// full render targets on world frames 3, 5, and 8). Returns `Some(world_frame)`
+/// once `VICTORY_EXIT_AFTER_WORLD_FRAMES` is reached.
+pub(crate) fn note_world_frame(frame: u64, draws_this_frame: u64) -> Option<u64> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static MIN: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     static COUNT: AtomicU64 = AtomicU64::new(0);
-    let Some(min) = *MIN.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_WORLD_DRAWS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-    }) else {
-        return;
-    };
+    let min = (*MIN.get_or_init(|| {
+        let capture_env = std::env::var("VICTORY_CAPTURE_WORLD_DRAWS").ok();
+        let exit_env = std::env::var("VICTORY_EXIT_AFTER_WORLD_FRAMES").ok();
+        min_world_draws(capture_env.as_deref(), exit_env.as_deref())
+    }))?;
     if draws_this_frame < min {
-        return;
+        return None;
     }
     let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if matches!(n, 2 | 4 | 7) {
@@ -50,6 +71,9 @@ pub(crate) fn note_world_frame(frame: u64, draws_this_frame: u64) {
             "scheduled auto world-frame capture and target dump"
         );
     }
+    exit_after_world_frames()
+        .filter(|&target| n >= target)
+        .map(|_| n)
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -662,5 +686,14 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn world_frame_threshold_defaults_when_exit_env_is_set() {
+        assert_eq!(super::min_world_draws(None, None), None);
+        assert_eq!(super::min_world_draws(None, Some("0")), None);
+        assert_eq!(super::min_world_draws(None, Some(" 8 ")), Some(500));
+        assert_eq!(super::min_world_draws(Some(" 250 "), Some("8")), Some(250));
+        assert_eq!(super::min_world_draws(Some("100"), None), Some(100));
     }
 }

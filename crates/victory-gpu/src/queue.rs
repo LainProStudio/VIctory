@@ -262,12 +262,12 @@ extern "system" fn present(
 ) -> HRESULT {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(all(windows, feature = "diagnostics"))]
-    {
+    let exit_world_frame = {
         static PREV_DRAWN: AtomicU64 = AtomicU64::new(0);
         let now = crate::draw::drawn();
         let prev = PREV_DRAWN.swap(now, Ordering::Relaxed);
-        crate::capture::note_world_frame(frame, now.saturating_sub(prev));
-    }
+        crate::capture::note_world_frame(frame, now.saturating_sub(prev))
+    };
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -323,6 +323,15 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(world_frame) = exit_world_frame {
+        tracing::info!(
+            frame,
+            world_frame,
+            "exiting cleanly after VICTORY_EXIT_AFTER_WORLD_FRAMES"
+        );
+        std::process::exit(0);
+    }
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

@@ -232,7 +232,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let mut not_watched = false;
         for &(a, e) in &asks {
             let mut count = (e - a) * PAGE / KERNEL_PAGE;
-            j.found.resize(count.max(j.found.len()), 0);
+            if j.found.len() < count {
+                j.found.resize(count, 0);
+            }
             let mut granularity = 0;
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
@@ -260,7 +262,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                     add(C::WatchDirectBytes, len as u64);
                     direct_ok_range(a * PAGE, len, us);
                 }
-                found.extend(j.found[..count].iter().map(|&at| at / PAGE));
+                let mut prev_page = usize::MAX;
+                for &at in &j.found[..count] {
+                    let page = at / PAGE;
+                    if page != prev_page {
+                        found.push(page);
+                        prev_page = page;
+                    }
+                }
             } else {
                 #[cfg(feature = "diagnostics")]
                 let phase_started = std::time::Instant::now();
@@ -328,6 +337,170 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Returns `(allocation_base, region_base, region_end)` when `addr` lies in a
+/// committed or reserved `MEM_PRIVATE` VirtualAlloc allocation.
+fn alloc_base_private(addr: usize) -> Option<(usize, usize, usize)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `VirtualQuery` inspects virtual memory metadata without dereferencing `addr`.
+    let n = unsafe { VirtualQuery(addr as *const _, &mut info, size_of_val(&info)) };
+    if n == size_of_val(&info) && info.State != MEM_FREE && info.Type == MEM_PRIVATE {
+        let alloc = info.AllocationBase as usize;
+        let reg_base = info.BaseAddress as usize;
+        let reg_end = reg_base.saturating_add(info.RegionSize);
+        (alloc != 0).then_some((alloc, reg_base, reg_end))
+    } else {
+        None
+    }
+}
+
+/// Pre-sweeps `ranges` (`[from, to)` byte spans) during an active [`Sweep`] by
+/// coalescing un-swept spans that share the same `MEM_PRIVATE` `AllocationBase`
+/// into a single `GetWriteWatch` query per allocation cluster, reducing kernel
+/// write-watch calls dramatically without risking stale reads.
+pub(crate) fn sweep_ranges(ranges: &[(usize, usize)]) {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    const MAX_SWEEP_GAP: usize = 64 << 20;
+    const MAX_SWEEP_SPAN: usize = 256 << 20;
+
+    if ranges.is_empty() {
+        return;
+    }
+    let mut page_ranges: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|&&(from, to)| from < to)
+        .map(|&(from, to)| (from / PAGE, to.div_ceil(PAGE)))
+        .collect();
+    if page_ranges.is_empty() {
+        return;
+    }
+    page_ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(page_ranges.len());
+    for (a, e) in page_ranges {
+        match merged.last_mut() {
+            Some((_, prev_e)) if a <= *prev_e => *prev_e = (*prev_e).max(e),
+            _ => merged.push((a, e)),
+        }
+    }
+
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    if j.sweeper != Some(std::thread::current().id()) {
+        return;
+    }
+    let mut unswept: Vec<(usize, usize)> = Vec::new();
+    for (a, e) in merged {
+        unswept.extend(gaps(&j.swept, a, e));
+    }
+    if unswept.is_empty() {
+        return;
+    }
+    {
+        let g = guards();
+        unswept.retain(|&(a, e)| !g.is_view_range(a, e) && !g.is_view(a));
+    }
+    if unswept.is_empty() {
+        return;
+    }
+
+    let mut clusters: Vec<(usize, usize)> = Vec::new();
+    let mut cur: Option<(usize, usize, usize)> = None;
+    let mut last_region: Option<(usize, usize, usize)> = None;
+    let mut lookup = |addr: usize| -> Option<usize> {
+        if let Some((alloc, rb, re)) = last_region
+            && addr >= rb
+            && addr < re
+        {
+            return Some(alloc);
+        }
+        let info = alloc_base_private(addr)?;
+        last_region = Some(info);
+        Some(info.0)
+    };
+    for (a, e) in unswept {
+        let Some(alloc_start) = lookup(a * PAGE) else {
+            continue;
+        };
+        let Some(alloc_end) = lookup((e * PAGE).saturating_sub(1)) else {
+            continue;
+        };
+        if alloc_start != alloc_end {
+            continue;
+        }
+        match cur {
+            Some((c_alloc, c_a, c_e))
+                if c_alloc == alloc_start
+                    && a.saturating_sub(c_e) * PAGE <= MAX_SWEEP_GAP
+                    && e.saturating_sub(c_a) * PAGE <= MAX_SWEEP_SPAN =>
+            {
+                cur = Some((c_alloc, c_a, c_e.max(e)));
+            }
+            Some((_, c_a, c_e)) => {
+                clusters.push((c_a, c_e));
+                cur = Some((alloc_start, a, e));
+            }
+            None => cur = Some((alloc_start, a, e)),
+        }
+    }
+    if let Some((_, c_a, c_e)) = cur {
+        clusters.push((c_a, c_e));
+    }
+
+    for (a, e) in clusters {
+        let mut count = (e - a) * PAGE / KERNEL_PAGE;
+        if j.found.len() < count {
+            j.found.resize(count, 0);
+        }
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        tests::KERNEL_ASKED.with(|n| n.set(n.get() + 1));
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (a * PAGE) as *const _,
+                (e - a) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        if !failed {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add, direct_ok_range};
+                let us = started.elapsed().as_micros() as u64;
+                let len = (e - a) * PAGE;
+                add(C::Watches, 1);
+                add(C::WatchUs, us);
+                add(C::WatchDirectOk, 1);
+                add(C::WatchDirectOkUs, us);
+                add(C::WatchDirectBytes, len as u64);
+                direct_ok_range(a * PAGE, len, us);
+            }
+            sweep_in(&mut j.swept, a, e);
+            if count > 0 {
+                j.asked += 1;
+                let now = j.asked;
+                let mut prev_page = usize::MAX;
+                for &at in &j.found[..count] {
+                    let page = at / PAGE;
+                    if page != prev_page {
+                        j.written.insert(page, now);
+                        prev_page = page;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The pages of `[start, end)` written, asked allocation by allocation:
@@ -1688,6 +1861,32 @@ mod tests {
         unsafe { ((p + 2 * PAGE) as *mut u8).write(1) };
         let (now, after) = writes(p, p + 3 * PAGE, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, inv), (p / PAGE + 2, now)]);
+        drop(sweep);
+    }
+
+    #[test]
+    fn sweep_ranges_coalesces_disjoint_ranges_in_same_allocation() {
+        let p = watched(8);
+        // SAFETY: committed pages inside our write-watched allocation.
+        unsafe {
+            (p as *mut u8).write(1);
+            ((p + 6 * PAGE) as *mut u8).write(2);
+        }
+        let sweep = Sweep::begin();
+        let asked_before = kernel_asked();
+        sweep_ranges(&[(p, p + PAGE), (p + 6 * PAGE, p + 7 * PAGE)]);
+        assert_eq!(
+            kernel_asked(),
+            asked_before + 1,
+            "disjoint spans in same MEM_PRIVATE allocation coalesce to one GetWriteWatch"
+        );
+        let (_, w0) = writes(p, p + PAGE, true).expect("watched");
+        let (_, w1) = writes(p + 6 * PAGE, p + 7 * PAGE, true).expect("watched");
+        assert_eq!(kernel_asked(), asked_before + 1, "already swept");
+        assert_eq!(w0.len(), 1);
+        assert_eq!(w1.len(), 1);
+        assert_eq!(w0[0].0, p / PAGE);
+        assert_eq!(w1[0].0, p / PAGE + 6);
         drop(sweep);
     }
 }
