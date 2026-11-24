@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -140,16 +140,80 @@ impl Tally {
     }
 }
 
-/// Emitted shaders by label, shared between threads.
-type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
+/// The first emitted shader matching each requested label substring.
+struct PairShaders<'a> {
+    pending: Vec<&'a str>,
+    matches: Vec<(String, emit::HostShader)>,
+}
+
+impl<'a> PairShaders<'a> {
+    fn new(pairs: &'a [(String, String)]) -> Self {
+        Self {
+            pending: pairs
+                .iter()
+                .flat_map(|(v, p)| [v.as_str(), p.as_str()])
+                .filter(|name| !name.is_empty())
+                .collect(),
+            matches: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, label: impl FnOnce() -> String, shader: &emit::HostShader) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let label = label();
+        let before = self.pending.len();
+        self.pending.retain(|name| !label.contains(*name));
+        if self.pending.len() < before {
+            self.matches.push((label, shader.clone()));
+        }
+    }
+
+    fn find(&self, name: &str) -> Option<&emit::HostShader> {
+        self.matches
+            .iter()
+            .find(|(label, _)| label.contains(name))
+            .map(|(_, shader)| shader)
+    }
+}
 
 /// The optional checks after emission, one set per thread.
-struct Checks {
+struct Checks<'a> {
+    hashes: Option<&'a [String]>,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
-    keep: Option<Kept>,
+    keep: Option<&'a Mutex<PairShaders<'a>>>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+}
+
+#[derive(clap::Args)]
+pub struct HashOptions {
+    /// Only translate matching container hash prefixes (comma-separated).
+    #[arg(long)]
+    hash: Option<String>,
+    /// Additional prefixes separated by whitespace or commas; # starts a comment.
+    #[arg(long)]
+    hash_file: Option<PathBuf>,
+}
+
+impl HashOptions {
+    fn prefixes(&self) -> Result<Option<Vec<String>>> {
+        let mut prefixes = crate::shader::hash_prefixes(self.hash.as_deref().unwrap_or_default());
+        if let Some(path) = &self.hash_file {
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("reading hash file {}", path.display()))?;
+            for line in contents.trim_start_matches('\u{feff}').lines() {
+                let body = line.split('#').next().unwrap_or_default();
+                prefixes.extend(
+                    body.split_whitespace()
+                        .flat_map(crate::shader::hash_prefixes),
+                );
+            }
+        }
+        Ok((self.hash_file.is_some() || !prefixes.is_empty()).then_some(prefixes))
+    }
 }
 
 pub fn run(
@@ -158,7 +222,9 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    hashes: HashOptions,
 ) -> Result<()> {
+    let hashes = hashes.prefixes()?;
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -178,7 +244,7 @@ pub fn run(
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
-    let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let kept = Mutex::new(PairShaders::new(&pairs));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
@@ -204,7 +270,8 @@ pub fn run(
                             ..Tally::default()
                         };
                         let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            hashes: hashes.as_deref(),
+                            keep: (!pairs.is_empty()).then_some(&kept),
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
@@ -273,10 +340,9 @@ pub fn run(
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+            let made = match (kept.find(v), kept.find(p)) {
+                (Some(vs), Some(ps)) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
@@ -312,6 +378,11 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    if let Some(prefixes) = checks.hashes
+        && !crate::shader::matches_hash(prefixes, &blake3::hash(&bytes).to_hex()[..16])
+    {
+        return;
+    }
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -418,11 +489,11 @@ fn translate(
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
     label: impl Fn() -> String,
 ) {
-    if let Some(keep) = &checks.keep {
-        lock(keep).push((label(), shader.clone()));
+    if let Some(keep) = checks.keep {
+        lock(keep).record(&label, &shader);
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
@@ -668,4 +739,170 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn container(metadata: u8) -> Vec<u8> {
+        let mut payload = vec![0u8; 0x68 + 0x54 + 0x34];
+        payload[..8].copy_from_slice(&6u64.to_le_bytes());
+        for offset in [8, 16, 24, 32, 40, 48, 72] {
+            payload[offset..offset + 8].copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes());
+        }
+        let cs = 0x68;
+        let code_offset = payload.len() as u64;
+        payload[0x60..cs].copy_from_slice(&(cs as u64).to_le_bytes());
+        payload[cs..cs + 8].copy_from_slice(&code_offset.to_le_bytes());
+        payload[cs + 8..cs + 16].copy_from_slice(&4u64.to_le_bytes());
+        for axis in payload[cs + 0x54 + 0x28..].as_chunks_mut::<4>().0 {
+            *axis = 1u32.to_le_bytes();
+        }
+        payload.extend_from_slice(&0xBF81_0000u32.to_le_bytes());
+
+        let mut fssm = b"FSSM".to_vec();
+        fssm.extend(0x101u32.to_le_bytes());
+        fssm.extend((payload.len() as u64).to_le_bytes());
+        fssm.extend(payload);
+
+        let len = u16::try_from(fssm.len()).unwrap();
+        let mut zlib = vec![0x78, 0x01, 0x01];
+        zlib.extend(len.to_le_bytes());
+        zlib.extend((!len).to_le_bytes());
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in &fssm {
+            a = (a + u32::from(byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        zlib.extend_from_slice(&fssm);
+        zlib.extend(((b << 16) | a).to_be_bytes());
+
+        let mut xbch = b"XBCH".to_vec();
+        xbch.extend(3u32.to_le_bytes());
+        xbch.extend((zlib.len() as u64).to_le_bytes());
+        xbch.extend((fssm.len() as u64).to_le_bytes());
+        xbch.extend(zlib);
+
+        let mut dxil = vec![0; 0x18];
+        dxil.extend(b"XDAT");
+        for field in [1, 0x24, 0x0d, 0x30, xbch.len() as u32] {
+            dxil.extend(field.to_le_bytes());
+        }
+        dxil.extend(xbch);
+
+        let dxil_at = 40u32;
+        let private_at = (dxil_at + 8 + dxil.len() as u32).next_multiple_of(4);
+        let mut bytes = b"DXBC".to_vec();
+        bytes.extend([0; 16]);
+        for field in [1, private_at + 9, 2, dxil_at, private_at] {
+            bytes.extend(field.to_le_bytes());
+        }
+        bytes.extend(b"DXIL");
+        bytes.extend((dxil.len() as u32).to_le_bytes());
+        bytes.extend(dxil);
+        bytes.resize(private_at as usize, 0);
+        bytes.extend(b"PRIV");
+        bytes.extend(1u32.to_le_bytes());
+        bytes.push(metadata);
+        bytes
+    }
+
+    #[test]
+    fn filters_shared_dxil_containers_by_runtime_hash_before_deduplication() {
+        let first = container(1);
+        let second = container(2);
+        let first_hash = blake3::hash(&first).to_hex()[..16].to_owned();
+        let second_hash = blake3::hash(&second).to_hex()[..16].to_owned();
+        let scan = |hashes: Option<&[String]>| {
+            let seen = Mutex::default();
+            let mut checks = Checks {
+                hashes,
+                keep: None,
+                validator: None,
+                host: None,
+            };
+            let mut t = Tally::default();
+            for data in [&first, &second, &second] {
+                translate(
+                    &Source::Raw { offset: 0, data },
+                    Path::new("synthetic"),
+                    &seen,
+                    &mut t,
+                    &mut checks,
+                );
+            }
+            (t.containers, t.cs_emitted, t.duplicates)
+        };
+        assert_eq!(scan(Some(&[second_hash[..12].into()])), (2, 1, 1));
+        assert_eq!(scan(Some(&[first_hash, second_hash])), (3, 1, 2));
+        assert_eq!(scan(Some(&["ffffffffffffffff".into()])), (0, 0, 0));
+        assert_eq!(scan(Some(&[])), (0, 0, 0));
+        assert_eq!(scan(None), (3, 1, 2));
+    }
+
+    #[test]
+    fn combines_command_line_and_commented_hash_file() {
+        let path = std::env::temp_dir().join(format!("victory-hashes-{}.txt", std::process::id()));
+        std::fs::write(&path, "\u{feff}# header\r\n\n Cc, DD\tee # ff\r\n11").unwrap();
+        let options = HashOptions {
+            hash: Some(" A, b".into()),
+            hash_file: Some(path.clone()),
+        };
+        let parsed = options.prefixes();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(parsed.unwrap().unwrap(), ["a", "b", "cc", "dd", "ee", "11"]);
+    }
+
+    #[test]
+    fn pair_scan_keeps_only_first_matches_and_shares_overlaps() {
+        let pairs = [
+            ("light".into(), "light_ps".into()),
+            ("world".into(), "light_ps".into()),
+            ("world".into(), "missing".into()),
+        ];
+        let kept = Mutex::new(PairShaders::new(&pairs));
+        let mut checks = Checks {
+            hashes: None,
+            keep: Some(&kept),
+            validator: None,
+            host: None,
+        };
+        let mut tally = Tally::default();
+        let shader = host::stub_ps();
+        for name in [
+            "sky",
+            "lighting/light_ps",
+            "other/light_ps",
+            "sun",
+            "world_vs",
+            "world_ms",
+        ] {
+            check(shader.clone(), &mut tally, &mut checks, || name.to_owned());
+        }
+        let kept = lock(&kept);
+        let labels: Vec<_> = kept
+            .matches
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect();
+        assert_eq!(labels, ["lighting/light_ps", "world_vs"]);
+        assert!(std::ptr::eq(
+            kept.find("light").unwrap(),
+            kept.find("light_ps").unwrap()
+        ));
+        assert!(kept.find("world").is_some());
+        assert!(kept.find("missing").is_none());
+    }
+
+    #[test]
+    fn completed_pair_skips_subsequent_labels() {
+        let pairs = [(String::new(), "sky".into())];
+        let mut kept = PairShaders::new(&pairs);
+        let shader = host::stub_ps();
+        kept.record(|| "sky_ps".into(), &shader);
+        kept.record(|| panic!("all selectors already matched"), &shader);
+        assert_eq!(kept.matches.len(), 1);
+        assert!(kept.find("").is_some());
+    }
 }
