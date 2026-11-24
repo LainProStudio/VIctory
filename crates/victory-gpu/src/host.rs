@@ -1139,8 +1139,8 @@ struct StagingArena {
 // accessed only while holding the arena's mutex under `Host::submitted`.
 unsafe impl Send for StagingArena {}
 
-const STAGING_CHUNK: u64 = 4 << 20;
-const MAX_POOLED_STAGING_CHUNKS: usize = 8;
+const STAGING_CHUNK: u64 = 8 << 20;
+const MAX_POOLED_STAGING_CHUNKS: usize = 16;
 
 impl StagingArena {
     fn alloc(
@@ -1746,16 +1746,124 @@ impl Host {
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done.
         let copying = std::time::Instant::now();
-        for r in &readback_plans {
-            // SAFETY: the fence completed and readback_arena is still alive and mapped.
-            let (old, after) = unsafe {
-                (
-                    std::slice::from_raw_parts(r.before_ptr, r.len),
-                    std::slice::from_raw_parts(r.after_ptr, r.len),
-                )
-            };
-            let written = r.shadow.copy_back_range(r.from, old, after);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        let mut total_cb_bytes = 0usize;
+        let mut total_cb_written = 0usize;
+        if !readback_plans.is_empty() {
+            const CB_STRIPE: usize = 1 << 20;
+            struct CbStripe {
+                plan_idx: usize,
+                shadow: std::sync::Arc<crate::shadow::Shadow>,
+                from: usize,
+                before: usize,
+                after: usize,
+                len: usize,
+            }
+            struct CbOutcome(usize, Vec<usize>);
+            let mut stripes = Vec::new();
+            for (plan_idx, r) in readback_plans.iter().enumerate() {
+                total_cb_bytes += r.len;
+                let shadow_start = r.shadow.start_addr() as usize;
+                let mut at = r.from;
+                let end = r.from + r.len;
+                while at < end {
+                    let page_aligned_next = ((shadow_start + at) / CB_STRIPE + 1) * CB_STRIPE;
+                    let next = page_aligned_next.saturating_sub(shadow_start).min(end);
+                    let len = next - at;
+                    if len > 0 {
+                        let rel = at - r.from;
+                        // SAFETY: `before_ptr + rel.. + len` and `after_ptr + rel.. + len`
+                        // lie inside the readback buffers owned by `readback_plans`.
+                        let (before, after) = unsafe {
+                            (r.before_ptr.add(rel) as usize, r.after_ptr.add(rel) as usize)
+                        };
+                        stripes.push(CbStripe {
+                            plan_idx,
+                            shadow: r.shadow.clone(),
+                            from: at,
+                            before,
+                            after,
+                            len,
+                        });
+                    }
+                    at = next;
+                }
+            }
+            let outcomes: Vec<CbOutcome> =
+                if stripes.len() >= 2 && total_cb_bytes >= (256 << 10) {
+                    let workers = std::thread::available_parallelism()
+                        .map_or(4, |n| n.get())
+                        .min(8)
+                        .min(stripes.len());
+                    let next = std::sync::atomic::AtomicUsize::new(0);
+                    let mut slots: Vec<CbOutcome> = (0..stripes.len())
+                        .map(|_| CbOutcome(0, Vec::new()))
+                        .collect();
+                    let slot_base = slots.as_mut_ptr() as usize;
+                    std::thread::scope(|s| {
+                        let stripes_ref = &stripes;
+                        let next_ref = &next;
+                        for _ in 0..workers {
+                            s.spawn(move || loop {
+                                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                                if idx >= stripes_ref.len() {
+                                    break;
+                                }
+                                let st = &stripes_ref[idx];
+                                // SAFETY: the fence completed, `readback_arena` is live and
+                                // mapped, and page-aligned 1 MiB stripes touch disjoint 64 KiB
+                                // title pages across threads.
+                                let (old, after) = unsafe {
+                                    (
+                                        std::slice::from_raw_parts(
+                                            st.before as *const u8,
+                                            st.len,
+                                        ),
+                                        std::slice::from_raw_parts(st.after as *const u8, st.len),
+                                    )
+                                };
+                                let (w, synced) =
+                                    st.shadow.copy_back_stripe(st.from, old, after);
+                                // SAFETY: `idx` was claimed atomically and uniquely.
+                                unsafe {
+                                    let dst = (slot_base as *mut CbOutcome).add(idx);
+                                    dst.write(CbOutcome(w, synced));
+                                }
+                            });
+                        }
+                    });
+                    slots
+                } else {
+                    stripes
+                        .iter()
+                        .map(|st| {
+                            // SAFETY: the fence completed and `readback_arena` is live and mapped.
+                            let (old, after) = unsafe {
+                                (
+                                    std::slice::from_raw_parts(st.before as *const u8, st.len),
+                                    std::slice::from_raw_parts(st.after as *const u8, st.len),
+                                )
+                            };
+                            let (w, synced) = st.shadow.copy_back_stripe(st.from, old, after);
+                            CbOutcome(w, synced)
+                        })
+                        .collect()
+                };
+            let mut per_plan: Vec<(usize, Vec<usize>)> =
+                vec![(0, Vec::new()); readback_plans.len()];
+            for (st, CbOutcome(w, synced)) in stripes.into_iter().zip(outcomes) {
+                let entry = &mut per_plan[st.plan_idx];
+                entry.0 += w;
+                entry.1.extend(synced);
+            }
+            for (r, (written, mut synced)) in readback_plans.iter().zip(per_plan) {
+                total_cb_written += written;
+                // SAFETY: the fence completed and `readback_arena` is live and mapped.
+                let after = unsafe { std::slice::from_raw_parts(r.after_ptr, r.len) };
+                r.shadow
+                    .rearm_synced_pages(r.from, r.len, after, &mut synced);
+                r.shadow.log_written(r.from, r.len, written);
+            }
+            COPY_BACK[1].fetch_add(total_cb_written as u64, Ordering::Relaxed);
         }
         for shadow in pending_shadows {
             shadow.clear_pending();
@@ -1790,6 +1898,8 @@ impl Host {
                     bindless_uploads = bindless_timings.uploads,
                     gpu_ms,
                     copyback_ms,
+                    cb_mb = total_cb_bytes / (1 << 20),
+                    cb_written_kb = total_cb_written / 1024,
                     tex_uploads,
                     "slow submission breakdown"
                 );

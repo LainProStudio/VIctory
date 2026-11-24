@@ -1077,7 +1077,7 @@ impl Resource {
                 let clear = clear
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-                let texture = host_texture(&self.desc, state, clear)?;
+                let (texture, placed_alloc) = host_texture_with_alloc(&self.desc, state, clear)?;
                 let state =
                     crate::host::legal_state(&texture, crate::host::texture_state(state));
                 // Depth and unordered access (see `host_texture`).
@@ -1090,17 +1090,28 @@ impl Resource {
                             texture,
                             state: 0.into(),
                             twin: None,
+                            _alloc: None,
                         })
                     });
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
                     twin,
+                    _alloc: placed_alloc,
                 }))
             })
             .as_ref()
     }
 }
+
+/// Keeps a retired placed texture resource alive until after the queue drains,
+/// releasing its heap allocation only once `ID3D12Resource` itself has dropped.
+#[cfg(windows)]
+#[allow(dead_code)]
+struct RetiredPlacedTexture(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    Option<PlacedTextureAlloc>,
+);
 
 /// A title texture's host copy and the state it is in. The title's barriers
 /// name console states (looser than the host's), so we transition from this
@@ -1116,12 +1127,35 @@ pub(crate) struct HostTexture {
     /// its unordered access views name; lists keep the two coherent
     /// (`HostList::transition`).
     pub(crate) twin: Option<std::sync::Arc<HostTexture>>,
+    /// Backing sub-allocation in a pooled 64 MiB texture `ID3D12Heap` (when
+    /// placed rather than committed), declared after `texture` and retired
+    /// together with a clone of `texture`.
+    _alloc: Option<PlacedTextureAlloc>,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    #[cfg(test)]
+    pub(crate) fn committed(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> Self {
+        Self {
+            texture,
+            state: state.into(),
+            twin: None,
+            _alloc: None,
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
-        crate::host::retire(self.texture.clone());
+        crate::host::retire(RetiredPlacedTexture(
+            self.texture.clone(),
+            self._alloc.take(),
+        ));
     }
 }
 
@@ -1183,14 +1217,223 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host().cloned()
 }
 
+/// Pooled 64 MiB `ID3D12Heap` sub-allocator for immutable sampled host
+/// textures, eliminating per-texture `CreateCommittedResource` kernel round-trips.
+#[cfg(windows)]
+const TEXTURE_HEAP_SIZE: u64 = 64 << 20;
+#[cfg(windows)]
+const MAX_PLACED_TEX_SIZE: u64 = 16 << 20;
+
+#[cfg(windows)]
+struct SlabState {
+    bump: u64,
+    cap: u64,
+    /// Sorted free intervals `(offset, size)`.
+    free: Vec<(u64, u64)>,
+}
+
+#[cfg(windows)]
+impl SlabState {
+    fn alloc(&mut self, size: u64, align: u64) -> Option<u64> {
+        for i in 0..self.free.len() {
+            let (off, block_len) = self.free[i];
+            let aligned = off.next_multiple_of(align);
+            let pad = aligned.saturating_sub(off);
+            let end = aligned.checked_add(size)?;
+            if end <= off + block_len {
+                let tail = off + block_len - end;
+                self.free.remove(i);
+                if tail > 0 {
+                    self.free.insert(i, (end, tail));
+                }
+                if pad > 0 {
+                    self.free.insert(i, (off, pad));
+                }
+                return Some(aligned);
+            }
+        }
+        let aligned = self.bump.next_multiple_of(align);
+        let pad = aligned.saturating_sub(self.bump);
+        let end = aligned.checked_add(size)?;
+        if end > self.cap {
+            return None;
+        }
+        if pad > 0 {
+            self.insert_free(self.bump, pad);
+        }
+        self.bump = end;
+        Some(aligned)
+    }
+
+    fn insert_free(&mut self, offset: u64, size: u64) {
+        if size == 0 {
+            return;
+        }
+        let pos = self.free.partition_point(|&(o, _)| o < offset);
+        self.free.insert(pos, (offset, size));
+        // Coalesce right neighbor, then left neighbor.
+        if pos + 1 < self.free.len() {
+            let (ro, rs) = self.free[pos + 1];
+            if offset + size == ro {
+                self.free[pos].1 += rs;
+                self.free.remove(pos + 1);
+            }
+        }
+        if pos > 0 {
+            let (lo, ls) = self.free[pos - 1];
+            let (co, cs) = self.free[pos];
+            if lo + ls == co {
+                self.free[pos - 1].1 += cs;
+                self.free.remove(pos);
+            }
+        }
+        while let Some(&(lo, ls)) = self.free.last()
+            && lo + ls == self.bump
+        {
+            self.free.pop();
+            self.bump = lo;
+        }
+    }
+}
+
+#[cfg(windows)]
+struct TextureSlab {
+    heap: windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+    state: std::sync::Mutex<SlabState>,
+}
+
+#[cfg(windows)]
+// SAFETY: `ID3D12Heap` is free-threaded and `state` is mutex-guarded.
+unsafe impl Send for TextureSlab {}
+#[cfg(windows)]
+// SAFETY: as above.
+unsafe impl Sync for TextureSlab {}
+
+#[cfg(windows)]
+pub(crate) struct PlacedTextureAlloc {
+    slab: std::sync::Arc<TextureSlab>,
+    offset: u64,
+    size: u64,
+}
+
+#[cfg(windows)]
+// SAFETY: `TextureSlab` is Send + Sync.
+unsafe impl Send for PlacedTextureAlloc {}
+#[cfg(windows)]
+// SAFETY: as above.
+unsafe impl Sync for PlacedTextureAlloc {}
+
+#[cfg(windows)]
+impl Drop for PlacedTextureAlloc {
+    fn drop(&mut self) {
+        let mut s = self.slab.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.insert_free(self.offset, self.size);
+    }
+}
+
+#[cfg(windows)]
+struct TextureHeapPool {
+    slabs: std::sync::Mutex<Vec<std::sync::Arc<TextureSlab>>>,
+}
+
+#[cfg(windows)]
+static TEXTURE_POOL: std::sync::LazyLock<TextureHeapPool> = std::sync::LazyLock::new(|| TextureHeapPool {
+    slabs: std::sync::Mutex::new(Vec::new()),
+});
+
+#[cfg(windows)]
+impl TextureHeapPool {
+    fn alloc(
+        &self,
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        size: u64,
+        alignment: u64,
+    ) -> Option<PlacedTextureAlloc> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let align = alignment.max(65_536);
+        let alloc_size = size.max(1).next_multiple_of(65_536);
+        if alloc_size > MAX_PLACED_TEX_SIZE {
+            return None;
+        }
+        let existing: Vec<std::sync::Arc<TextureSlab>> = {
+            self.slabs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+        for slab in existing.iter().rev() {
+            let mut st = slab.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(offset) = st.alloc(alloc_size, align) {
+                drop(st);
+                return Some(PlacedTextureAlloc {
+                    slab: slab.clone(),
+                    offset,
+                    size: alloc_size,
+                });
+            }
+        }
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: TEXTURE_HEAP_SIZE,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
+            Alignment: D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain heap creation outside all pool locks.
+        if unsafe { device.CreateHeap(&desc, &mut heap) }.is_err() {
+            return None;
+        }
+        let heap = heap?;
+        let slab = std::sync::Arc::new(TextureSlab {
+            heap,
+            state: std::sync::Mutex::new(SlabState {
+                bump: alloc_size,
+                cap: TEXTURE_HEAP_SIZE,
+                free: Vec::new(),
+            }),
+        });
+        let alloc = PlacedTextureAlloc {
+            slab: slab.clone(),
+            offset: 0,
+            size: alloc_size,
+        };
+        self.slabs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(slab);
+        Some(alloc)
+    }
+
+    #[cfg(test)]
+    fn slab_count(&self) -> usize {
+        self.slabs.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    host_texture_with_alloc(desc, state, clear).map(|(tex, _)| tex)
+}
+
+#[cfg(windows)]
+fn host_texture_with_alloc(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    Option<PlacedTextureAlloc>,
+)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -1253,6 +1496,51 @@ fn host_texture(
         };
         value
     });
+    let initial_state = D3D12_RESOURCE_STATES(crate::host::legal_for(
+        d.flags,
+        crate::host::texture_state(state),
+    ) as i32);
+    // Fast path: sub-allocate immutable sampled textures inside pooled 64 MiB
+    // `ID3D12Heap` slabs instead of individual `CreateCommittedResource` calls.
+    if d.flags & (RENDER_TARGET | DEPTH | UNORDERED) == 0
+        && d.sample_count <= 1
+        && clear_value.is_none()
+    {
+        // SAFETY: `d` matches `D3D12_RESOURCE_DESC` layout (checked by static assertions).
+        let d3d_desc: D3D12_RESOURCE_DESC = unsafe { *std::ptr::from_ref(&d).cast() };
+        // SAFETY: live device and stack `D3D12_RESOURCE_DESC`.
+        let info = unsafe { host.device.GetResourceAllocationInfo(0, &[d3d_desc]) };
+        if info.SizeInBytes > 0
+            && info.SizeInBytes <= MAX_PLACED_TEX_SIZE
+            && info.Alignment <= 65_536
+            && let Some(alloc) = TEXTURE_POOL.alloc(&host.device, info.SizeInBytes, info.Alignment)
+        {
+            let mut placed: Option<ID3D12Resource> = None;
+            // SAFETY: `alloc` reserves `[alloc.offset, alloc.offset + alloc.size)` inside
+            // `alloc.slab.heap` until `RetiredPlacedTexture` drops behind the GPU fence.
+            let ok = unsafe {
+                host.device.CreatePlacedResource(
+                    &alloc.slab.heap,
+                    alloc.offset,
+                    &d3d_desc,
+                    initial_state,
+                    None,
+                    &mut placed,
+                )
+            };
+            if ok.is_ok()
+                && let Some(tex) = placed
+            {
+                crate::host::name(&tex, || {
+                    format!(
+                        "placed texture {}x{} f{} flags {:#x}",
+                        d.width, d.height, d.format, d.flags
+                    )
+                });
+                return Some((tex, Some(alloc)));
+            }
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1313,7 +1601,7 @@ fn host_texture(
             )
         });
     }
-    texture
+    texture.map(|t| (t, None))
 }
 
 /// Depth families that have unordered access formats (16-bit and 32-bit
@@ -3452,5 +3740,44 @@ void main(uint3 id : SV_DispatchThreadID) {
             res2.is_some(),
             "B4G4R4A4 texture creation succeeded without RenderTarget"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_texture_pool_suballocates_and_reclaims_on_drop() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let slabs_before = TEXTURE_POOL.slab_count();
+        let desc = texture(256, 256, 28, 1);
+        let (tex1, alloc1) = host_texture_with_alloc(&desc, 0, std::ptr::null())
+            .expect("first sampled texture");
+        let a1 = alloc1.expect("sub-allocated from TextureHeapPool");
+        let (tex2, alloc2) = host_texture_with_alloc(&desc, 0, std::ptr::null())
+            .expect("second sampled texture");
+        let a2 = alloc2.expect("sub-allocated from TextureHeapPool");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a1.slab, &a2.slab) || a2.offset >= a1.offset + a1.size
+        );
+        let slabs_after_two = TEXTURE_POOL.slab_count();
+        assert!(slabs_after_two >= slabs_before.max(1));
+
+        // Drop both placed resources before releasing their heap blocks, then
+        // confirm the next allocation reclaims `a1`'s block without growing slabs.
+        let reused_offset = a1.offset;
+        drop(tex1);
+        drop(tex2);
+        drop(a1);
+        drop(a2);
+
+        let (tex3, alloc3) = host_texture_with_alloc(&desc, 0, std::ptr::null())
+            .expect("reclaimed sampled texture");
+        let a3 = alloc3.expect("reused freed slab block");
+        assert_eq!(a3.offset, reused_offset);
+        assert_eq!(TEXTURE_POOL.slab_count(), slabs_after_two);
+        // SAFETY: live device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop(tex3);
+        drop(a3);
     }
 }

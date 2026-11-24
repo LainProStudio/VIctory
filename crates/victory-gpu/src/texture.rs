@@ -756,7 +756,7 @@ mod tests {
     use super::*;
     use crate::host::Host;
     use crate::resource::HostTexture;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::Ordering;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
 
@@ -807,11 +807,10 @@ mod tests {
                 )
                 .expect("create host texture");
         }
-        let copy = Arc::new(HostTexture {
-            texture: resource.unwrap(),
-            state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
-            twin: None,
-        });
+        let copy = Arc::new(HostTexture::committed(
+            resource.unwrap(),
+            D3D12_RESOURCE_STATE_COMMON.0 as u32,
+        ));
         (copy, layout_tex)
     }
 

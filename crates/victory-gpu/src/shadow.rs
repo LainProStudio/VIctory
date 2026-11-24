@@ -76,24 +76,75 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Whether `[start, start + len)` lies inside a single committed writable
-/// region (`PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`).
-fn is_writable_commit(start: usize, len: usize) -> bool {
+/// Queries `VirtualQuery` at `start` and returns `(region_base, region_end, writable)`
+/// for committed writable regions (`PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`).
+fn region_writable_info(start: usize) -> Option<(usize, usize, bool)> {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
-    };
-    let Some(end) = start.checked_add(len) else {
-        return false;
     };
     // SAFETY: plain data filled in by `VirtualQuery`.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: `VirtualQuery` inspects the address range without dereferencing `start`.
     let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
-    n == size_of_val(&info)
-        && info.State == MEM_COMMIT
-        && matches!(info.Protect, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
-        && (info.BaseAddress as usize) <= start
-        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= end
+    if n != size_of_val(&info) || info.RegionSize == 0 {
+        return None;
+    }
+    let base = info.BaseAddress as usize;
+    let reg_end = base.saturating_add(info.RegionSize);
+    let writable = info.State == MEM_COMMIT
+        && matches!(info.Protect, PAGE_READWRITE | PAGE_EXECUTE_READWRITE);
+    Some((base, reg_end, writable))
+}
+
+/// Whether `[start, start + len)` lies inside a single committed writable
+/// region (`PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`).
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_writable_commit(start: usize, len: usize) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    region_writable_info(start)
+        .is_some_and(|(base, reg_end, writable)| writable && base <= start && reg_end >= end)
+}
+
+/// Per-call `VirtualQuery` cache for committed writable regions (`PAGE_READWRITE`
+/// or `PAGE_EXECUTE_READWRITE`), strictly local to one submission's copy-back pass.
+struct WritableRegionCache {
+    entries: [(usize, usize, bool); 16],
+    next: usize,
+}
+
+impl Default for WritableRegionCache {
+    fn default() -> Self {
+        Self {
+            entries: [(0, 0, false); 16],
+            next: 0,
+        }
+    }
+}
+
+impl WritableRegionCache {
+    fn is_writable(&mut self, start: usize, len: usize) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if len == 0 {
+            return true;
+        }
+        for &(base, reg_end, writable) in &self.entries {
+            if base < reg_end && base <= start && end <= reg_end {
+                return writable;
+            }
+        }
+        let Some((base, reg_end, writable)) = region_writable_info(start) else {
+            return false;
+        };
+        if writable {
+            self.entries[self.next] = (base, reg_end, true);
+            self.next = (self.next + 1) % self.entries.len();
+        }
+        writable && base <= start && end <= reg_end
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -137,6 +188,11 @@ impl Shadow {
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start
+    }
+
+    /// Title start address of this shadow buffer.
+    pub(crate) fn start_addr(&self) -> u64 {
+        self.start
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -202,20 +258,24 @@ impl Shadow {
     /// (`old`) and after (`after`) the submission for buffer offset range
     /// `[from, from + old.len())`, and copies only the GPU-modified byte runs
     /// back into title memory (unmapped pages left alone). Preserves any
-    /// concurrent CPU writes to other bytes on the same page; pages without
-    /// concurrent CPU writes are marked current after re-arming write-watch so
-    /// our own write-back is not re-uploaded on the next submission. Returns
-    /// the bytes written.
-    pub(crate) fn copy_back_range(&self, from: usize, old: &[u8], after: &[u8]) -> usize {
+    /// concurrent CPU writes to other bytes on the same page; returns the
+    /// bytes written and the title page numbers that are now byte-identical to
+    /// host memory and need re-arming via [`Shadow::rearm_synced_pages`].
+    pub(crate) fn copy_back_stripe(
+        &self,
+        from: usize,
+        old: &[u8],
+        after: &[u8],
+    ) -> (usize, Vec<usize>) {
         debug_assert_eq!(old.len(), after.len());
         let len = old.len().min(after.len());
         if len == 0 {
-            return 0;
+            return (0, Vec::new());
         }
         let start = self.start as usize;
-        let shadow_len = self.len as usize;
         let to = from + len;
         let mut written = 0;
+        let mut synced = Vec::new();
         const PIECE: usize = 64 << 10;
         COPY_BACK_SCRATCH.with(|buf| {
             let mut title_buf = buf.borrow_mut();
@@ -223,135 +283,193 @@ impl Shadow {
                 title_buf.resize(PIECE, 0);
             }
             let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
-            let mut synced = Vec::new();
+            let mut writable_cache = WritableRegionCache::default();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
                 let rel = at - from;
                 let host = &after[rel..rel + n];
                 let prev = &old[rel..rel + n];
-                let title = &mut title_buf[..n];
-                if host != prev && crate::host::read_into((start + at) as *const u8, title) {
-                    dirty_runs.clear();
-                    let mut dirty_start: Option<usize> = None;
-                    let mut cpu_diff = false;
-                    let mut i = 0usize;
-                    while i < n {
-                        if i + 8 <= n && host[i..i + 8] == prev[i..i + 8] {
-                            if let Some(s) = dirty_start.take() {
-                                dirty_runs.push((s, i));
-                            }
-                            if host[i..i + 8] != title[i..i + 8] {
-                                cpu_diff = true;
-                            }
-                            i += 8;
-                            continue;
+                if host != prev {
+                    let chunk_start = start + at;
+                    crate::watch::writing(chunk_start, n);
+                    let writable = writable_cache.is_writable(chunk_start, n);
+                    let title = &mut title_buf[..n];
+                    let read_ok = if writable {
+                        // SAFETY: `watch::writing` opened guarded blocks and
+                        // `writable_cache` verified `[chunk_start, chunk_start + n)`
+                        // is committed `PAGE_READWRITE | PAGE_EXECUTE_READWRITE`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                chunk_start as *const u8,
+                                title.as_mut_ptr(),
+                                n,
+                            );
                         }
-                        let end_j = (i + 8).min(n);
-                        for j in i..end_j {
-                            let h = host[j];
-                            let t_byte = title[j];
-                            if h != prev[j] {
-                                if t_byte != h {
-                                    title[j] = h;
-                                    dirty_start.get_or_insert(j);
-                                }
-                            } else {
+                        true
+                    } else {
+                        crate::host::read_into(chunk_start as *const u8, title)
+                    };
+                    if read_ok {
+                        dirty_runs.clear();
+                        let mut dirty_start: Option<usize> = None;
+                        let mut cpu_diff = false;
+                        let mut i = 0usize;
+                        while i < n {
+                            if i + 8 <= n && host[i..i + 8] == prev[i..i + 8] {
                                 if let Some(s) = dirty_start.take() {
-                                    dirty_runs.push((s, j));
+                                    dirty_runs.push((s, i));
                                 }
-                                if t_byte != h {
+                                if host[i..i + 8] != title[i..i + 8] {
                                     cpu_diff = true;
                                 }
+                                i += 8;
+                                continue;
                             }
+                            let end_j = (i + 8).min(n);
+                            for j in i..end_j {
+                                let h = host[j];
+                                let t_byte = title[j];
+                                if h != prev[j] {
+                                    if t_byte != h {
+                                        title[j] = h;
+                                        dirty_start.get_or_insert(j);
+                                    }
+                                } else {
+                                    if let Some(s) = dirty_start.take() {
+                                        dirty_runs.push((s, j));
+                                    }
+                                    if t_byte != h {
+                                        cpu_diff = true;
+                                    }
+                                }
+                            }
+                            i = end_j;
                         }
-                        i = end_j;
-                    }
-                    if let Some(s) = dirty_start {
-                        dirty_runs.push((s, n));
-                    }
-                    if !dirty_runs.is_empty() {
-                        let chunk_start = start + at;
-                        crate::watch::writing(chunk_start, n);
-                        let direct = dirty_runs.len() > 16 && is_writable_commit(chunk_start, n);
-                        for &(s, e) in &dirty_runs {
-                            let run_len = e - s;
-                            if direct {
-                                // SAFETY: `watch::writing` opened guarded blocks and
-                                // `is_writable_commit` verified `[chunk_start, chunk_start + n)`
-                                // is committed and writable.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        title[s..].as_ptr(),
+                        if let Some(s) = dirty_start {
+                            dirty_runs.push((s, n));
+                        }
+                        if !dirty_runs.is_empty() {
+                            for &(s, e) in &dirty_runs {
+                                let run_len = e - s;
+                                if writable {
+                                    // SAFETY: `watch::writing` opened guarded blocks and
+                                    // `writable_cache` verified `[chunk_start, chunk_start + n)`
+                                    // is committed and writable.
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            title[s..].as_ptr(),
+                                            (chunk_start + s) as *mut u8,
+                                            run_len,
+                                        );
+                                    }
+                                } else {
+                                    crate::host::write_mapped(
                                         (chunk_start + s) as *mut u8,
+                                        title[s..].as_ptr(),
                                         run_len,
                                     );
                                 }
-                            } else {
-                                crate::host::write_mapped(
-                                    (chunk_start + s) as *mut u8,
-                                    title[s..].as_ptr(),
-                                    run_len,
-                                );
+                                written += run_len;
                             }
-                            written += run_len;
                         }
-                    }
-                    // Only mark the page synced if title memory and VRAM now match
-                    // byte for byte; if the title concurrently wrote other bytes on
-                    // this page, leave it dirty so the next refresh uploads them.
-                    if !cpu_diff {
-                        synced.push((start + at) / PAGE);
+                        // Only mark the page synced if title memory and VRAM now match
+                        // byte for byte; if the title concurrently wrote other bytes on
+                        // this page, leave it dirty so the next refresh uploads them.
+                        if !cpu_diff {
+                            synced.push(chunk_start / PAGE);
+                        }
                     }
                 }
                 at += n;
             }
-            // Re-arm write-watch only on contiguous runs of full pages synced above
-            // so unrelated untouched subranges avoid multi-MB kernel queries.
-            synced.retain(|&p| {
-                let Some(pf) = (p * PAGE).checked_sub(start) else {
-                    return false;
-                };
-                let pt = pf + PAGE;
-                pt <= shadow_len && from <= pf && pt <= to
-            });
-            synced.sort_unstable();
-            synced.dedup();
-            if !synced.is_empty() && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-                let base = start / PAGE;
-                let mut idx = 0;
-                while idx < synced.len() {
-                    let run_start = synced[idx];
-                    let mut run_end = run_start + 1;
-                    while idx + 1 < synced.len() && synced[idx + 1] == run_end {
-                        idx += 1;
-                        run_end += 1;
-                    }
-                    #[cfg(test)]
-                    BEFORE_COPY_BACK_REARM.with(|hook| {
-                        if let Some(f) = hook.borrow_mut().as_mut() {
-                            f();
-                        }
-                    });
-                    if let Some((now, _)) =
-                        crate::watch::writes(run_start * PAGE, run_end * PAGE, true)
-                    {
-                        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                        for page in run_start..run_end {
-                            let title_page = &mut title_buf[..PAGE];
-                            let pf = page * PAGE - start;
-                            let host_page = &after[pf - from..pf - from + PAGE];
-                            if crate::host::read_into((page * PAGE) as *const u8, title_page)
-                                && title_page == host_page
-                            {
-                                copied[page - base] = now;
-                            }
-                        }
-                    }
+        });
+        (written, synced)
+    }
+
+    /// Re-arms write-watch on contiguous full-page runs of `synced` inside
+    /// `[from, from + len)` whose title bytes still match `after`, so our own
+    /// write-back is not re-uploaded on the next submission.
+    pub(crate) fn rearm_synced_pages(
+        &self,
+        from: usize,
+        len: usize,
+        after: &[u8],
+        synced: &mut Vec<usize>,
+    ) {
+        if synced.is_empty() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return;
+        }
+        let start = self.start as usize;
+        let shadow_len = self.len as usize;
+        let to = from + len.min(after.len());
+        // Re-arm write-watch only on contiguous runs of full pages synced above
+        // so unrelated untouched subranges avoid multi-MB kernel queries.
+        synced.retain(|&p| {
+            let Some(pf) = (p * PAGE).checked_sub(start) else {
+                return false;
+            };
+            let pt = pf + PAGE;
+            pt <= shadow_len && from <= pf && pt <= to
+        });
+        synced.sort_unstable();
+        synced.dedup();
+        if synced.is_empty() {
+            return;
+        }
+        COPY_BACK_SCRATCH.with(|buf| {
+            let mut title_buf = buf.borrow_mut();
+            if title_buf.len() < PAGE {
+                title_buf.resize(PAGE, 0);
+            }
+            let mut writable_cache = WritableRegionCache::default();
+            let base = start / PAGE;
+            let mut idx = 0;
+            while idx < synced.len() {
+                let run_start = synced[idx];
+                let mut run_end = run_start + 1;
+                while idx + 1 < synced.len() && synced[idx + 1] == run_end {
                     idx += 1;
+                    run_end += 1;
                 }
+                #[cfg(test)]
+                BEFORE_COPY_BACK_REARM.with(|hook| {
+                    if let Some(f) = hook.borrow_mut().as_mut() {
+                        f();
+                    }
+                });
+                if let Some((now, _)) =
+                    crate::watch::writes(run_start * PAGE, run_end * PAGE, true)
+                {
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    for page in run_start..run_end {
+                        let page_addr = page * PAGE;
+                        let pf = page_addr - start;
+                        let host_page = &after[pf - from..pf - from + PAGE];
+                        let matches = if writable_cache.is_writable(page_addr, PAGE) {
+                            // SAFETY: `writable_cache` verified this full 64 KiB page is
+                            // committed writable memory.
+                            unsafe {
+                                std::slice::from_raw_parts(page_addr as *const u8, PAGE)
+                                    == host_page
+                            }
+                        } else {
+                            let title_page = &mut title_buf[..PAGE];
+                            crate::host::read_into(page_addr as *const u8, title_page)
+                                && title_page == host_page
+                        };
+                        if matches {
+                            copied[page - base] = now;
+                        }
+                    }
+                }
+                idx += 1;
             }
         });
+    }
+
+    /// Logs a non-empty copy-back when `VICTORY_LOG_COPYBACK` is enabled.
+    pub(crate) fn log_written(&self, from: usize, len: usize, written: usize) {
         #[cfg(feature = "diagnostics")]
         if written > 0 && log_copyback() {
             tracing::info!(
@@ -362,6 +480,20 @@ impl Shadow {
                 "shadow copy_back"
             );
         }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (from, len, written);
+    }
+
+    /// After the submission ran: compares the readback snapshots taken before
+    /// (`old`) and after (`after`) the submission for buffer offset range
+    /// `[from, from + old.len())`, copies GPU-modified byte runs back into
+    /// title memory, and re-arms write-watch on synced pages.
+    #[cfg(test)]
+    pub(crate) fn copy_back_range(&self, from: usize, old: &[u8], after: &[u8]) -> usize {
+        let len = old.len().min(after.len());
+        let (written, mut synced) = self.copy_back_stripe(from, old, after);
+        self.rearm_synced_pages(from, len, after, &mut synced);
+        self.log_written(from, len, written);
         written
     }
 
@@ -1516,5 +1648,70 @@ mod tests {
         crate::watch::forget_journal(base, PAGE);
         // SAFETY: our write-watched allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn writable_region_cache_matches_is_writable_commit() {
+        let mut cache = WritableRegionCache::default();
+        assert!(!cache.is_writable(0, PAGE));
+        assert_eq!(cache.is_writable(0, PAGE), is_writable_commit(0, PAGE));
+
+        // SAFETY: fresh committed writable allocation, freed below.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        assert!(cache.is_writable(p, PAGE));
+        assert!(cache.is_writable(p + PAGE, PAGE));
+        assert_eq!(cache.is_writable(p, 2 * PAGE), is_writable_commit(p, 2 * PAGE));
+        // SAFETY: `p` is our VirtualAlloc allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn copy_back_striped_multi_mib_merges_and_preserves_concurrent_cpu_writes() {
+        const STRIPE: usize = 1 << 20;
+        const TOTAL: usize = 2 * STRIPE + PAGE;
+        let Some((_memory, base, s, mut staging)) = title_pages(TOTAL / PAGE) else {
+            return;
+        };
+        for off in (0..TOTAL).step_by(PAGE) {
+            poke(base + off + 8, 0x11);
+        }
+        stage_into(&s, base, TOTAL, &mut staging);
+        let old = staging.clone();
+        let mut after = old.clone();
+
+        // Mutate bytes across three 1 MiB stripes on GPU while CPU concurrently
+        // writes a distinct byte inside one of those same 64 KiB pages.
+        after[64] = 0xa1;
+        after[STRIPE + 128] = 0xb2;
+        after[2 * STRIPE + 256] = 0xc3;
+        poke(base + STRIPE + 512, 0x7e);
+
+        let (w0, s0) = s.copy_back_stripe(0, &old[..STRIPE], &after[..STRIPE]);
+        let (w1, s1) = s.copy_back_stripe(STRIPE, &old[STRIPE..2 * STRIPE], &after[STRIPE..2 * STRIPE]);
+        let (w2, s2) = s.copy_back_stripe(2 * STRIPE, &old[2 * STRIPE..], &after[2 * STRIPE..]);
+        assert_eq!(w0 + w1 + w2, 3);
+
+        let mut synced = Vec::new();
+        synced.extend(s0);
+        synced.extend(s1);
+        synced.extend(s2);
+        s.rearm_synced_pages(0, TOTAL, &after, &mut synced);
+
+        assert_eq!(peek(base + 64), 0xa1);
+        assert_eq!(peek(base + STRIPE + 128), 0xb2);
+        assert_eq!(peek(base + 2 * STRIPE + 256), 0xc3);
+        assert_eq!(peek(base + STRIPE + 512), 0x7e);
+
+        // Concurrent CPU write must still be uploaded on the next stage.
+        stage_into(&s, base, TOTAL, &mut staging);
+        assert_eq!(staging[STRIPE + 512], 0x7e);
     }
 }
