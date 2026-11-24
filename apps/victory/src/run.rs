@@ -11,6 +11,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    no_audio: bool,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -99,6 +100,9 @@ pub fn run(
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
+    }
+    if no_audio || std::env::var_os("VICTORY_NO_AUDIO").is_some() {
+        victory_hle::modules::audio::mute_process();
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
@@ -333,6 +337,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: bool) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

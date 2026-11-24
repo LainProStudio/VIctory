@@ -1156,4 +1156,125 @@ mod tests {
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn mute_process_does_not_panic() {
+        let handle = std::thread::spawn(|| {
+            // SAFETY: thread-local COM initialization paired with uninitialize.
+            let hr = unsafe {
+                windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                )
+            };
+            super::mute_active_endpoints(std::process::id());
+            if hr.is_ok() {
+                // SAFETY: paired with CoInitializeEx above.
+                unsafe { windows::Win32::System::Com::CoUninitialize() };
+            }
+        });
+        handle.join().unwrap();
+    }
+}
+
+/// Mutes this process's Windows WASAPI render audio sessions on all active
+/// endpoints before title startup, then periodically re-applies the mute to
+/// catch custom-GUID sessions or device switches while keeping WASAPI draining
+/// normally so title audio/video timing does not stall.
+#[cfg(windows)]
+pub fn mute_process() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    static MUTING: AtomicBool = AtomicBool::new(false);
+    if MUTING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let pid = std::process::id();
+    let spawned = std::thread::Builder::new()
+        .name("victory audio mute".into())
+        .spawn(move || {
+            // SAFETY: dedicated background thread initializes its own MTA apartment.
+            let _ = unsafe {
+                windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                )
+            };
+            mute_active_endpoints(pid);
+            let _ = tx.send(());
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                mute_active_endpoints(pid);
+            }
+        });
+    if spawned.is_ok() {
+        let _ = rx.recv_timeout(Duration::from_secs(2));
+        tracing::info!("process audio muted");
+    }
+}
+
+#[cfg(not(windows))]
+pub fn mute_process() {}
+
+#[cfg(windows)]
+fn mute_active_endpoints(pid: u32) {
+    use windows::Win32::Media::Audio::{
+        DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
+        ISimpleAudioVolume, MMDeviceEnumerator, eRender,
+    };
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+    use windows::core::Interface;
+
+    // SAFETY: valid COM calls within an initialized MTA thread; errors are
+    // ignored so missing/headless audio devices never fail or block startup.
+    unsafe {
+        let Ok(enumerator): Result<IMMDeviceEnumerator, _> =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        else {
+            return;
+        };
+        let Ok(collection) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
+            return;
+        };
+        let Ok(count) = collection.GetCount() else {
+            return;
+        };
+        for i in 0..count {
+            let Ok(device) = collection.Item(i) else {
+                continue;
+            };
+            let Ok(mgr): Result<IAudioSessionManager2, _> = device.Activate(CLSCTX_ALL, None)
+            else {
+                continue;
+            };
+            // Pre-mute this process's default (GUID_NULL) audio session.
+            if let Ok(vol) = mgr.GetSimpleAudioVolume(None, 0) {
+                let _ = vol.SetMute(true, std::ptr::null());
+            }
+            let Ok(sessions) = mgr.GetSessionEnumerator() else {
+                continue;
+            };
+            let Ok(scount) = sessions.GetCount() else {
+                continue;
+            };
+            for j in 0..scount {
+                let Ok(session) = sessions.GetSession(j) else {
+                    continue;
+                };
+                let Ok(ctrl2) = session.cast::<IAudioSessionControl2>() else {
+                    continue;
+                };
+                if ctrl2.GetProcessId() != Ok(pid) {
+                    continue;
+                }
+                if let Ok(vol) = session.cast::<ISimpleAudioVolume>()
+                    && !vol.GetMute().unwrap_or_default().as_bool()
+                {
+                    let _ = vol.SetMute(true, std::ptr::null());
+                }
+            }
+        }
+    }
 }
