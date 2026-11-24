@@ -101,9 +101,10 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
-    if no_audio || std::env::var_os("VICTORY_NO_AUDIO").is_some() {
-        victory_hle::modules::audio::mute_process();
-    }
+    victory_hle::modules::audio::set_process_audio(
+        no_audio || std::env::var_os("VICTORY_NO_AUDIO").is_some(),
+        0.5,
+    );
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
