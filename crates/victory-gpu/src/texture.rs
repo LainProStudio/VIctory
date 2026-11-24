@@ -139,6 +139,12 @@ fn hash_textures() -> bool {
 }
 
 impl Staging {
+    /// Title memory span `(start, end)` backing this texture.
+    pub(crate) fn memory_range(&self) -> (usize, usize) {
+        let start = self.memory as usize;
+        (start, start.saturating_add(self.layout.size as usize))
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all). Returns `true` when the
     /// staging buffer received new contents that must be copied to the host

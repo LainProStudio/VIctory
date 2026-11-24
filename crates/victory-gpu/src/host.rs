@@ -418,6 +418,85 @@ mod tests {
         );
     }
 
+    /// A node of the device-removed data is a list by pointer or by name.
+    /// The name is what still matches when the runtime records another
+    /// object than the one we hold (the debug layer wraps ours), and a
+    /// different list or an unnamed node never matches.
+    #[test]
+    fn a_breadcrumb_node_is_found_by_pointer_or_by_name() {
+        let ours = [0x1000, 0x1008];
+        let name = list_name(7);
+        let is = |pointer, text| node_is_list(pointer, text, &ours, &name);
+        assert_eq!(name, "victory host list 7");
+        assert!(is(Some(0x1000), None));
+        assert!(is(Some(0x1008), Some("other")));
+        assert!(is(Some(0x9999), Some("victory host list 7")));
+        assert!(is(None, Some("victory host list 7")));
+        assert!(!is(Some(0x9999), Some("victory host list 70")));
+        assert!(!is(Some(0x9999), None));
+        assert!(!is(None, None));
+        assert_eq!(list_name(70), "victory host list 70");
+    }
+
+    /// The pointers of one list: the interface pointers it answers with
+    /// are all there, and another list's are not.
+    #[test]
+    fn a_list_knows_every_pointer_it_answers_with() {
+        // SAFETY: plain device and list creation on the software adapter.
+        unsafe {
+            let Ok(adapter) = warp_adapter() else { return };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            let device = device.unwrap();
+            // An open list holds its allocator: one each.
+            let make = || -> ID3D12GraphicsCommandList {
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .unwrap()
+            };
+            let (a, b) = (make(), make());
+            let pointers = identities(&a);
+            assert!(pointers.contains(&(a.as_raw() as usize)));
+            let unknown = a.cast::<windows::core::IUnknown>().unwrap();
+            assert!(pointers.contains(&(unknown.as_raw() as usize)));
+            let command_list = a.cast::<ID3D12CommandList>().unwrap();
+            assert!(pointers.contains(&(command_list.as_raw() as usize)));
+            let other = identities(&b);
+            assert!(pointers.iter().all(|p| !other.contains(p)));
+            // As a node: the same object by any of its pointers; a node
+            // naming the other list by pointer and our name still matches.
+            let name = list_name(3);
+            let is = |pointer, text| node_is_list(pointer, text, &pointers, &name);
+            assert!(is(Some(command_list.as_raw() as usize), None));
+            assert!(!is(Some(b.as_raw() as usize), None));
+            assert!(is(Some(b.as_raw() as usize), Some(&name)));
+        }
+    }
+
+    /// A node as the runtime gives it, built by hand: `HostList::is_node`
+    /// reads the pointer and the copied name, and the name alone finds a
+    /// list the runtime records under another object.
+    #[test]
+    fn is_node_reads_the_name_the_runtime_copied() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut wide: Vec<u16> = list_name(list.id).encode_utf16().collect();
+        wide.push(0);
+        let mut node = D3D12_AUTO_BREADCRUMB_NODE::default();
+        assert!(!list.is_node(&node), "an empty node is no list");
+        node.pCommandListDebugNameW = windows::core::PCWSTR(wide.as_ptr());
+        assert!(list.is_node(&node), "found by its name alone");
+        let mut other: Vec<u16> = list_name(list.id + 1).encode_utf16().collect();
+        other.push(0);
+        node.pCommandListDebugNameW = windows::core::PCWSTR(other.as_ptr());
+        assert!(!list.is_node(&node), "another list's name is no match");
+    }
+
     #[test]
     fn buffer_states_transition_between_writes_and_reads() {
         let mut s = BufferStates::default();
@@ -786,6 +865,9 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Which list this is, for the name that tells it apart in device-removed
+    /// data (see [`HostList::is_node`]).
+    id: u64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -910,6 +992,51 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
     }
+}
+
+/// The id of the next host list (see [`HostList::is_node`]).
+static NEXT_LIST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The name a host list gets with device-removed data on.
+fn list_name(id: u64) -> String {
+    format!("victory host list {id}")
+}
+
+/// The pointers one of our list objects answers to: its own and the one each
+/// interface a runtime may record it by gives (COM identity is the
+/// `IUnknown` one). Only our live object is queried: a node of the
+/// device-removed data may name a list that is long released, so its pointer
+/// is compared and never dereferenced.
+fn identities(list: &impl Interface) -> Vec<usize> {
+    let mut found = vec![list.as_raw() as usize];
+    let mut add = |pointer: Option<*mut core::ffi::c_void>| {
+        if let Some(pointer) = pointer {
+            found.push(pointer as usize);
+        }
+    };
+    add(list
+        .cast::<windows::core::IUnknown>()
+        .ok()
+        .map(|i| i.as_raw()));
+    add(list.cast::<ID3D12Object>().ok().map(|i| i.as_raw()));
+    add(list.cast::<ID3D12DeviceChild>().ok().map(|i| i.as_raw()));
+    add(list.cast::<ID3D12CommandList>().ok().map(|i| i.as_raw()));
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Whether a node of the device-removed data is a list: by pointer, or by the
+/// name the runtime copied when the list was submitted. With the debug layer
+/// on, the object we hold is its wrapper and the runtime records another
+/// one, so no pointer of ours matches; the name still does.
+fn node_is_list(
+    node_pointer: Option<usize>,
+    node_name: Option<&str>,
+    pointers: &[usize],
+    name: &str,
+) -> bool {
+    node_pointer.is_some_and(|p| pointers.contains(&p)) || node_name == Some(name)
 }
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
@@ -1059,6 +1186,8 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
+            name(&list, || list_name(id));
             Ok(HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
@@ -1071,6 +1200,7 @@ impl Host {
                 twins: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                id,
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1245,20 +1375,17 @@ impl Host {
             let com_identity = |obj: &ID3D12GraphicsCommandList| -> Option<*mut std::ffi::c_void> {
                 obj.cast::<windows::core::IUnknown>().ok().map(|u| u.as_raw())
             };
-            let list_index = |l: Option<&ID3D12GraphicsCommandList>| -> Option<usize> {
-                let target = com_identity(l?)?;
-                runs.iter().position(|r| com_identity(&r.list) == Some(target))
+            let list_index = |p: &D3D12_AUTO_BREADCRUMB_NODE| -> Option<usize> {
+                runs.iter().position(|r| r.is_node(p))
             };
-            let list_label = |l: Option<&ID3D12GraphicsCommandList>| -> String {
-                let Some(target) = l.and_then(com_identity) else {
-                    return "None".into();
-                };
+            let list_label = |p: &D3D12_AUTO_BREADCRUMB_NODE| -> String {
+                let ptr = p.pCommandList.as_ref().and_then(|l| com_identity(l));
                 runs.iter()
                     .enumerate()
                     .find_map(|(i, r)| {
-                        if com_identity(&r.list) == Some(target) {
+                        if r.is_node(p) {
                             Some(format!("Some({i})"))
-                        } else if com_identity(&r.prelude.1) == Some(target) {
+                        } else if ptr.is_some() && com_identity(&r.prelude.1) == ptr {
                             Some(format!("prelude {i}"))
                         } else {
                             None
@@ -1271,7 +1398,7 @@ impl Host {
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let label = list_label(p.pCommandList.as_ref());
+                let label = list_label(p);
                 progress.push(format!("{done}/{} {label}", p.BreadcrumbCount));
                 node = p.pNext;
             }
@@ -1286,7 +1413,7 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let run = list_index(p.pCommandList.as_ref())
+                    let run = list_index(p)
                         .map(|i| runs[i])
                         .or_else(|| (runs.len() == 1 && p.BreadcrumbCount > 2).then_some(runs[0]));
                     // The k-th marker command is the k-th note.
@@ -1783,6 +1910,26 @@ impl HostList {
         }
     }
 
+    /// Whether `node` of the device-removed data (its breadcrumbs) is this
+    /// list.
+    fn is_node(&self, node: &D3D12_AUTO_BREADCRUMB_NODE) -> bool {
+        // SAFETY: only the pointer and the name text are read: the pointer is
+        // compared, never used, and the name is the runtime's copy.
+        let (pointer, text) = unsafe {
+            (
+                node.pCommandList.as_ref().map(|l| l.as_raw() as usize),
+                (!node.pCommandListDebugNameW.is_null())
+                    .then(|| node.pCommandListDebugNameW.to_string().unwrap_or_default()),
+            )
+        };
+        node_is_list(
+            pointer,
+            text.as_deref(),
+            &identities(&self.list),
+            &list_name(self.id),
+        )
+    }
+
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
@@ -1801,7 +1948,15 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        let (p_start, p_end) = (
+            (dst as usize) / crate::watch::PAGE,
+            (dst as usize).saturating_add(len).div_ceil(crate::watch::PAGE),
+        );
+        deferred.refreshed.retain(|&(_, addr, l)| {
+            let e_start = addr / crate::watch::PAGE;
+            let e_end = addr.saturating_add(l).div_ceil(crate::watch::PAGE);
+            e_end <= p_start || p_end <= e_start
+        });
         deferred.copy_epoch += 1;
     }
 
@@ -2061,7 +2216,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.copy_written(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2100,7 +2255,9 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging) && staging.refresh() {
+                    if batch.texture_due_range(staging, staging.memory_range())
+                        && staging.refresh()
+                    {
                         uploads.push((staging.clone(), copy.clone()));
                     }
                     continue;
@@ -2128,8 +2285,9 @@ impl HostList {
 struct Batch {
     /// Per copy, `[from, to)` ranges in the order they came.
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)>,
-    /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    /// Staging buffers (by address) refreshed since the last overlapping title
+    /// write, mapped to the title memory `(start, end)` they cover.
+    textures: std::collections::HashMap<usize, (usize, usize)>,
     /// View heaps the submission's draws index directly, and whether their
     /// shaders may write memory.
     bindless: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, bool)>,
@@ -2177,12 +2335,25 @@ impl Batch {
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
-    /// notes it refreshed).
+    /// notes it refreshed for test helpers / unbounded callers).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        self.texture_due_range(staging, (0, usize::MAX))
     }
 
-    /// A list of the submission indexes `heap` directly.
+    /// Whether `staging` (backed by title range `(start, end)`) is still to be
+    /// refreshed in this submission, noting its backing range so disjoint
+    /// buffer writes leave it valid.
+    fn texture_due_range<T>(
+        &mut self,
+        staging: &std::sync::Arc<T>,
+        range: (usize, usize),
+    ) -> bool {
+        self.textures
+            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize, range)
+            .is_none()
+    }
+
+    /// Host heaps indexed directly by draws/dispatches of this submission.
     fn bindless(&mut self, heap: &std::sync::Arc<crate::descriptor::host::HostHeap>, writes: bool) {
         match self
             .bindless
@@ -2213,42 +2384,94 @@ impl Batch {
         address: usize,
         len: usize,
     ) {
-        // Even a repeated declaration comes after the preceding refreshes.
-        self.flush();
+        // Flush only pending refreshes on `shadow` whose pages overlap this
+        // GPU write range before declaring it busy.
+        self.flush_shadow_overlapping(shadow, address, address.saturating_add(len));
         self.record_write(shadow, address, len);
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// Before a known copy into title memory `[start, start + len)`: flush only
+    /// overlapping pending refreshes and invalidate only overlapping textures.
+    fn copy_written(&mut self, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        self.flush_overlapping(start, end);
+        let (p_start, p_end) = (start / crate::watch::PAGE, end.div_ceil(crate::watch::PAGE));
+        self.textures.retain(|_, &mut (ts, te)| {
+            if ts >= te {
+                return true;
+            }
+            let t_start = ts / crate::watch::PAGE;
+            let t_end = te.div_ceil(crate::watch::PAGE);
+            t_end <= p_start || p_end <= t_start
+        });
+    }
+
+    /// Before a step that may arbitrarily write title memory (`Step::Run`):
+    /// pending refreshes are done first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
     }
 
     fn flush(&mut self) {
-        for (shadow, mut ranges) in self.refreshes.drain(..) {
-            coalesce_ranges(&mut ranges, crate::watch::PAGE);
-            for (from, to) in ranges {
-                let started = std::time::Instant::now();
-                let copied = shadow.update(from, to - from);
-                let us = started.elapsed().as_micros() as u64;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::range(from, to - from, us, 0);
-                PREPARING[0].fetch_add(us, Ordering::Relaxed);
-                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        self.flush_matching(|_, _, _| true);
+    }
+
+    fn flush_overlapping(&mut self, start: usize, end: usize) {
+        let (p_start, p_end) = (start / crate::watch::PAGE, end.div_ceil(crate::watch::PAGE));
+        self.flush_matching(|_, from, to| {
+            from / crate::watch::PAGE < p_end && p_start < to.div_ceil(crate::watch::PAGE)
+        });
+    }
+
+    fn flush_shadow_overlapping(
+        &mut self,
+        target: &std::sync::Arc<crate::shadow::Shadow>,
+        start: usize,
+        end: usize,
+    ) {
+        if start >= end {
+            return;
+        }
+        let (p_start, p_end) = (start / crate::watch::PAGE, end.div_ceil(crate::watch::PAGE));
+        self.flush_matching(|s, from, to| {
+            std::sync::Arc::ptr_eq(s, target)
+                && from / crate::watch::PAGE < p_end
+                && p_start < to.div_ceil(crate::watch::PAGE)
+        });
+    }
+
+    fn flush_matching(
+        &mut self,
+        mut pred: impl FnMut(&std::sync::Arc<crate::shadow::Shadow>, usize, usize) -> bool,
+    ) {
+        for (shadow, ranges) in std::mem::take(&mut self.refreshes) {
+            let (mut due, keep): (Ranges, Ranges) = ranges
+                .into_iter()
+                .partition(|&(from, to)| pred(&shadow, from, to));
+            if !due.is_empty() {
+                coalesce_ranges(&mut due, crate::watch::PAGE);
+                for (from, to) in due {
+                    update(&shadow, from, to - from);
+                }
+            }
+            if !keep.is_empty() {
+                self.refreshes.push((shadow, keep));
             }
         }
     }
 
     /// After every list's steps (no title copy follows): each directly
     /// indexed heap's slots, once per submission however many lists and
-    /// draws use it. What they read is refreshed (unchanged pages cost only
-    /// the write-watch's answer); their unordered access ranges are kept
-    /// for copy-back only when a shader that may write memory uses the heap.
+    /// draws use it. Plan reads coalesce into `self.refreshes` before a single
+    /// flush, and writable snapshots pre-size once per shadow.
     fn prepare_bindless(&mut self) {
-        self.flush();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let mut pending_plans = Vec::new();
         for (heap, writes) in std::mem::take(&mut self.bindless) {
             let Some(plan) = heap.bindless_plan() else {
                 continue;
@@ -2261,8 +2484,37 @@ impl Batch {
                     add(C::Refreshes, 1);
                     add(C::RefreshBytes, *len as u64);
                 }
-                update(shadow, *address, *len);
+                self.add(shadow, *address, *len);
             }
+            pending_plans.push((plan, writes));
+        }
+        self.flush();
+        let mut bounds: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        for (plan, writes) in &pending_plans {
+            if !*writes {
+                continue;
+            }
+            for &(ref shadow, address, len) in &plan.writes {
+                if len == 0 {
+                    continue;
+                }
+                let end = address.saturating_add(len);
+                match bounds
+                    .iter_mut()
+                    .find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow))
+                {
+                    Some((_, min_from, max_to)) => {
+                        *min_from = (*min_from).min(address);
+                        *max_to = (*max_to).max(end);
+                    }
+                    None => bounds.push((shadow.clone(), address, end)),
+                }
+            }
+        }
+        for (shadow, min_from, max_to) in bounds {
+            shadow.reserve_snapshot(min_from, max_to - min_from);
+        }
+        for (plan, writes) in pending_plans {
             if writes {
                 for (shadow, address, len) in &plan.writes {
                     self.record_write(shadow, *address, *len);
@@ -3309,6 +3561,23 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn copy_written_invalidates_only_overlapping_textures() {
+        let mut batch = Batch::default();
+        let (a, b) = (Arc::new(1u32), Arc::new(2u32));
+        let p = crate::watch::PAGE;
+        assert!(batch.texture_due_range(&a, (0x10_0000, 0x10_0000 + p)));
+        assert!(batch.texture_due_range(&b, (0x20_0000, 0x20_0000 + p)));
+        // Writing to an unrelated range leaves both textures cached.
+        batch.copy_written(0x30_0000, 4096);
+        assert!(!batch.texture_due_range(&a, (0x10_0000, 0x10_0000 + p)));
+        assert!(!batch.texture_due_range(&b, (0x20_0000, 0x20_0000 + p)));
+        // Writing onto `a`'s page invalidates only `a`.
+        batch.copy_written(0x10_0100, 256);
+        assert!(batch.texture_due_range(&a, (0x10_0000, 0x10_0000 + p)));
+        assert!(!batch.texture_due_range(&b, (0x20_0000, 0x20_0000 + p)));
     }
 
     /// The hashing a submission does for textures in physical-page memory,

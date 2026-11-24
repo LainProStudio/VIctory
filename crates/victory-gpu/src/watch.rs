@@ -58,60 +58,85 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    // Guarded blocks all still clean: nothing was written there, and the
-    // answer is the journal's. Asking the kernel would fail (views are not
-    // write-watched) and `guard`'s query walks the view's pages; for a big
-    // clean view both cost more than the copy they decide. Blocks are
-    // pages, so `first..last` are the blocks. `JOURNAL` is taken before
-    // `GUARDS` here as in `guard`; nothing takes them the other way round.
-    if guarded && first < last && guards().clean.range(first..last).count() == last - first {
-        j.asked += 1;
-        return Some((
-            j.asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
-    }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    #[cfg(test)]
-    tests::KERNEL_ASKED.with(|n| n.set(n.get() + 1));
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        match by_allocation(first * PAGE, last * PAGE, &mut j.found) {
-            Some(pages) => pages,
-            None if !guarded => return None,
-            None => guard(first * PAGE, last * PAGE)?,
+    // `JOURNAL` is taken before `GUARDS` here as in `guard`; nothing takes
+    // them the other way round.
+    let known_view_pages = if guarded && first < last {
+        let mut g = guards();
+        // Guarded blocks all still clean: zero syscalls, answer from journal.
+        if g.clean.range(first..last).count() == last - first {
+            j.asked += 1;
+            return Some((
+                j.asked,
+                j.written
+                    .range(first..last)
+                    .map(|(&p, &w)| (p, w))
+                    .collect(),
+            ));
+        }
+        // Known view region with some blocks dirty/absent: skip GetWriteWatch +
+        // VirtualQuery and guard/update directly under the lock.
+        if g.is_view_range(first, last) {
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            let pages = guard_locked(&mut g, first, last);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Watches, 1);
+                add(C::WatchUs, started.elapsed().as_micros() as u64);
+            }
+            Some(pages)
+        } else {
+            None
         }
     } else {
-        Vec::new()
+        None
     };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-    }
+    let (count, guarded_pages) = if let Some(pages) = known_view_pages {
+        (0, pages)
+    } else {
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        tests::KERNEL_ASKED.with(|n| n.set(n.get() + 1));
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        let guarded_pages = if failed {
+            count = 0;
+            match by_allocation(first * PAGE, last * PAGE, &mut j.found) {
+                Some(pages) => pages,
+                None if !guarded => return None,
+                None => guard(first * PAGE, last * PAGE)?,
+            }
+        } else {
+            Vec::new()
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        (count, guarded_pages)
+    };
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for &at in &j.found[..count] {
+        j.written.insert(at / PAGE, now);
+    }
+    for page in guarded_pages {
         j.written.insert(page, now);
     }
     Some((
@@ -204,6 +229,9 @@ struct Guards {
     /// runtime remaps them. Asking the system each time (`VirtualQuery`)
     /// cost 100-230 ms per world frame, more than the rest of the guard.
     views: BTreeSet<usize>,
+    /// Disjoint mapped-view block ranges `[start_block, end_block)` discovered
+    /// via `VirtualQuery`, until `title_memory_remapped` splits/clears them.
+    view_ranges: BTreeMap<usize, usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -211,10 +239,55 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     views: BTreeSet::new(),
+    view_ranges: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Guards {
+    fn is_view_range(&self, first: usize, last: usize) -> bool {
+        first < last
+            && self
+                .view_ranges
+                .range(..=first)
+                .next_back()
+                .is_some_and(|(&s, &e)| s <= first && last <= e)
+    }
+
+    fn record_view_region(&mut self, mut first: usize, mut last: usize) {
+        let mut to_remove = Vec::new();
+        for (&s, &e) in self.view_ranges.range(..=last) {
+            if e >= first {
+                first = first.min(s);
+                last = last.max(e);
+                to_remove.push(s);
+            }
+        }
+        for s in to_remove {
+            self.view_ranges.remove(&s);
+        }
+        self.view_ranges.insert(first, last);
+    }
+
+    fn remove_view_range(&mut self, r_start: usize, r_end: usize) {
+        let overlapping: Vec<(usize, usize)> = self
+            .view_ranges
+            .range(..r_end)
+            .filter(|&(_, &e)| e > r_start)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in overlapping {
+            self.view_ranges.remove(&s);
+            if s < r_start {
+                self.view_ranges.insert(s, r_start);
+            }
+            if e > r_end {
+                self.view_ranges.insert(r_end, e);
+            }
+        }
+    }
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -225,12 +298,15 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut g = guards();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Asked under the lock: a remap in between would leave a stale view.
-    if !g.views.contains(&first) {
-        if !view(start) {
-            return None;
-        }
+    if !g.views.contains(&first) && !g.is_view_range(first, (first + 1).min(last)) {
+        let (v_start, v_end) = view_region(start)?;
         g.views.insert(first);
+        g.record_view_region(v_start, v_end);
     }
+    Some(guard_locked(&mut g, first, last))
+}
+
+fn guard_locked(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let mut uncommitted_until = first;
@@ -258,10 +334,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+            protect(g, from, block);
         }
     }
-    Some(written)
+    written
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
@@ -314,8 +390,9 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
-/// Whether `at` is in a view (of a section).
-fn view(at: usize) -> bool {
+/// If `at` lies in a view (of a section), returns the view region's
+/// `[start_block, end_block)` span.
+fn view_region(at: usize) -> Option<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     #[cfg(test)]
     tests::QUERIED.with(|n| n.set(n.get() + 1));
@@ -323,7 +400,16 @@ fn view(at: usize) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.Type == MEM_MAPPED
+    if n != 0 && info.Type == MEM_MAPPED {
+        let base = info.BaseAddress as usize;
+        let end = base.saturating_add(info.RegionSize);
+        let first = base / BLOCK;
+        let last = end / BLOCK;
+        if first < last {
+            return Some((first, last));
+        }
+    }
+    None
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
@@ -385,10 +471,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for block in absent {
             g.absent.remove(&block);
         }
-        let views: Vec<usize> = g.views.range(range).copied().collect();
+        let views: Vec<usize> = g.views.range(range.clone()).copied().collect();
         for block in views {
             g.views.remove(&block);
         }
+        g.remove_view_range(range.start, range.end);
         open(&mut g, at, end);
     }
     crate::resource::evict_placed_textures(at as u64, end as u64);
@@ -538,11 +625,12 @@ mod tests {
         assert_eq!(part, [(first + 1, taken)]);
         assert_eq!(kernel_asked(), asked + 1);
 
-        // The title writes block 2: the handler opens it; the kernel is asked.
+        // The title writes block 2: the handler opens it; because `v..v+4*BLOCK`
+        // is already a known mapped view region, `writes` skips `GetWriteWatch`.
         // SAFETY: our view, guarded read-only; the handler gives write access.
         unsafe { ((v + 2 * BLOCK + 8) as *mut u8).write(7) };
         let (written, after) = writes(start, end, true).expect("a view");
-        assert_eq!(kernel_asked(), asked + 2);
+        assert_eq!(kernel_asked(), asked + 1);
         assert_eq!(after[2], (first + 2, written));
         assert_eq!(after.iter().filter(|&&(_, w)| w == written).count(), 1);
         // SAFETY: as above, readable.
@@ -550,51 +638,52 @@ mod tests {
         // Guarded again, and clean.
         let (_, again) = writes(start, end, true).expect("a view");
         assert_eq!(again, after);
-        assert_eq!(kernel_asked(), asked + 2);
+        assert_eq!(kernel_asked(), asked + 1);
 
         // Our own write through the kernel, announced.
         writing(v + 3 * BLOCK, 1);
         let (announced, after) = writes(start, end, true).expect("a view");
-        assert_eq!(kernel_asked(), asked + 3);
+        assert_eq!(kernel_asked(), asked + 1);
         assert_eq!(after[3], (first + 3, announced));
 
-        // The runtime remapped block 0.
+        // The runtime remapped block 0 (clearing it from `view_ranges`): asked again.
         title_memory_remapped(v, BLOCK);
         let (remapped, after) = writes(start, end, true).expect("a view");
-        assert_eq!(kernel_asked(), asked + 4);
+        assert_eq!(kernel_asked(), asked + 2);
         assert_eq!(after[0], (first, remapped));
         let (_, settled) = writes(start, end, true).expect("a view");
         assert_eq!(settled, after);
-        assert_eq!(kernel_asked(), asked + 4);
+        assert_eq!(kernel_asked(), asked + 2);
 
         // An empty range is not answered from the guards.
         let _ = writes(v, v, true);
-        assert_eq!(kernel_asked(), asked + 5);
+        assert_eq!(kernel_asked(), asked + 3);
         unmap(v, 4);
     }
 
-    /// A range only partly guarded and clean asks the kernel.
+    /// Expanding within the same mapped view region reuses the known region
+    /// without extra `GetWriteWatch` calls; unguarded askers still query.
     #[test]
     fn partly_clean_ranges_ask_the_kernel() {
         let v = view(2);
         let asked = kernel_asked();
-        // Only block 0 is guarded.
+        // Only block 0 is guarded, discovering the whole 2-block view region.
         let _ = writes(v, v + BLOCK, true).expect("a view");
         assert_eq!(kernel_asked(), asked + 1);
         let (now, both) = writes(v, v + 2 * BLOCK, true).expect("a view");
-        assert_eq!(kernel_asked(), asked + 2);
+        assert_eq!(kernel_asked(), asked + 1);
         assert_eq!(both.last(), Some(&(v / PAGE + 1, now)));
         // Both guarded and clean now.
         let _ = writes(v, v + 2 * BLOCK, true).expect("a view");
-        assert_eq!(kernel_asked(), asked + 2);
+        assert_eq!(kernel_asked(), asked + 1);
         // Not guarded askers (texture hashes) never take the journal's word.
         assert!(writes(v, v + 2 * BLOCK, false).is_none());
-        assert_eq!(kernel_asked(), asked + 3);
+        assert_eq!(kernel_asked(), asked + 2);
         unmap(v, 2);
     }
 
-    /// A view is asked about once per block an asking starts in, again
-    /// only after the runtime remapped it; other memory every time.
+    /// A view region is queried once across all its blocks until the runtime
+    /// remaps an overlapping block; other memory every time.
     #[test]
     fn views_are_queried_once_until_remapped() {
         use windows_sys::Win32::System::Memory::{
@@ -619,20 +708,20 @@ mod tests {
         assert!(guard(view, view + 2 * BLOCK).is_some());
         assert!(guard(view + 8, view + BLOCK).is_some());
         assert_eq!(queried(), at + 1);
-        // Another start block is asked about once.
+        // Another block in the same mapped region is already known.
         assert!(guard(view + BLOCK, view + 2 * BLOCK).is_some());
         assert!(guard(view + BLOCK, view + 2 * BLOCK).is_some());
-        assert_eq!(queried(), at + 2);
+        assert_eq!(queried(), at + 1);
         // The runtime remapped the first block: asked again.
         title_memory_remapped(view, BLOCK);
         assert!(guard(view, view + 2 * BLOCK).is_some());
-        assert_eq!(queried(), at + 3);
+        assert_eq!(queried(), at + 2);
         // Private memory is not a view, however often asked.
         let plain = vec![0u8; 2 * BLOCK];
         let p = plain.as_ptr() as usize;
         assert!(guard(p, p + 16).is_none());
         assert!(guard(p, p + 16).is_none());
-        assert_eq!(queried(), at + 5);
+        assert_eq!(queried(), at + 4);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
@@ -640,6 +729,22 @@ mod tests {
             })
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn known_view_dirty_subranges_skip_kernel_asks() {
+        let v = view(4);
+        let asked = kernel_asked();
+        let _ = writes(v, v + BLOCK, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 1);
+        // Dirtied subranges inside the same 4-block mapped view use zero kernel
+        // write-watch asks while accurately reporting the written block.
+        // SAFETY: `v + 2 * BLOCK` is mapped and our VEH opens the guarded block on write.
+        unsafe { ((v + 2 * BLOCK + 16) as *mut u8).write(0x5a) };
+        let (t1, found1) = writes(v + BLOCK, v + 3 * BLOCK, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 1);
+        assert!(found1.iter().any(|&(p, w)| p == (v / PAGE + 2) && w == t1));
+        unmap(v, 4);
     }
 
     #[test]
