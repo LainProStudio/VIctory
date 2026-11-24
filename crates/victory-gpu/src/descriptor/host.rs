@@ -2803,7 +2803,7 @@ fn clamp_buffer_view(
     first: &mut u64,
     count: &mut u32,
 ) -> bool {
-    if element == 0 {
+    if element == 0 || *count == 0 {
         return false;
     }
     // SAFETY: a live buffer.
@@ -2814,9 +2814,9 @@ fn clamp_buffer_view(
         return false;
     }
     if *first + u64::from(*count) > capacity {
-        *count = (capacity - *first) as u32;
+        *count = (capacity - *first).min(u64::from(u32::MAX)) as u32;
     }
-    true
+    *count > 0
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -4887,6 +4887,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut past = 16u64;
         let mut past_count = 4u32;
         assert!(!clamp_buffer_view(&buf, 4, &mut past, &mut past_count));
+        let mut zero_first = 4u64;
+        let mut zero_count = 0u32;
+        assert!(!clamp_buffer_view(&buf, 4, &mut zero_first, &mut zero_count));
     }
 
     #[test]
