@@ -1,4 +1,7 @@
-use super::{Lowered, Numeric, Parts, buffer_format, lower, plan_lds_barriers};
+use super::{
+    Lowered, Numeric, Parts, buffer_format, compute_uniformity, half_inputs, lower,
+    packed_input_half, plan_lds_barriers,
+};
 use crate::dxbc::{Container, FourCC};
 use crate::emit::{self, HostShader};
 use crate::native::{
@@ -419,61 +422,6 @@ fn a_scalar_carry_chain_reaches_the_select() {
     }
 }
 
-/// A wave32 graphics program's host wave may have 64 lanes, whose upper
-/// half is a second console wave: a lane mask read as a number picks the
-/// reader's half of the ballot, so the reader's lane index is needed.
-#[test]
-fn a_wave32_mask_read_takes_its_ballot_half() {
-    let words = [
-        0x7D8A_0480, // v_cmp_ne_u32 vcc, 0, v2
-        0xBE84_0F6A, // s_bcnt1_i32_b32 s4, vcc_lo
-        0x7E08_0204, // v_mov_b32 v4, s4
-        0xF800_180F,
-        0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
-        S_ENDPGM,
-    ];
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
-        stage: HwStage::Ps,
-        wave64: false,
-        vgprs: 256,
-        layout: vec![],
-        used: vec![],
-        io: StageIo::Ps {
-            inputs: vec![],
-            input_addr: 0,
-            db_shader_control: 0,
-            patches: vec![],
-        },
-        code,
-    };
-    let p = ir::build(&native.code, false, 256).unwrap();
-    let res = resource::track(&p, &native.layout, native.stage).unwrap();
-    let io = io::raise(&p, &native).unwrap();
-    let st = structure::structure(&p).unwrap();
-    let lowered = lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: vec![],
-        outputs: vec![],
-        prims: vec![],
-        mesh_stride: 0,
-        options: super::TranslateOptions::default(),
-    })
-    .unwrap();
-    // Without the per-half pick, nothing reads the lane index here.
-    assert!(
-        lowered
-            .op_names
-            .iter()
-            .any(|n| n == "dx.op.waveGetLaneIndex"),
-        "the mask read should pick the lane's half of the ballot"
-    );
-}
-
 #[test]
 fn private_memory_is_as_large_as_its_addresses_reach() {
     let bytes = |words: &[u32]| {
@@ -819,6 +767,36 @@ fn emit_synthetic_cs_mode(
     (hs, p, st)
 }
 
+fn plan_synthetic_barriers(
+    words: &[u32],
+    threads: [u32; 3],
+    lds_granules: u32,
+) -> Option<super::LdsBarriers> {
+    let rsrc2 = (1 << 1) | (lds_granules << 15);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code: words_to_bytes(words),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let (uniform, _) = compute_uniformity(&p, &st, &res, &io.inputs);
+    plan_lds_barriers(&p, &st, &uniform)
+}
+
 fn psv_wave_size(dxil: &[u8]) -> Option<u32> {
     let c = Container::parse(dxil).unwrap();
     let psv = c.part(FourCC::PSV0).unwrap().data;
@@ -887,8 +865,8 @@ fn wave64_single_wave_lds_adds_barriers_and_drops_wave_size() {
     w.extend(buffer_store_dword(4, 1, 4)); // uav[tid * 4] = v4
     w.push(S_ENDPGM);
 
-    let (hs, p, st) = emit_synthetic_cs_mode(&w, [64, 1, 1], 1, super::Wave64Mode::Wave32);
-    let barriers = plan_lds_barriers(&p, &st).expect("uniform LDS barriers");
+    let (hs, _, _) = emit_synthetic_cs_mode(&w, [64, 1, 1], 1, super::Wave64Mode::Wave32);
+    let barriers = plan_synthetic_barriers(&w, [64, 1, 1], 1).expect("uniform LDS barriers");
     assert!(
         !barriers.before.is_empty(),
         "expected RAW barrier before ds_read_b32"
@@ -929,8 +907,8 @@ fn wave64_single_wave_lds_uniform_loop_syncs_raw_and_war() {
     w.extend(buffer_store_dword(2, 1, 4)); // uav[tid * 4] = acc
     w.push(S_ENDPGM);
 
-    let (hs, p, st) = emit_synthetic_cs_mode(&w, [64, 1, 1], 1, super::Wave64Mode::Wave32);
-    let barriers = plan_lds_barriers(&p, &st).expect("uniform loop LDS barriers");
+    let (hs, _, _) = emit_synthetic_cs_mode(&w, [64, 1, 1], 1, super::Wave64Mode::Wave32);
+    let barriers = plan_synthetic_barriers(&w, [64, 1, 1], 1).expect("uniform loop LDS barriers");
     assert_eq!(
         barriers.before.len(),
         2,
@@ -968,8 +946,8 @@ fn wave64_divergent_lds_hazard_keeps_wave_size_64() {
     w.extend(buffer_store_dword(2, 1, 4));
     w.push(S_ENDPGM);
 
-    let (hs, p, st) = emit_synthetic_cs(&w, [64, 1, 1], 1);
-    assert!(plan_lds_barriers(&p, &st).is_none());
+    let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+    assert!(plan_synthetic_barriers(&w, [64, 1, 1], 1).is_none());
     assert_eq!(psv_wave_size(&hs.dxil), Some(64));
 }
 
@@ -1000,8 +978,8 @@ fn wave64_divergent_write_reconverging_before_read_adds_barrier() {
     w.extend(buffer_store_dword(4, 1, 4));
     w.push(S_ENDPGM);
 
-    let (hs, p, st) = emit_synthetic_cs_mode(&w, [64, 1, 1], 1, super::Wave64Mode::Wave32);
-    let barriers = plan_lds_barriers(&p, &st).expect("reconverged LDS barrier");
+    let (hs, _, _) = emit_synthetic_cs_mode(&w, [64, 1, 1], 1, super::Wave64Mode::Wave32);
+    let barriers = plan_synthetic_barriers(&w, [64, 1, 1], 1).expect("reconverged LDS barrier");
     assert!(!barriers.before.is_empty());
     assert_eq!(psv_wave_size(&hs.dxil), None);
 
@@ -1029,9 +1007,34 @@ fn wave64_readfirstlane_of_tid_branch_keeps_wave_size_64() {
     w.extend(buffer_store_dword(2, 1, 4));
     w.push(S_ENDPGM);
 
-    let (hs, p, st) = emit_synthetic_cs(&w, [64, 1, 1], 1);
-    assert!(plan_lds_barriers(&p, &st).is_none());
+    let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+    assert!(plan_synthetic_barriers(&w, [64, 1, 1], 1).is_none());
     assert_eq!(psv_wave_size(&hs.dxil), Some(64));
+}
+
+#[test]
+fn wave64_128_threads_intra_wave_lds_with_s_barrier_plans_barriers() {
+    // 128 threads with an s_barrier isolating Phase 0/1, then intra-wave
+    // WAR + RAW LDS hazards in Phase 1 with no s_barrier: planner must reset
+    // hazard state across s_barrier and insert 2 intra-wave barriers in Phase 1.
+    let mut w = Vec::new();
+    w.push(sop1_mov_imm(1, 0x80));
+    w.extend(s_load_dwordx4(4, 0));
+    w.push(vop2(0x1A, 1, 0x82, 0)); // v_lshlrev_b32 v1, 2, v0
+    w.extend(ds_write_b32(1, 0)); // Phase 0 write
+    w.push(0xBF8A_0000); // s_barrier
+    w.extend(ds_read_b32(2, 1)); // Phase 1 read (safe after s_barrier)
+    w.extend(ds_write_b32(1, 2)); // Phase 1 write (WAR -> barrier 1)
+    w.extend(ds_read_b32(3, 1)); // Phase 1 read (RAW -> barrier 2)
+    w.extend(buffer_store_dword(3, 1, 4));
+    w.push(S_ENDPGM);
+
+    let (hs, _, _) = emit_synthetic_cs_mode(&w, [128, 1, 1], 2, super::Wave64Mode::Wave32);
+    let barriers =
+        plan_synthetic_barriers(&w, [128, 1, 1], 2).expect("planned intra-wave barriers");
+    assert_eq!(barriers.before.len(), 2, "{:?}", barriers.before);
+    assert!(barriers.at_end.is_empty());
+    assert_eq!(psv_wave_size(&hs.dxil), None);
 }
 
 #[test]
@@ -1135,9 +1138,9 @@ fn packed_half_inputs_pair_unlisted_rows() {
         patches: vec![],
     };
     let map = half_inputs(&io, &inputs);
-    assert_eq!(map.get(&0), Some(&(true, Some(1))));
-    assert_eq!(map.get(&2), Some(&(true, Some(4))));
-    assert_eq!(map.get(&5), Some(&(true, None)));
+    assert_eq!(map.get(&0), Some(&(true, Some(1), false)));
+    assert_eq!(map.get(&2), Some(&(true, Some(4), true)));
+    assert_eq!(map.get(&5), Some(&(true, None, false)));
 
     // Duplicate entries for the same row keep the first entry and do not
     // consume an extra free row; an earlier unpaired row (0) must not steal
@@ -1154,8 +1157,8 @@ fn packed_half_inputs_pair_unlisted_rows() {
         patches: vec![],
     };
     let map2 = half_inputs(&io2, &inputs2);
-    assert_eq!(map2.get(&0), Some(&(true, None)));
-    assert_eq!(map2.get(&2), Some(&(true, Some(3))));
+    assert_eq!(map2.get(&0), Some(&(true, None, false)));
+    assert_eq!(map2.get(&2), Some(&(true, Some(3), false)));
 }
 
 #[cfg(windows)]
@@ -1495,4 +1498,380 @@ fn cube_sample_grad_and_cl_lower_and_validate() {
         .unwrap();
         validate(&l.dxil);
     }
+}
+
+#[test]
+fn a_missing_value_stays_missing_through_two_live_joins() {
+    let mut words = [
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+        0xBF85_0001, // skip the first overwrite
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
+        0xBF85_0001, // skip the second overwrite
+        0xBE86_0381, // s_mov_b32 s6, 1
+        0xBF07_8006, // s_cmp_lg_u32 s6, 0
+        0xBF85_0001, // use the result to branch
+        0xBE83_0380,
+        S_ENDPGM,
+    ];
+    // Compare to a direct read so future timestamp support works in both cases.
+    let refusal = |code: &[u32]| match lowers_cs(code, false, 0) {
+        Ok(_) => None,
+        Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+        Err(error) => panic!("{error}"),
+    };
+    let direct = [&words[..2], &words[8..]].concat();
+    assert_eq!(refusal(&words), refusal(&direct));
+    words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
+    lowers_cs(&words, false, 0).expect("dead timestamp");
+}
+
+#[test]
+fn packed_pixel_inputs_find_their_second_row() {
+    use super::super::container::SigElement;
+    use crate::native::{PsInput, Usage};
+    let entry = |row, row2, pack2| PsInput {
+        usage: Usage::Generic,
+        row,
+        mask: 0xF,
+        attr: row,
+        flat: false,
+        fp16: true,
+        pack2,
+        row2,
+    };
+    let element = |row| SigElement {
+        name: "TEXCOORD".into(),
+        index: row,
+        kind: 0,
+        comp: 9,
+        interp: 2,
+        row: Some(row),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: true,
+    };
+    // Rows 0 and 3 pack and leave their second row out; 5 names its
+    // own (6). Unnamed 16-bit rows: 1, 4, 6, 7.
+    let io = StageIo::Ps {
+        inputs: vec![entry(0, 0, true), entry(3, 3, true), entry(5, 6, true)],
+        input_addr: 0,
+        db_shader_control: 0,
+        patches: vec![],
+    };
+    let sig: Vec<_> = [0, 1, 3, 4, 5, 6, 7].map(element).into();
+    let p = half_inputs(&io, &sig);
+    assert_eq!(p.get(&0), Some(&(true, Some(1), false)));
+    assert_eq!(p.get(&3), Some(&(true, Some(4), false)));
+    assert_eq!(p.get(&5), Some(&(true, Some(6), true)));
+}
+
+#[test]
+fn explicit_packed_input_tail_is_padding() {
+    use super::super::container::SigElement;
+    let element = |row, cols| SigElement {
+        name: "TEXCOORD".into(),
+        index: row,
+        kind: 0,
+        comp: 9,
+        interp: 2,
+        row: Some(row),
+        col: 0,
+        cols,
+        usage: 0,
+        half: true,
+    };
+    // Four halves in row 6 followed by only two in its explicit partner
+    // row 7. The next two reads address the packing's zero padding.
+    let sig = vec![element(6, 4), element(7, 2)];
+    assert_eq!(
+        packed_input_half(&sig, 6, Some(7), 5, true),
+        Ok(Some((7, 1)))
+    );
+    assert_eq!(packed_input_half(&sig, 6, Some(7), 6, true), Ok(None));
+    assert_eq!(packed_input_half(&sig, 6, Some(7), 7, true), Ok(None));
+    // With an inferred partner the same gap is not assumed to be zero.
+    assert!(packed_input_half(&sig, 6, Some(7), 6, false).is_err());
+    assert!(packed_input_half(&sig, 6, None, 4, false).is_err());
+}
+
+/// Lowers `words` as a `stage` program (`wave64`: the console's wave
+/// size) with no resources or inputs.
+fn lower_program(
+    words: &[u32],
+    stage: HwStage,
+    wave64: bool,
+    io: StageIo,
+) -> Result<Lowered, crate::ShaderError> {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage,
+        wave64,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io,
+        code,
+    };
+    let p = ir::build(&native.code, wave64, 256).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let st = structure::structure(&p).unwrap();
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        options: super::TranslateOptions::default(),
+    })
+}
+
+fn pixel_io() -> StageIo {
+    StageIo::Ps {
+        inputs: vec![],
+        input_addr: 0,
+        db_shader_control: 0,
+        patches: vec![],
+    }
+}
+
+fn compute_io() -> StageIo {
+    StageIo::Cs(ComputeIo {
+        rsrc2: 0,
+        threads: [1, 1, 1],
+    })
+}
+
+/// The index of the instruction `pat` names in `lines`.
+fn at(lines: &[String], pat: &str) -> usize {
+    lines
+        .iter()
+        .position(|l| l == pat)
+        .unwrap_or_else(|| panic!("no `{pat}` in {lines:?}"))
+}
+
+/// A wave32 graphics program's host wave may have 64 lanes, whose upper
+/// half is a second console wave: a lane mask read as a number picks the
+/// reader's half of the ballot, and `v_mbcnt_lo` reports its rank as a
+/// host lane number.
+#[test]
+fn a_wave32_mask_read_takes_its_ballot_half() {
+    let words = [
+        0x7D8A_0480, // v_cmp_ne_u32 vcc, 0, v2
+        0xBE84_0F6A, // s_bcnt1_i32_b32 s4, vcc_lo
+        0xBF07_806A, // s_cmp_lg_u32 vcc_lo, 0
+        0x7E08_0204, // v_mov_b32 v4, s4
+        0xD765_0005,
+        0x0001_006A, // v_mbcnt_lo_u32_b32 v5, vcc_lo, 0
+        0xD766_0006,
+        0x0002_0A6A, // v_mbcnt_hi_u32_b32 v6, vcc_lo, v5
+        0xD765_0007,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v7, -1, 0
+        0xBF85_0001, // s_cbranch_scc1 -> the export
+        S_ENDPGM,    // no lane had its bit: done
+        0xF800_180F,
+        0x0706_0504, // exp mrt0, v4, v5, v6, v7 done vm
+        S_ENDPGM,
+    ];
+    let lowered = lower_program(&words, HwStage::Ps, false, pixel_io()).unwrap();
+    let f = |name| lowered.op_names.iter().position(|n| n == name);
+    let (lane, ballot, bits) = (
+        f("dx.op.waveGetLaneIndex").expect("no lane index for the pick"),
+        f("dx.op.waveActiveBallot").expect("no ballot for the mask read"),
+        f("dx.op.unaryBits.i32").expect("no bit count"),
+    );
+    let l = &lowered.insts;
+    let lanes: Vec<usize> = l
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| **i == format!("call f{lane} [k111]"))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!lanes.is_empty(), "no lane index for the pick");
+    let i_ballot = l
+        .iter()
+        .position(|i| i.starts_with(&format!("call f{ballot} [k116, ")))
+        .expect("no ballot");
+    let (i_x, i_y) = (
+        at(l, &format!("extract i{i_ballot} 0")),
+        at(l, &format!("extract i{i_ballot} 1")),
+    );
+    // The pick: upper host lanes read the ballot's second dword.
+    let i_cmp = l
+        .iter()
+        .position(|i| {
+            i.starts_with("cmp:") && lanes.iter().any(|n| i.ends_with(&format!("i{n} k32")))
+        })
+        .expect("no `lane >= 32` compare");
+    at(l, &format!("select i{i_cmp} i{i_y} i{i_x}"));
+    // v_mbcnt_lo counts below the lane in its own half; a wave32 mask's
+    // high half is empty, so v_mbcnt_hi's count is of no bits.
+    assert!(
+        lanes
+            .iter()
+            .any(|n| l.contains(&format!("bin:And i{n} k31"))),
+        "no `lane & 31` in {l:?}"
+    );
+    at(l, &format!("call f{bits} [k31, k0]"));
+    // The count is a lane number, so a second wave's rank takes its
+    // 32-lane base: `v_mbcnt_lo(-1)` is the host lane index.
+    let bases: Vec<usize> = l
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.starts_with("bin:And ")
+                && lanes.iter().any(|n| **s == format!("bin:And i{n} k32"))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!bases.is_empty(), "no `lane & 32` wave base in {l:?}");
+    for base in &bases {
+        assert!(
+            l.iter().any(|s| {
+                s.starts_with("bin:Add ")
+                    && s["bin:Add ".len()..]
+                        .split(' ')
+                        .any(|a| a == format!("i{base}"))
+            }),
+            "the wave base `i{base}` is never added in {l:?}"
+        );
+    }
+}
+
+/// On a 64-lane host wave a wave32 program's lane-indexed ops use the
+/// lane's own console wave: a constant lane operand takes the wave's
+/// 32-lane base, and the first lane comes from its half's ballot.
+#[test]
+fn a_wave32_lane_op_uses_its_own_console_wave() {
+    let words = [
+        0xD760_0004,
+        0x0001_0B02, // v_readlane_b32 v4, v2, 5
+        0xD761_0005,
+        0x0001_0A87, // v_writelane_b32 v5, 7, 5
+        0x7E0C_0502, // v_readfirstlane_b32 v6, v2
+        0x360E_0B04, // v_and_b32 v7, v4, v5
+        0x360E_0D07, // v_and_b32 v7, v7, v6
+        0x7D8A_0E80, // v_cmp_ne_u32 vcc, 0, v7
+        0xBF07_806A, // s_cmp_lg_u32 vcc_lo, 0
+        0xBF85_0001, // s_cbranch_scc1 -> the export
+        S_ENDPGM,
+        0xF800_180F,
+        0x0707_0707, // exp mrt0, v7, v7, v7, v7 done vm
+        S_ENDPGM,
+    ];
+    let lowered = lower_program(&words, HwStage::Ps, false, pixel_io()).unwrap();
+    let l = &lowered.insts;
+    let lane_calls: Vec<usize> = l
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.starts_with("call f") && i.ends_with("[k111]"))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!lane_calls.is_empty(), "no lane index in {l:?}");
+    let bases: Vec<usize> = lane_calls
+        .iter()
+        .flat_map(|n| {
+            l.iter()
+                .enumerate()
+                .filter(|(_, i)| **i == format!("bin:And i{n} k32"))
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let used = |v: usize| -> bool {
+        l.iter()
+            .any(|i| i.ends_with(&format!("i{v}]")) || i.ends_with(&format!(" i{v}")))
+    };
+    // Console lane 5 of the lane's own wave is host lane 5 | (lane & 32),
+    // for both v_readlane (readLaneAt) and v_writelane (lane equality).
+    let ors: Vec<usize> = bases
+        .iter()
+        .filter_map(|b| l.iter().position(|i| i == &format!("bin:Or k5 i{b}")))
+        .collect();
+    assert_eq!(ors, Vec::from([2, 6]), "no `5 | base` host lanes in {l:?}");
+    for or in &ors {
+        assert!(used(*or), "the host lane `i{or}` is never used in {l:?}");
+    }
+    assert!(
+        l.iter()
+            .any(|i| i.starts_with("call f") && i.contains("k117, ")),
+        "no waveReadLaneAt in {l:?}"
+    );
+    // v_readfirstlane takes the low set bit of the lane's own half of
+    // the exec ballot, renumbered to a host lane.
+    let ballot = l
+        .iter()
+        .position(|i| i.starts_with("call f") && i.contains("[k116, "))
+        .expect("no exec ballot");
+    let (x, y) = (
+        at(l, &format!("extract i{ballot} 0")),
+        at(l, &format!("extract i{ballot} 1")),
+    );
+    let own = l
+        .iter()
+        .position(|i| i.starts_with("select ") && i.ends_with(&format!("i{y} i{x}")))
+        .expect("no own-half pick");
+    let first = l
+        .iter()
+        .position(|i| i.starts_with("call f") && i.contains(&format!("k32, i{own}")))
+        .expect("no first bit of the own half");
+    let host_first = bases
+        .iter()
+        .find_map(|b| l.iter().position(|i| i == &format!("bin:Or i{first} i{b}")))
+        .expect("the first lane is not renumbered");
+    assert!(used(host_first), "no read at the first host lane in {l:?}");
+
+    // On a wave64 program console lanes are host lanes one to one: the
+    // same reads need no renumbering at all.
+    let l64 = lower_program(&words, HwStage::Ps, true, pixel_io()).unwrap();
+    let l = &l64.insts;
+    assert!(
+        !l.iter().any(|i| i.starts_with("bin:Or ")),
+        "a wave64 lane operand is renumbered in {l:?}"
+    );
+    assert!(
+        l.iter()
+            .any(|i| i.starts_with("call f") && i.contains("k117, ") && i.contains("k5]")),
+        "no direct waveReadLaneAt of lane 5 in {l:?}"
+    );
+    assert!(
+        l.iter()
+            .any(|i| i.starts_with("call f") && i.contains("k118, ")),
+        "a wave64 first lane is not waveReadLaneFirst in {l:?}"
+    );
+}
+
+/// The ballot-half pick is for wave32 graphics programs only: a wave64
+/// program's mask dwords are its own, and the console path (compute) is
+/// the whole host wave already, so neither reads the lane index for it.
+#[test]
+fn only_host_wave32_reads_take_a_ballot_half() {
+    let words = [
+        0x7D8A_0480, // v_cmp_ne_u32 vcc, 0, v2
+        0xBE84_0F6A, // s_bcnt1_i32_b32 s4, vcc_lo
+        0x7E08_0204, // v_mov_b32 v4, s4
+        0xF800_180F,
+        0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+        S_ENDPGM,
+    ];
+    let l64 = lower_program(&words, HwStage::Ps, true, pixel_io()).unwrap();
+    assert!(!l64.op_names.iter().any(|n| n == "dx.op.waveGetLaneIndex"));
+    let words = [
+        0x7D8A_0480, // v_cmp_ne_u32 vcc, 0, v0
+        0xBE84_0F6A, // s_bcnt1_i32_b32 s4, vcc_lo
+        0xBF07_8004, // s_cmp_lg_u32 s4, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE85_0380, // s_mov_b32 s5, 0
+        S_ENDPGM,
+    ];
+    let cs = lower_program(&words, HwStage::Cs, false, compute_io()).unwrap();
+    assert!(!cs.op_names.iter().any(|n| n == "dx.op.waveGetLaneIndex"));
 }

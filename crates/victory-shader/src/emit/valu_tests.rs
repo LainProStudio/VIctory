@@ -3301,3 +3301,325 @@ fn waveid_and_group_info_match_virtual_wave64_in_wave32_and_emulate() {
         );
     }
 }
+
+/// DS `ds_swizzle_b32 vdst, vsrc offset:offset`.
+const fn ds_swizzle_b32(vdst: u8, vsrc: u8, offset: u16) -> [u32; 2] {
+    [
+        0x36 << 26 | 0x35 << 18 | offset as u32,
+        (vdst as u32) << 24 | vsrc as u32,
+    ]
+}
+
+/// Lowers a synthetic RDNA2 compute shader of `threads` threads in one row
+/// (thread id in `v0`): 4 dwords of root constants in `s0..s3`, the
+/// descriptor table address in `s4`, a raw UAV at heap index 0.
+fn build_cs_threads(words: &[u32], threads: u32) -> HostShader {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 4,
+                user_data: 4,
+                slot: 0,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [threads, 1, 1],
+        }),
+        code,
+    };
+    let shader = try_lower_compute(&native).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// One wave of 32 lanes holding 1..=32 (the input of the ISA's examples)
+/// through `ds_swizzle_b32` with `offset`: what each lane reads.
+fn swizzle_32(offset: u16) -> Vec<Vec<u32>> {
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.push(vop2(0x25, 1, 129, 0)); // v_add_nc_u32 v1, 1, v0
+    words.extend_from_slice(&ds_swizzle_b32(2, 1, offset));
+    words.push(vop2(0x1A, 3, 130, 0)); // v_lshlrev_b32 v3, 2, v0
+    words.extend_from_slice(&buffer_store_dword_offen(2, 3, 8));
+    words.push(S_ENDPGM);
+    let shader = build_cs_threads(&words, 32);
+
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(p) => p,
+            // A host without 32-lane waves cannot run it.
+            Err(e) if warp => {
+                eprintln!("{label}: no pipeline ({e}); skipped");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let uavs = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(32)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        out.push(uavs[0].clone());
+    }
+    if out.is_empty() {
+        eprintln!("no SM 6.6 device with 32-lane waves; skipped");
+    }
+    out
+}
+
+/// The basic modes: a quad permutation and a 32-lane and/or/xor mapping.
+#[test]
+fn ds_swizzle_basic_modes() {
+    // offset[15]: lanes of each quad read lanes 3, 2, 1, 0 of it.
+    let reversed: Vec<u32> = (0..32).map(|i| (i ^ 3) + 1).collect();
+    // and 0x1f, or 0, xor 0x10: the halves swap.
+    let swapped: Vec<u32> = (0..32).map(|i| (i ^ 16) + 1).collect();
+    for (offset, want) in [(0x801B, reversed), (0x401F, swapped)] {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+}
+
+/// Offsets from 0xE000: the FFT orders, as the ISA lists them for inputs
+/// 1..=0x20 (RDNA2 ISA, 12.13.1).
+#[test]
+fn ds_swizzle_fft_mode() {
+    let cases: [(u16, [u32; 32]); 3] = [
+        (
+            0xE000,
+            [
+                0x01, 0x11, 0x09, 0x19, 0x05, 0x15, 0x0d, 0x1d, 0x03, 0x13, 0x0b, 0x1b, 0x07, 0x17,
+                0x0f, 0x1f, 0x02, 0x12, 0x0a, 0x1a, 0x06, 0x16, 0x0e, 0x1e, 0x04, 0x14, 0x0c, 0x1c,
+                0x08, 0x18, 0x10, 0x20,
+            ],
+        ),
+        (
+            0xE010,
+            [
+                0x01, 0x09, 0x05, 0x0d, 0x03, 0x0b, 0x07, 0x0f, 0x02, 0x0a, 0x06, 0x0e, 0x04, 0x0c,
+                0x08, 0x10, 0x11, 0x19, 0x15, 0x1d, 0x13, 0x1b, 0x17, 0x1f, 0x12, 0x1a, 0x16, 0x1e,
+                0x14, 0x1c, 0x18, 0x20,
+            ],
+        ),
+        // 0x1f: no swizzle.
+        (0xE01F, std::array::from_fn(|i| i as u32 + 1)),
+    ];
+    for (offset, want) in cases {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+    // The other bits of an FFT offset do not matter.
+    for got in swizzle_32(0xFFF0) {
+        assert_eq!(got, cases[1].1, "offset 0xfff0");
+    }
+}
+
+/// Offsets from 0xC000 to 0xDFFF: the wave's 32 lanes rotate left by
+/// offset[9:5], or right with offset[10] (RDNA2 ISA, 12.13.1).
+#[test]
+fn ds_swizzle_rotate_mode() {
+    let rotated = |by: u32| -> Vec<u32> { (0..32).map(|i| (i + by) % 32 + 1).collect() };
+    for (offset, by) in [
+        (0xC000 | 1 << 5, 1),            // the ISA's example: {2, 3, ... 0x20, 1}
+        (0xC000 | 1 << 10 | 1 << 5, 31), // and {0x20, 1, ... 0x1f}
+        (0xC000, 0),
+        (0xC000 | 5 << 5, 5),
+        (0xC000 | 1 << 10 | 5 << 5, 27),
+        (0xD800 | 31 << 5, 31), // bits 11 and 12 are not read
+    ] {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, rotated(by), "offset {offset:#06x}");
+        }
+    }
+}
+
+/// Rotations with a mask (offset[4:0]): the mask's bits of the lane index
+/// stay, the others rotate, as the ISA's pseudocode has it. Its examples for
+/// mask 1 list other lanes; the lanes here are the ones measured on RDNA2
+/// hardware (gfx1036, by Lyrnc in Marvisak/VIctory#606, who gives the first
+/// and last entries of each list and reports the pseudocode matching all 2048
+/// offsets 0xC000-0xC7FF, and bits 11 and 12 being ignored).
+#[test]
+fn ds_swizzle_masked_rotations() {
+    // The lane each lane reads.
+    let cases: [(u16, [u32; 32]); 4] = [
+        // Left by 1, mask 1: 0, 3, 2, 5, 4, 7, 6, 9, 8, ..., 28, 31, 30, 1.
+        (
+            0xC021,
+            [
+                0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 17, 16, 19, 18, 21, 20, 23, 22,
+                25, 24, 27, 26, 29, 28, 31, 30, 1,
+            ],
+        ),
+        // Right by 1, mask 1: 30, 1, 0, 3, 2, 5, 4, ...
+        (
+            0xC421,
+            [
+                30, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 17, 16, 19, 18, 21, 20,
+                23, 22, 25, 24, 27, 26, 29, 28, 31,
+            ],
+        ),
+        // Left by 1, mask 3: 0, 1, 2, 7, 4, 5, 6, 11, ...
+        (
+            0xC023,
+            [
+                0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14, 19, 16, 17, 18, 23, 20, 21, 22,
+                27, 24, 25, 26, 31, 28, 29, 30, 3,
+            ],
+        ),
+        // Bits 11 and 12 set: as 0xC021.
+        (
+            0xD821,
+            [
+                0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 17, 16, 19, 18, 21, 20, 23, 22,
+                25, 24, 27, 26, 29, 28, 31, 30, 1,
+            ],
+        ),
+    ];
+    for (offset, lanes) in cases {
+        // Lane i holds i + 1.
+        let want: Vec<u32> = lanes.iter().map(|j| j + 1).collect();
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+}
+
+/// Runs VOP1 `op` on each input and compares the result dword.
+fn check_cvt(name: &str, op: u16, cases: &[(u32, u32)]) {
+    let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got,
+            want,
+            "{backend}: {name}({:#010x} = {:e}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+            f32::from_bits(inp[0]),
+        );
+    });
+}
+
+#[test]
+fn v_cvt_rpi_i32_f32_rounds_to_nearest() {
+    // floor(x + 0.5) of the exact sum: an f32 sum rounds to even first, so
+    // it is 1 too high just below 0.5 and for odd integers from 2^23 up.
+    check_cvt(
+        "v_cvt_rpi_i32_f32",
+        0x00C,
+        &[
+            (0x0000_0000, 0),
+            (0x3EFF_FFFF, 0), // 0.5 - 2^-25
+            (0x3F00_0000, 1), // 0.5: ties go up
+            (0xBF00_0000, 0), // -0.5
+            (0xBF00_0001, 0xFFFF_FFFF),
+            (0x3FC0_0000, 2),           // 1.5
+            (0x4020_0000, 3),           // 2.5
+            (0xBFC0_0000, 0xFFFF_FFFF), // -1.5
+            (0xC020_0000, 0xFFFF_FFFE), // -2.5
+            (0x0000_0001, 0),           // denormals, flushed or not
+            (0x8000_0001, 0),
+            (0x4A80_0001, 0x0040_0001), // 2^22 + 0.5
+            (0x4B00_0001, 0x0080_0001), // 2^23 + 1
+            (0x4B7F_FFFF, 0x00FF_FFFF), // 2^24 - 1
+            (0xCB00_0001, 0xFF7F_FFFF), // -(2^23 + 1)
+            (0xCB7F_FFFF, 0xFF00_0001),
+            (0x4EFF_FFFF, 0x7FFF_FF80),
+            (0x4F00_0000, 0x7FFF_FFFF), // 2^31 and up saturate
+            (0x7F80_0000, 0x7FFF_FFFF),
+            (0xCF00_0000, 0x8000_0000),
+            (0xCF00_0001, 0x8000_0000),
+            (0xFF80_0000, 0x8000_0000),
+        ],
+    );
+}
+
+#[test]
+fn v_cvt_flr_i32_f32_rounds_down() {
+    check_cvt(
+        "v_cvt_flr_i32_f32",
+        0x00D,
+        &[
+            (0x0000_0000, 0),
+            (0x8000_0000, 0),
+            (0x3FC0_0000, 1),           // 1.5
+            (0xBFC0_0000, 0xFFFF_FFFE), // -1.5
+            (0x3F7F_FFFF, 0),
+            (0xBF80_0000, 0xFFFF_FFFF), // -1
+            (0xB300_0000, 0xFFFF_FFFF), // -2^-25
+            (0x4B7F_FFFF, 0x00FF_FFFF),
+            (0x4F00_0000, 0x7FFF_FFFF),
+            (0x7F80_0000, 0x7FFF_FFFF),
+            (0xCF00_0001, 0x8000_0000),
+            (0xFF80_0000, 0x8000_0000),
+        ],
+    );
+}
+
+#[test]
+fn v_cvt_flr_and_rpi_i32_f32_saturate_nan_by_sign() {
+    // Unlike v_cvt_i32_f32 (NaN gives 0), these saturate whatever has an
+    // exponent above 30, a NaN too: to the largest or the smallest integer
+    // by its sign.
+    let cases = [
+        (0x7FC0_0000, 0x7FFF_FFFF),
+        (0x7F80_0001, 0x7FFF_FFFF),
+        (0x7FFF_FFFF, 0x7FFF_FFFF),
+        (0xFFC0_0000, 0x8000_0000),
+        (0xFF80_0001, 0x8000_0000),
+        (0xFFFF_FFFF, 0x8000_0000),
+    ];
+    check_cvt("v_cvt_rpi_i32_f32", 0x00C, &cases);
+    check_cvt("v_cvt_flr_i32_f32", 0x00D, &cases);
+    // v_cvt_i32_f32 keeps giving 0.
+    check_cvt(
+        "v_cvt_i32_f32",
+        0x008,
+        &[(0x7FC0_0000, 0), (0xFFC0_0000, 0), (0x7F80_0001, 0)],
+    );
+}

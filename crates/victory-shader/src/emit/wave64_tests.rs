@@ -908,4 +908,46 @@ mod gpu {
             true,
         );
     }
+
+    #[test]
+    fn gpu_128_threads_intra_wave_lds_with_s_barrier_elsewhere() {
+        // 128-thread Wave64 compute shader with BOTH:
+        // 1. Inter-wave LDS write + explicit `s_barrier` + read from `(tid ^ 64) * 4`.
+        // 2. Intra-wave LDS write + read from `(tid ^ 32) * 4` WITHOUT `s_barrier`
+        //    (crossing the Wave32 host half boundary).
+        let mut code = Vec::new();
+        code.push(v_lshlrev_b32(2, inline_u(2), 0)); // v2 = tid * 4
+        code.push(v_add_nc_u32(3, inline_u(10), 0)); // v3 = tid + 10
+        code.extend_from_slice(&ds_op(0x0D, 0, 0, 2, 3, 0)); // ds_write_b32 lds[tid*4] = tid+10
+        code.push(sopp(0x0A, 0)); // s_barrier
+        code.push(v_mov_b32(4, LIT));
+        code.push(64);
+        code.push(vop2(0x1D, 4, vgpr(4), 0)); // v4 = tid ^ 64
+        code.push(v_lshlrev_b32(4, inline_u(2), 4)); // v4 = (tid ^ 64) * 4
+        code.extend_from_slice(&ds_op(0x36, 0, 0, 4, 0, 5)); // v5 = lds[(tid ^ 64)*4]
+        // Intra-wave LDS write-then-read with NO s_barrier (WAR after above read + RAW before read below):
+        code.push(v_mov_b32(6, LIT));
+        code.push(100);
+        code.push(v_add_nc_u32(6, vgpr(6), 5)); // v6 = v5 + 100
+        code.extend_from_slice(&ds_op(0x0D, 0, 0, 2, 6, 0)); // ds_write_b32 lds[tid*4] = v6
+        code.push(vop2(0x1D, 7, inline_u(32), 0)); // v7 = tid ^ 32
+        code.push(v_lshlrev_b32(7, inline_u(2), 7)); // v7 = (tid ^ 32) * 4
+        code.extend_from_slice(&ds_op(0x36, 0, 0, 7, 0, 1)); // v1 = lds[(tid ^ 32)*4]
+        emit_uav_store(&mut code, 1, 0);
+        code.push(S_ENDPGM);
+
+        let prog = make_cs_program(&code, [128, 1, 1], 1024, false);
+        let sh = emit_cs(&prog, Wave64Mode::Wave32).unwrap();
+        assert_eq!(psv_wave_range(&sh), (0, u32::MAX));
+
+        let expected: Vec<u32> = (0..128u32).map(|tid| (tid ^ 96) + 110).collect();
+        run_on_hosts(
+            "128_threads_intra_wave_lds_with_s_barrier",
+            &prog,
+            [1, 1, 1],
+            128,
+            &expected,
+            false,
+        );
+    }
 }
