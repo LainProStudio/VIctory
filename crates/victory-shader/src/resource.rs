@@ -1251,10 +1251,10 @@ fn restored_with(
     let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
         return None;
     };
-    spilled_with(
+    spilled_lane(
         p,
-        defs,
-        phis,
+        &|val| defs[val.0 as usize].map(|(b, i)| &p.blocks[b].insts[i]),
+        &|val| phis[val.0 as usize],
         inst.read(Reg::V(reg))?,
         lane_of(lane)?,
         &mut Vec::new(),
@@ -1263,22 +1263,24 @@ fn restored_with(
     .flatten()
 }
 
-fn spilled_with(
-    p: &Program,
-    defs: &[Option<Site>],
-    phis: &[Option<(usize, usize)>],
+/// Traces lane `lane` of VGPR value `v` back through `v_writelane_b32` writes
+/// and VGPR phis to the spilled scalar or constant (`Ok(None)` for a phi cycle).
+pub(crate) fn spilled_lane<'a>(
+    p: &'a Program,
+    def_of: &impl Fn(Value) -> Option<&'a Inst>,
+    phi_of: &impl Fn(Value) -> Option<(usize, usize)>,
     v: Value,
     lane: u32,
     seen: &mut Vec<Value>,
 ) -> Result<Option<Moved>, ()> {
-    if let Some((b, i)) = phis[v.0 as usize] {
+    if let Some((b, i)) = phi_of(v) {
         if seen.contains(&v) {
             return Ok(None);
         }
         seen.push(v);
         let mut found = None;
         for &a in &p.blocks[b].phis[i].args {
-            if let Some(m) = spilled_with(p, defs, phis, a, lane, seen)? {
+            if let Some(m) = spilled_lane(p, def_of, phi_of, a, lane, seen)? {
                 if found.is_some_and(|f| f != m) {
                     return Err(());
                 }
@@ -1287,8 +1289,7 @@ fn spilled_with(
         }
         return Ok(found);
     }
-    let (b, i) = defs[v.0 as usize].ok_or(())?;
-    let inst = &p.blocks[b].insts[i];
+    let inst = def_of(v).ok_or(())?;
     let Fields::Valu(w) = &inst.fields else {
         return Err(());
     };
@@ -1299,10 +1300,18 @@ fn spilled_with(
         return Err(());
     }
     if lane_of(*at).ok_or(())? != lane {
-        return spilled_with(p, defs, phis, inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        return spilled_lane(
+            p,
+            def_of,
+            phi_of,
+            inst.read(Reg::V(reg)).ok_or(())?,
+            lane,
+            seen,
+        );
     }
     match *value {
         Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).map(Moved::Value),
+        Operand::Scalar { .. } => Some(Moved::Const(0)),
         Operand::Literal(x) => Some(Moved::Const(x)),
         Operand::Const(c) => inline(c).map(Moved::Const),
         _ => None,
@@ -1320,7 +1329,7 @@ impl Tracer<'_> {
 }
 
 /// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+pub(crate) fn lane_of(op: Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
@@ -1911,6 +1920,38 @@ pub(crate) mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn descriptors_copied_through_vgprs_and_readfirstlane_are_tracked() {
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0201,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+                0x7E00_0208, // v_mov_b32 v0, s8
+                0x7E02_0209, // v_mov_b32 v1, s9
+                0x7E04_020A, // v_mov_b32 v2, s10
+                0x7E06_020B, // v_mov_b32 v3, s11
+                0x7E08_0500, // v_readfirstlane_b32 s4, v0
+                0x7E0A_0501, // v_readfirstlane_b32 s5, v1
+                0x7E0C_0502, // v_readfirstlane_b32 s6, v2
+                0x7E0E_0503, // v_readfirstlane_b32 s7, v3
+                0xF420_0002,
+                0xFA00_0000, // s_buffer_load_dword s0, s[4:7], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
         );
     }
 }

@@ -1958,3 +1958,145 @@ fn heap_buffer_load_glc_emits_globally_coherent_uav_and_validates() {
         l.handle_props
     );
 }
+
+#[test]
+fn sixty_four_bit_image_atomics_lower_and_validate() {
+    let words = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF40C_0501,
+        0xFA00_0000, // s_load_dwordx8 s[20:27], s[2:3], null
+        0xF05C_130A,
+        0x0005_060D,
+        0x0000_0004, // image_atomic_umax v[6:7], [v13,v4], s[20:27] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+        S_ENDPGM,
+    ];
+    let layout = vec![root(RootType::Table, 0, 0)];
+    let used = vec![UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 0,
+        slot: 0,
+    }];
+    let l = lower_with(&words, layout, used).unwrap();
+    validate(&l.dxil);
+}
+
+#[test]
+fn spilled_inactive_mask_does_not_poison_other_lanes() {
+    let words = [
+        0xBE80_0385, // s_mov_b32 s0, 5
+        0x8902_C17E, // s_xor_b32 s2, exec_lo, -1
+        0xD761_0000,
+        0x0001_0002, // v_writelane_b32 v0, s2, 0
+        0xD761_0000,
+        0x0001_0200, // v_writelane_b32 v0, s0, 1
+        0xD760_0004,
+        0x0001_0300, // v_readlane_b32 s4, v0, 1
+        0xBF06_8504, // s_cmp_eq_u32 s4, 5
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE85_0380, // s_mov_b32 s5, 0
+        S_ENDPGM,
+    ];
+    lowers(&words).unwrap();
+}
+
+#[test]
+fn spilled_derived_lane_mask_restored_for_select_lowers_and_validates() {
+    let cnd = 258 | (259 << 9) | (3 << 18); // v_cndmask_b32 v1, v2, v3, s3
+    let words = [
+        0x8902_C17E, // s_xor_b32 s2, exec_lo, -1 (inactive mask)
+        0xD761_0000,
+        0x0001_0002, // v_writelane_b32 v0, s2, 0
+        0xD760_0003,
+        0x0001_0100, // v_readlane_b32 s3, v0, 0
+        0xD501_0001,
+        cnd, // v_cndmask_b32 v1, v2, v3, s3
+        S_ENDPGM,
+    ];
+    let l = lowers_cs(&words, false, 0).unwrap();
+    validate(&l.dxil);
+    assert!(!l.op_names.iter().any(|n| n == "dx.op.waveGetLaneIndex"));
+}
+
+#[test]
+fn descriptor_data_handles_s_buffer_load_srv() {
+    let words = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0001,
+        0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_0002, // s_cbranch_scc1 -> s_endpgm
+        0xF420_0100,
+        0xFA00_0000, // s_buffer_load_dword s4, s[0:3], null
+        S_ENDPGM,
+    ];
+    let layout = vec![root(RootType::Table, 0, 0)];
+    let used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    let l = lower_with(&words, layout, used).unwrap();
+    validate(&l.dxil);
+}
+
+#[test]
+fn transitive_descriptor_phi_does_not_block_live_data_join() {
+    let words = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0003, // s_cbranch_scc1 -> second descriptor load
+        0xF408_0101,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+        0xBF82_0002, // s_branch -> join1
+        0xF408_0101,
+        0xFA00_0010, // s_load_dwordx4 s[4:7], s[2:3], 0x10
+        0xBF06_8101, // join1: s_cmp_eq_u32 s1, 1
+        0xBF85_0001, // s_cbranch_scc1 -> join2
+        0xBE84_0381, // s_mov_b32 s4, 1
+        0xBF07_8004, // join2: s_cmp_lg_u32 s4, 0
+        0xBF85_0001, // s_cbranch_scc1 -> end
+        0xBE88_0380, // s_mov_b32 s8, 0
+        S_ENDPGM,
+    ];
+    let layout = vec![
+        root(RootType::Table, 0, 0),
+        root(RootType::Constants, 1, 0),
+    ];
+    let l = lower_with(&words, layout, Vec::new()).unwrap();
+    validate(&l.dxil);
+}
+
+#[test]
+fn transitive_lane_mask_phi_does_not_block_live_data_join() {
+    let words = [
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0003, // s_cbranch_scc1 -> second v_cmp
+        0xD4C2_0004,
+        0x0002_0080, // v_cmp_eq_u32 s4, 0, v0
+        0xBF82_0002, // s_branch -> join1
+        0xD4C5_0004,
+        0x0002_0080, // v_cmp_ne_u32 s4, 0, v0
+        0xBF06_8101, // join1: s_cmp_eq_u32 s1, 1
+        0xBF85_0001, // s_cbranch_scc1 -> join2
+        0xBE84_0381, // s_mov_b32 s4, 1
+        0xBF07_8004, // join2: s_cmp_lg_u32 s4, 0
+        0xBF85_0001, // s_cbranch_scc1 -> end
+        0xBE88_0380, // s_mov_b32 s8, 0
+        S_ENDPGM,
+    ];
+    let l = lowers_cs(&words, false, 2).unwrap();
+    validate(&l.dxil);
+}

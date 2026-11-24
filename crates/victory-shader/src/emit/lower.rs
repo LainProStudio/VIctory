@@ -579,6 +579,7 @@ struct Lower<'a> {
 enum Spill {
     Value(Value),
     Const(u32),
+    Mask,
 }
 
 /// SSA tracking for a function-wide loop step counter across IR blocks.
@@ -1193,73 +1194,77 @@ fn resolve_spills(p: &Program, st: &Structured) -> (HashMap<Site, Spill>, HashSe
         true
     };
 
-    fn walk(
-        p: &Program,
-        st: &Structured,
-        def_site: &HashMap<Value, Site>,
-        phi_at: &HashMap<Value, (usize, usize)>,
-        v: Value,
-        lane: u32,
-        seen: &mut Vec<Value>,
-    ) -> Result<Option<Spill>, ()> {
-        if let Some(&(b, i)) = phi_at.get(&v) {
-            if seen.contains(&v) {
-                return Ok(None);
-            }
-            seen.push(v);
-            let mut found = None;
-            for &arg in &p.blocks[b].phis[i].args {
-                if let Some(m) = walk(p, st, def_site, phi_at, arg, lane, seen)? {
-                    if found.is_some_and(|f| f != m) {
-                        return Err(());
+    struct SpillWalker<'a> {
+        p: &'a Program,
+        st: &'a Structured,
+        def_site: &'a HashMap<Value, Site>,
+        phi_at: &'a HashMap<Value, (usize, usize)>,
+        allow_mask: bool,
+    }
+
+    impl<'a> SpillWalker<'a> {
+        fn walk(
+            &self,
+            v: Value,
+            lane: u32,
+            seen: &mut Vec<Value>,
+        ) -> Result<Option<Spill>, ()> {
+            if let Some(&(b, i)) = self.phi_at.get(&v) {
+                if seen.contains(&v) {
+                    return Ok(None);
+                }
+                seen.push(v);
+                let mut found = None;
+                for &arg in &self.p.blocks[b].phis[i].args {
+                    if let Some(m) = self.walk(arg, lane, seen)? {
+                        if found.is_some_and(|f| f != m) {
+                            return Err(());
+                        }
+                        found = Some(m);
                     }
-                    found = Some(m);
                 }
+                return Ok(found);
             }
-            return Ok(found);
-        }
-        let &(b, i) = def_site.get(&v).ok_or(())?;
-        let inst = &p.blocks[b].insts[i];
-        let Fields::Valu(w) = &inst.fields else {
-            return Err(());
-        };
-        if inst.name() != "v_writelane_b32"
-            || w.abs != 0
-            || w.neg != 0
-            || w.opsel != 0
-            || w.sdwa.is_some()
-            || w.dpp.is_some()
-        {
-            return Err(());
-        }
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
-            return Err(());
-        };
-        if const_lane(*at, p.wave64).ok_or(())? != lane {
-            return walk(
-                p,
-                st,
-                def_site,
-                phi_at,
-                inst.read(Reg::V(reg)).ok_or(())?,
-                lane,
-                seen,
-            );
-        }
-        let spill = match *value {
-            Operand::Scalar { code: NULL, .. } => Spill::Const(0),
-            Operand::Scalar { code, .. } => {
-                let sv = inst.read(Reg::S(code)).ok_or(())?;
-                if st.masks.contains_key(&sv) || st.highs.contains_key(&sv) {
-                    return Err(());
+            let &(b, i) = self.def_site.get(&v).ok_or(())?;
+            let inst = &self.p.blocks[b].insts[i];
+            let Fields::Valu(w) = &inst.fields else {
+                return Err(());
+            };
+            if inst.name() != "v_writelane_b32"
+                || w.abs != 0
+                || w.neg != 0
+                || w.opsel != 0
+                || w.sdwa.is_some()
+                || w.dpp.is_some()
+            {
+                return Err(());
+            }
+            let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+                return Err(());
+            };
+            if const_lane(*at, self.p.wave64).ok_or(())? != lane {
+                return self.walk(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+            }
+            let spill = match *value {
+                Operand::Scalar { code: NULL, .. } => Spill::Const(0),
+                Operand::Scalar { code, .. } => {
+                    let sv = inst.read(Reg::S(code)).ok_or(())?;
+                    if self.st.masks.contains_key(&sv) || self.st.highs.contains_key(&sv) {
+                        if self.allow_mask {
+                            Spill::Mask
+                        } else {
+                            return Err(());
+                        }
+                    } else {
+                        Spill::Value(sv)
+                    }
                 }
-                Spill::Value(sv)
-            }
-            Operand::Literal(x) => Spill::Const(x),
-            Operand::Const(c) => Spill::Const(crate::resource::inline(c).ok_or(())?),
-            _ => return Err(()),
-        };
-        Ok(Some(spill))
+                Operand::Literal(x) => Spill::Const(x),
+                Operand::Const(c) => Spill::Const(crate::resource::inline(c).ok_or(())?),
+                _ => return Err(()),
+            };
+            Ok(Some(spill))
+        }
     }
 
     let mut resolved_reads = HashMap::new();
@@ -1282,14 +1287,30 @@ fn resolve_spills(p: &Program, st: &Structured) -> (HashMap<Site, Spill>, HashSe
             else {
                 continue;
             };
-            if let Ok(Some(spill)) = walk(p, st, &def_site, &phi_at, vgpr_val, lane, &mut Vec::new())
-            {
+            let dst_is_mask = matches!(
+                v.dst,
+                Some(Operand::Scalar { code, .. }) if code != NULL
+                    && inst.write(Reg::S(code)).is_some_and(|w| {
+                        st.masks.contains_key(&w) || st.highs.contains_key(&w)
+                    })
+            );
+            let walker = SpillWalker {
+                p,
+                st,
+                def_site: &def_site,
+                phi_at: &phi_at,
+                allow_mask: dst_is_mask,
+            };
+            if let Ok(Some(spill)) = walker.walk(vgpr_val, lane, &mut Vec::new()) {
                 let ok = match spill {
-                    Spill::Const(_) => true,
+                    Spill::Const(_) | Spill::Mask => true,
                     Spill::Value(sv) => def_block.get(&sv).is_some_and(|&db| dominates(db, b)),
                 };
                 if ok {
-                    resolved_reads.insert((b, i), spill);
+                    resolved_reads.insert(
+                        (b, i),
+                        if dst_is_mask { Spill::Mask } else { spill },
+                    );
                 }
             }
         }
@@ -8020,10 +8041,18 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                let dst_v = match v.dst {
+                    Some(Operand::Scalar { code, .. }) if code != NULL => inst.write(Reg::S(code)),
+                    _ => None,
+                };
+                if self.is_mask(dst_v) || dst_v.is_some_and(|d| self.x.st.highs.contains_key(&d)) {
+                    return Err(LANE_MASK);
+                }
                 if let Some(&spill) = self.resolved_reads.get(&(b, i)) {
                     let r = match spill {
                         Spill::Value(val) => self.i32_of(val)?,
                         Spill::Const(k) => self.s.m.i32(k),
+                        Spill::Mask => return Err(LANE_MASK),
                     };
                     return int(self, r);
                 }
@@ -9778,7 +9807,7 @@ impl<'a> Lower<'a> {
             // handle U32 (0x105), matching `props` above.
             let ty = if wide {
                 self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED;
-                if matches!(src, Source::Loaded { .. }) {
+                if !matches!(src, Source::Built { .. } | Source::Constant(_)) {
                     self.s.flags |= flags::ATOMIC_INT64_HEAP;
                 }
                 self.s.m.int(64)
@@ -11772,18 +11801,22 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
-        // A phi that only another read phi consumes is live too. Without this,
-        // a value with no DXIL form that reaches a read through two joins is
-        // taken for dead at the first join and replaced by zero below, and the
-        // lowering accepts what it refuses when the same value is read
-        // directly.
-        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
+        // A phi read only by another phi is read too: follow incoming phi
+        // dependencies from the phis actual readers mark, by fixpoint, before
+        // the substitution decision; a dead phi keeps the zero substitution.
+        // Keep `self.read_phis` as the direct readers so intermediate phis
+        // carrying only descriptors, lane masks, barycentrics, or
+        // interpolation halves (which resource tracking, the mask pass, and
+        // interpolation lowering resolve without a DXIL value) are not
+        // spuriously rejected.
+        let mut read = self.read_phis.clone();
+        let mut work: Vec<Value> = read.iter().copied().collect();
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
             for &arg in &p.blocks[b].phis[i].args {
-                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
+                if self.phi_at.contains_key(&arg) && read.insert(arg) {
                     work.push(arg);
                 }
             }
@@ -11811,6 +11844,8 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            let is_direct = self.read_phis.contains(&phi.value);
+            let is_read = read.contains(&phi.value);
             // A register initialized only on one branch may carry a dead
             // descriptor dword left over from earlier register reuse on the
             // other branch (guarded by a separate predicate). Only treat a
@@ -11828,7 +11863,7 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                if is_read && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
                 }
                 let x = match (self.vals.get(&arg).copied(), bit) {
@@ -11843,19 +11878,27 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.i32(0)
                     }
+                    (Some(Val::Missing(why)), _)
+                        if is_read && !is_direct && is_non_data_role(why) =>
+                    {
+                        if bit {
+                            self.s.m.bool(false)
+                        } else {
+                            self.s.m.i32(0)
+                        }
+                    }
                     (Some(Val::Missing(_)), false)
-                        if self.read_phis.contains(&phi.value)
-                            && self.overwritten_movreld_edge(b, phi, n).is_some() =>
+                        if is_read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Bit(_)), false) if is_read => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _) if is_read => {
                         return Err(Stop::Retry(phi.value, why));
                     }
-                    _ if self.read_phis.contains(&phi.value) => {
+                    _ if is_read => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
                     }
                     _ if bit => self.s.m.bool(false),
@@ -11875,6 +11918,31 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether a missing-value reason belongs to a non-data entity (descriptor,
+/// lane mask, barycentric, or interpolation half) resolved by its own pass.
+fn is_non_data_role(why: Why) -> bool {
+    matches!(
+        why,
+        "a descriptor read only as data"
+            | "a descriptor's address or format read as data"
+            | "a constant buffer's descriptor read as data"
+            | "a descriptor read as data and by a scalar load"
+            | "a descriptor read as data and by a global access"
+            | "a descriptor read as data and by another instruction"
+            | "a root descriptor"
+            | "a lane mask"
+            | "a lane mask read as data"
+            | "a lane mask holding lanes elsewhere read as data"
+            | "a lane mask from a carry"
+            | "a lane mask written after its use"
+            | "a lane mask whose lanes depend on its own value"
+            | "the first half of an interpolation"
+            | "pull-model barycentrics"
+            | "barycentrics of a third interpolation mode"
+            | "a console barycentrics element without i and j"
+    )
 }
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
