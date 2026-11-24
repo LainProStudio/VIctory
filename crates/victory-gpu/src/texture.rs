@@ -16,6 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -280,10 +281,14 @@ impl Staging {
         };
         let (mut read, mut linear) = take_scratch();
         let mut packed = Vec::new();
-        let pool_mutex = Mutex::new(pool);
         let res = self.refresh_prepared(
-            host,
-            &pool_mutex,
+            || {
+                let (buf, ptr, off) = pool.alloc(host, self.total)?;
+                // SAFETY: this reservation owns self.total mapped bytes until refresh returns.
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(ptr.cast(), self.total as usize) };
+                Some((dst, (buf, off)))
+            },
             watch_now,
             &mut read,
             &mut linear,
@@ -335,34 +340,32 @@ impl Staging {
 
     /// Refreshes a single dirty or hashed texture into `pool` using caller-owned
     /// scratch buffers (safe to run concurrently across distinct textures).
-    pub(crate) fn refresh_prepared(
+    fn refresh_prepared<'a, T>(
         &self,
-        host: &crate::host::Host,
-        pool: &Mutex<&mut UploadPool>,
+        allocate: impl FnOnce() -> Option<(&'a mut [MaybeUninit<u8>], T)>,
         watch_now: Option<u64>,
         read: &mut Vec<u8>,
         linear: &mut Vec<u8>,
         packed: &mut Vec<u8>,
-    ) -> Option<(ID3D12Resource, u64)> {
+    ) -> Option<T> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let (bytes_read, uploaded) =
-            self.refresh_prepared_inner(host, pool, watch_now, read, linear, packed);
+            self.refresh_prepared_inner(allocate, watch_now, read, linear, packed);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(bytes_read as u64, Relaxed);
         uploaded
     }
 
-    fn refresh_prepared_inner(
+    fn refresh_prepared_inner<'a, T>(
         &self,
-        host: &crate::host::Host,
-        pool: &Mutex<&mut UploadPool>,
+        allocate: impl FnOnce() -> Option<(&'a mut [MaybeUninit<u8>], T)>,
         watch_now: Option<u64>,
         read: &mut Vec<u8>,
         linear: &mut Vec<u8>,
         packed: &mut Vec<u8>,
-    ) -> (usize, Option<(ID3D12Resource, u64)>) {
+    ) -> (usize, Option<T>) {
         use std::sync::atomic::Ordering;
         let size = self.layout.size as usize;
         if let Some(now) = watch_now {
@@ -370,29 +373,35 @@ impl Staging {
             if let Some(extra) = size.checked_sub(read.len())
                 && read.try_reserve_exact(extra).is_err()
             {
-                once!(bytes = size, "no room to read a texture's memory; not uploaded");
+                once!(
+                    bytes = size,
+                    "no room to read a texture's memory; not uploaded"
+                );
                 return (0, None);
             }
-            let Some((upload_buf, upload_ptr, base_offset)) =
-                pool.lock().unwrap_or_else(|e| e.into_inner()).alloc(host, self.total)
-            else {
+            let Some((upload_ptr, upload)) = allocate() else {
                 return (0, None);
             };
-            last.asked = now;
-            self.last_asked.store(now, Ordering::Release);
             read.resize(size, 0);
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-            self.detile(read, linear, packed, upload_ptr);
+            if !self.detile(read, linear, packed, upload_ptr) {
+                return (size, None);
+            }
+            last.asked = now;
+            self.last_asked.store(now, Ordering::Release);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, Some((upload_buf, base_offset)));
+            return (size, Some(upload));
         }
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(extra) = size.checked_sub(read.len())
             && read.try_reserve_exact(extra).is_err()
         {
-            once!(bytes = size, "no room to read a texture's memory; not uploaded");
+            once!(
+                bytes = size,
+                "no room to read a texture's memory; not uploaded"
+            );
             return (0, None);
         }
         read.resize(size, 0);
@@ -412,16 +421,16 @@ impl Staging {
         if last.hash == Some(hash) {
             return (size, None);
         }
-        let Some((upload_buf, upload_ptr, base_offset)) =
-            pool.lock().unwrap_or_else(|e| e.into_inner()).alloc(host, self.total)
-        else {
+        let Some((upload_ptr, upload)) = allocate() else {
             return (size, None);
         };
+        if !self.detile(read, linear, packed, upload_ptr) {
+            return (size, None);
+        }
         last.hash = Some(hash);
-        self.detile(read, linear, packed, upload_ptr);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, Some((upload_buf, base_offset)))
+        (size, Some(upload))
     }
 
     /// Records `CopyTextureRegion` for every subresource from `upload` at
@@ -469,7 +478,13 @@ impl Staging {
     /// inside an upload pool slice). The buffer is a mapped upload heap
     /// (write-combined), where scattered writes are slow, so each subresource is
     /// detiled into `linear` and copied in one sequential pass.
-    fn detile(&self, tiled: &[u8], linear: &mut Vec<u8>, packed: &mut Vec<u8>, dst: *mut u8) {
+    fn detile(
+        &self,
+        tiled: &[u8],
+        linear: &mut Vec<u8>,
+        packed: &mut Vec<u8>,
+        dst: &mut [MaybeUninit<u8>],
+    ) -> bool {
         #[cfg(feature = "diagnostics")]
         if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -483,12 +498,22 @@ impl Staging {
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let lines = rows as usize * f.Depth as usize;
-            let len = if self.widened_from.is_some() && lines > 0 {
-                // The last subresource allocation stops at the last row's used bytes.
-                pitch * (lines - 1) + f.Width as usize * 4
-            } else {
-                pitch * lines
+            // GetCopyableFootprints omits trailing padding on the last row.
+            // For compressed formats the layout width is already in blocks.
+            let row_bytes = self.layout.mips[mip as usize].width as usize
+                * self
+                    .widened_from
+                    .map_or(self.layout.desc.element_bytes as usize, |_| 4);
+            let len = pitch * lines.saturating_sub(1) + row_bytes;
+            let offset = footprint.Offset as usize;
+            let Some(dst) = dst.get_mut(offset..offset.saturating_add(len)) else {
+                tracing::warn!(mip, slice, "detiled texture exceeds its upload footprint");
+                return false;
             };
+            if row_bytes > pitch {
+                tracing::warn!(mip, slice, "detiled row exceeds its pitch");
+                return false;
+            }
             if linear.len() < len {
                 linear.resize(len, 0);
             }
@@ -506,18 +531,15 @@ impl Staging {
                 packed,
             ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return false;
             }
-            // SAFETY: `dst + footprint.Offset..dst + footprint.Offset + len`
-            // lies inside the upload pool slice allocated with `self.total` bytes.
+            // SAFETY: both slices cover len bytes. Scratch is private cacheable RAM,
+            // disjoint from the mapped, possibly uninitialized destination.
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    scratch.as_ptr(),
-                    dst.add(footprint.Offset as usize),
-                    len,
-                )
+                std::ptr::copy_nonoverlapping(scratch.as_ptr().cast(), dst.as_mut_ptr(), len)
             };
         }
+        true
     }
 }
 
@@ -525,9 +547,15 @@ struct SendUpload(usize, ID3D12Resource, u64);
 // SAFETY: `ID3D12Resource` is free-threaded; moved once back to the preparing thread.
 unsafe impl Send for SendUpload {}
 
-/// Reads, hashes (when unwatched), and detiles all `items` in parallel using a
-/// bounded worker pool (`available_parallelism.min(8)`). Each item must refer
-/// to a distinct `Staging` instance.
+/// A unique range from the submission upload pool. A job owns it until the
+/// worker returns the resource and offset for the submitting thread.
+struct ReservedUpload(ID3D12Resource, usize, u64);
+// SAFETY: D3D12 resources are free-threaded. Pool allocations are disjoint
+// and remain mapped until every worker is joined under the submission lock.
+unsafe impl Send for ReservedUpload {}
+
+/// Dirty watched textures have a known upload size. Reserve those slices
+/// before workers start. Hashed textures allocate only after a changed hash.
 pub(crate) fn refresh_batch(
     host: &crate::host::Host,
     pool: &mut UploadPool,
@@ -536,74 +564,96 @@ pub(crate) fn refresh_batch(
     if items.is_empty() {
         return Vec::new();
     }
-    if items.len() == 1 {
-        let (idx, staging, watch_now) = &items[0];
-        let (mut read, mut linear) = take_scratch();
-        let mut packed = Vec::new();
-        let pool_mutex = Mutex::new(pool);
-        let res = staging
-            .refresh_prepared(
-                host,
-                &pool_mutex,
-                *watch_now,
-                &mut read,
-                &mut linear,
-                &mut packed,
+    let workers = if items.len() > 1 {
+        std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(8)
+    } else {
+        1
+    };
+    let jobs: Vec<_> = items
+        .into_iter()
+        .filter_map(|(idx, staging, watch)| {
+            let reserved = if watch.is_some() {
+                let (buffer, ptr, offset) = pool.alloc(host, staging.total)?;
+                Some(ReservedUpload(buffer, ptr as usize, offset))
+            } else {
+                None
+            };
+            Some((idx, staging, watch, reserved))
+        })
+        .collect();
+    let pool = Mutex::new(pool);
+    let uploads = run_refresh_jobs(
+        jobs,
+        workers,
+        |(idx, staging, watch, reserved), read, linear, packed| {
+            staging.refresh_prepared(
+                || {
+                    let (buf, ptr, offset) = match reserved {
+                        Some(ReservedUpload(buf, ptr, offset)) => (buf, ptr as *mut u8, offset),
+                        None => pool
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .alloc(host, staging.total)?,
+                    };
+                    // SAFETY: pool reservations do not overlap, remain mapped through
+                    // the worker join, and belong to exactly one job.
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(ptr.cast(), staging.total as usize)
+                    };
+                    Some((dst, SendUpload(idx, buf, offset)))
+                },
+                watch,
+                read,
+                linear,
+                packed,
             )
-            .map(|(buf, off)| (*idx, buf, off))
-            .into_iter()
-            .collect();
-        return_scratch(read, linear);
-        return res;
-    }
-    let workers = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .min(8)
-        .min(items.len())
-        .max(1);
-    let pool_mutex = Mutex::new(pool);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut results: Vec<Vec<SendUpload>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                s.spawn(|| {
-                    let (mut read, mut linear) = take_scratch();
-                    let mut packed = Vec::new();
-                    let mut local = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= items.len() {
-                            break;
-                        }
-                        let (idx, ref staging, watch_now) = items[i];
-                        if let Some((buf, off)) = staging.refresh_prepared(
-                            host,
-                            &pool_mutex,
-                            watch_now,
-                            &mut read,
-                            &mut linear,
-                            &mut packed,
-                        ) {
-                            local.push(SendUpload(idx, buf, off));
-                        }
-                    }
-                    return_scratch(read, linear);
-                    local
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_default())
-            .collect()
-    });
-    let mut out: Vec<(usize, ID3D12Resource, u64)> = results
-        .drain(..)
-        .flatten()
+        },
+    );
+    let mut out: Vec<_> = uploads
+        .into_iter()
         .map(|SendUpload(idx, buf, off)| (idx, buf, off))
         .collect();
     out.sort_unstable_by_key(|&(idx, _, _)| idx);
     out
+}
+
+fn run_refresh_jobs<J: Send, T: Send>(
+    jobs: Vec<J>,
+    workers: usize,
+    refresh: impl Fn(J, &mut Vec<u8>, &mut Vec<u8>, &mut Vec<u8>) -> Option<T> + Sync,
+) -> Vec<T> {
+    let workers = workers.min(jobs.len());
+    if workers == 0 {
+        return Vec::new();
+    }
+    let jobs = Mutex::new(jobs.into_iter());
+    let run = || {
+        let (mut read, mut linear) = take_scratch();
+        let mut packed = Vec::new();
+        let mut uploads = Vec::new();
+        loop {
+            let job = jobs.lock().unwrap_or_else(|e| e.into_inner()).next();
+            let Some(job) = job else { break };
+            if let Some(upload) = refresh(job, &mut read, &mut linear, &mut packed) {
+                uploads.push(upload);
+            }
+        }
+        return_scratch(read, linear);
+        uploads
+    };
+    if workers == 1 {
+        return run();
+    }
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = (1..workers).map(|_| scope.spawn(&run)).collect();
+        let mut uploads = run();
+        for worker in threads {
+            uploads.extend(worker.join().expect("texture preparation worker panicked"));
+        }
+        uploads
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1118,6 +1168,139 @@ mod tests {
             "host-written textures must not queue CPU-to-GPU uploads"
         );
         forget(fake_resource as usize);
+    }
+
+    // CPU-backed D3D12-style footprints, ending at the last meaningful byte.
+    fn cpu_staging(format: u32, seed: usize) -> (Vec<u8>, Staging) {
+        let tex = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 67,
+            height: 33,
+            depth_or_array: 1,
+            mips: 3,
+            format,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        })
+        .unwrap();
+        let layout = tex.planes[0].layout.clone();
+        let bytes: Vec<_> = (0..layout.size as usize)
+            .map(|i| ((i ^ (i >> 8)).wrapping_add(seed * 17)) as u8)
+            .collect();
+        let widened_from = crate::resource::PACKED_16
+            .contains(&format)
+            .then_some(format);
+        let mut footprints = Vec::new();
+        let mut rows = Vec::new();
+        let mut total = 0u64;
+        for m in &layout.mips {
+            let row = m.width * widened_from.map_or(layout.desc.element_bytes, |_| 4);
+            let pitch = row.next_multiple_of(256);
+            let offset = total.next_multiple_of(512);
+            footprints.push(D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: offset,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Width: m.width,
+                    Height: m.height,
+                    Depth: 1,
+                    RowPitch: pitch,
+                    ..Default::default()
+                },
+            });
+            rows.push(m.height);
+            total = offset + u64::from(pitch * (m.height - 1) + row);
+        }
+        let staging = Staging {
+            memory: bytes.as_ptr(),
+            layout,
+            footprints,
+            rows,
+            total,
+            mips: 3,
+            widened_from,
+            last_asked: Default::default(),
+            last: Default::default(),
+            gpu_uploads: Default::default(),
+        };
+        (bytes, staging)
+    }
+
+    #[test]
+    fn parallel_reserved_staging_matches_serial_bytes_and_preserves_guards() {
+        // RGBA8, BC1 blocks and packed 16-bit widened to RGBA8, including mip tails.
+        let textures: Vec<_> = [28, 71, 86, 28, 71, 86, 28, 71]
+            .into_iter()
+            .enumerate()
+            .map(|(seed, fmt)| cpu_staging(fmt, seed))
+            .collect();
+        let stride = textures
+            .iter()
+            .map(|(_, s)| s.total as usize)
+            .max()
+            .unwrap()
+            + 64;
+        let run = |workers| {
+            let mut arena = vec![0xab; textures.len() * stride];
+            let jobs: Vec<_> = textures
+                .iter()
+                .zip(arena.chunks_exact_mut(stride))
+                .collect();
+            let completed = run_refresh_jobs(
+                jobs,
+                workers,
+                |((_, staging), bytes), read, linear, packed| {
+                    // D3D ignores row padding. Use identical scratch padding in both runs
+                    // so the comparison can cover every byte of every allocation.
+                    linear.resize(staging.total as usize, 0);
+                    linear.fill(0);
+                    let range = &mut bytes[16..][..staging.total as usize];
+                    // SAFETY: u8 and MaybeUninit<u8> have identical layout.
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(range.as_mut_ptr().cast(), range.len())
+                    };
+                    let result =
+                        staging.refresh_prepared(|| Some((dst, ())), Some(7), read, linear, packed);
+                    assert!(bytes[..16].iter().all(|&b| b == 0xab));
+                    assert!(
+                        bytes[16 + staging.total as usize..]
+                            .iter()
+                            .all(|&b| b == 0xab)
+                    );
+                    result
+                },
+            );
+            assert_eq!(completed.len(), textures.len());
+            arena
+        };
+        let serial = run(1);
+        assert!(serial.iter().any(|&b| b != 0xab && b != 0));
+        assert_eq!(serial, run(4));
+    }
+
+    #[test]
+    fn hashed_staging_allocates_only_on_change_and_retries_failure() {
+        let (mut bytes, staging) = cpu_staging(28, 1);
+        let mut dst = vec![MaybeUninit::uninit(); staging.total as usize];
+        let (mut read, mut linear, mut packed) = (Vec::new(), Vec::new(), Vec::new());
+        let mut allocations = 0;
+        let mut refresh = |space: bool| {
+            staging.refresh_prepared(
+                || {
+                    allocations += 1;
+                    space.then_some((dst.as_mut_slice(), ()))
+                },
+                None,
+                &mut read,
+                &mut linear,
+                &mut packed,
+            )
+        };
+        assert_eq!(refresh(false), None);
+        assert_eq!(refresh(true), Some(()));
+        assert_eq!(refresh(true), None);
+        bytes[0] ^= 0xff;
+        assert_eq!(refresh(true), Some(()));
+        assert_eq!(allocations, 3);
     }
 
     #[test]
