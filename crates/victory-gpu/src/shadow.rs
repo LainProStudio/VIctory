@@ -379,6 +379,52 @@ impl Shadow {
         written
     }
 
+    /// Whether `[from, to)` on this shadow can safely consume a pre-fetched
+    /// cross-shadow `watch::writes` answer (no overlapping busy shader writes
+    /// and not already known unwatched).
+    pub(crate) fn can_use_prefetched(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return false;
+        }
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < to && e > from)
+    }
+
+    /// Updates `[address, address + len)` using a pre-fetched cross-shadow
+    /// write-watch answer when eligible, otherwise falls back to [`Shadow::update`].
+    pub(crate) fn update_with_watch(
+        &self,
+        address: usize,
+        len: usize,
+        prefetched: Option<(u64, &[(usize, u64)])>,
+    ) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return 0;
+        }
+        if let Some((now, written)) = prefetched
+            && self.can_use_prefetched(from, to)
+        {
+            self.watched.store(1, Ordering::Relaxed);
+            let copied = self.copy_stale(from, to, now, written);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+            }
+            return copied;
+        }
+        self.update(from, to - from)
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.

@@ -41,8 +41,18 @@ pub(crate) enum C {
     BindlessRebuilds,
     BindlessDirty,
     BindlessUs,
+    /// Write-watch 5-bucket breakdown.
+    WatchCleanHits,
+    WatchKnownView,
+    WatchKnownViewUs,
+    WatchDirectOk,
+    WatchDirectOkUs,
+    WatchByAlloc,
+    WatchByAllocUs,
+    WatchGuardFallback,
+    WatchGuardFallbackUs,
 }
-const COUNTERS: usize = C::BindlessUs as usize + 1;
+const COUNTERS: usize = C::WatchGuardFallbackUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -131,6 +141,21 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    if c[C::Watches as usize] > 0.0 || c[C::WatchCleanHits as usize] > 0.0 {
+        tracing::info!(
+            "watches breakdown: clean_hits {:.0}; known_view {:.0} ({:.2} ms); \
+             direct_ok {:.0} ({:.2} ms); by_alloc {:.0} ({:.2} ms); guard_fallback {:.0} ({:.2} ms)",
+            c[C::WatchCleanHits as usize],
+            c[C::WatchKnownView as usize],
+            ms(c[C::WatchKnownViewUs as usize]),
+            c[C::WatchDirectOk as usize],
+            ms(c[C::WatchDirectOkUs as usize]),
+            c[C::WatchByAlloc as usize],
+            ms(c[C::WatchByAllocUs as usize]),
+            c[C::WatchGuardFallback as usize],
+            ms(c[C::WatchGuardFallbackUs as usize]),
+        );
+    }
     if c[C::BindlessUs as usize] > 0.0 || c[C::BindlessRebuilds as usize] > 0.0 {
         tracing::info!(
             "bindless per frame: {:.1} rebuilds, {:.0} dirty slots, {:.2} ms preparing",

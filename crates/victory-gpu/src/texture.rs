@@ -30,11 +30,11 @@ macro_rules! once {
     }};
 }
 
-/// A texture's upload state: the staging buffer laid out as the host
-/// texture's subresources, and what was last detiled.
+/// A texture's upload state: the staging footprint layout as the host texture's
+/// subresources, and what was last detiled (written into the host's pooled
+/// submission upload ring only when dirty).
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
-    data: *mut u8,
+    total: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -50,21 +50,112 @@ pub(crate) struct Staging {
     gpu_uploads: std::sync::atomic::AtomicU64,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
+/// What a texture's staging state holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    /// Cached memory each subresource is detiled into before one sequential
-    /// copy to the (write-combined) staging buffer; kept across calls.
-    linear: Vec<u8>,
 }
 
 /// Room to read a watched or hashed texture's memory into, shared by all
 /// textures (a buffer each would hold the sum of their sizes for good). Kept,
 /// already touched, so refreshing does not fault its pages in again.
 static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Shared intermediate detiling buffer across all textures (shrunk back to
+/// `MAX_SCRATCH` after one-off giant textures so RAM stays bounded).
+static LINEAR_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+const MAX_SCRATCH: usize = 64 << 20;
+
+fn shrink_scratch(buf: &mut Vec<u8>) {
+    if buf.capacity() > MAX_SCRATCH {
+        buf.clear();
+        buf.shrink_to(MAX_SCRATCH);
+    }
+}
+
+/// Submission-lifetime upload buffer ring shared across all dirty textures in a
+/// frame, resetting right after the synchronous submission finishes on the GPU.
+pub(crate) struct UploadPool {
+    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    current: usize,
+    used: u64,
+    oversized: Vec<ID3D12Resource>,
+}
+
+// SAFETY: only touched under the host submission lock while sequential submissions prepare.
+unsafe impl Send for UploadPool {}
+
+impl UploadPool {
+    const CHUNK_BYTES: u64 = 32 << 20;
+    const MAX_POOLED_BYTES: u64 = 128 << 20;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            current: 0,
+            used: 0,
+            oversized: Vec::new(),
+        }
+    }
+
+    pub(crate) fn alloc(
+        &mut self,
+        host: &crate::host::Host,
+        bytes: u64,
+    ) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        const ALIGN: u64 = 512;
+        let bytes = bytes.max(1);
+        if bytes > Self::CHUNK_BYTES {
+            let (buffer, data) = host.upload_buffer(bytes)?;
+            crate::host::name(&buffer, || format!("texture upload oversized {bytes:#x}"));
+            self.oversized.push(buffer.clone());
+            return Some((buffer, data, 0));
+        }
+        let aligned = self.used.next_multiple_of(ALIGN);
+        if self.current < self.chunks.len()
+            && aligned.saturating_add(bytes) > self.chunks[self.current].2
+        {
+            self.current += 1;
+            self.used = 0;
+        } else if self.current < self.chunks.len() {
+            self.used = aligned;
+        }
+        if self.current >= self.chunks.len() {
+            let (buffer, data) = host.upload_buffer(Self::CHUNK_BYTES)?;
+            crate::host::name(&buffer, || "texture upload chunk".into());
+            self.chunks.push((buffer, data as usize, Self::CHUNK_BYTES));
+            self.used = 0;
+        }
+        let (ref buffer, ptr, _) = self.chunks[self.current];
+        let offset = self.used;
+        self.used += bytes;
+        // SAFETY: `offset..offset + bytes` falls inside the chunk's `CHUNK_BYTES` mapping.
+        let dst = unsafe { (ptr as *mut u8).add(offset as usize) };
+        Some((buffer.clone(), dst, offset))
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.oversized.clear();
+        let mut kept = 0u64;
+        self.chunks.retain(|(_, _, cap)| {
+            if kept + *cap <= Self::MAX_POOLED_BYTES {
+                kept += *cap;
+                true
+            } else {
+                false
+            }
+        });
+        self.current = 0;
+        self.used = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> (usize, usize) {
+        (self.chunks.len(), self.oversized.len())
+    }
+}
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -145,22 +236,29 @@ impl Staging {
         (start, start.saturating_add(self.layout.size as usize))
     }
 
-    /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all). Returns `true` when the
-    /// staging buffer received new contents that must be copied to the host
-    /// texture (including initial upload).
-    pub(crate) fn refresh(&self) -> bool {
+    /// Detiles the texture memory into `pool` only when it changed since the last
+    /// time (and is mapped at all). Returns `Some((upload_buffer, base_offset))`
+    /// when a copy to the host texture is required.
+    pub(crate) fn refresh(
+        &self,
+        host: &crate::host::Host,
+        pool: &mut UploadPool,
+    ) -> Option<(ID3D12Resource, u64)> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, dirty) = self.refresh_now();
+        let (read, uploaded) = self.refresh_now(host, pool);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
-        dirty
+        uploaded
     }
 
-    /// Returns `(bytes_read, dirty)`.
-    fn refresh_now(&self) -> (usize, bool) {
+    /// Returns `(bytes_read, Option<(upload_buffer, base_offset)>)`.
+    fn refresh_now(
+        &self,
+        host: &crate::host::Host,
+        pool: &mut UploadPool,
+    ) -> (usize, Option<(ID3D12Resource, u64)>) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -169,7 +267,7 @@ impl Staging {
             crate::watch::writes(start, start + size, !hash_textures())
         {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return (0, false);
+                return (0, None);
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
@@ -178,15 +276,23 @@ impl Staging {
                 && read.try_reserve_exact(extra).is_err()
             {
                 once!(bytes = size, "no room to read a texture's memory; not uploaded");
-                return (0, false);
+                return (0, None);
             }
+            let Some((upload_buf, upload_ptr, base_offset)) = pool.alloc(host, self.total) else {
+                return (0, None);
+            };
             last.asked = now;
             read.resize(size, 0);
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&read, &mut last.linear);
+            {
+                let mut linear = LINEAR_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+                self.detile(&read, &mut linear, upload_ptr);
+                shrink_scratch(&mut linear);
+            }
+            shrink_scratch(&mut read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, true);
+            return (size, Some((upload_buf, base_offset)));
         }
         // Copy the whole texture out first: asking `committed` (VirtualQuery
         // per region) is slow, especially under Wine, while the read fails by
@@ -196,7 +302,7 @@ impl Staging {
             && read.try_reserve_exact(extra).is_err()
         {
             once!(bytes = size, "no room to read a texture's memory; not uploaded");
-            return (0, false);
+            return (0, None);
         }
         read.resize(size, 0);
         if !crate::host::read_into(self.memory, &mut read) {
@@ -207,24 +313,41 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
-            return (0, false);
+            shrink_scratch(&mut read);
+            return (0, None);
         }
         let hash = blake3::hash(&read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            return (size, false);
+            shrink_scratch(&mut read);
+            return (size, None);
         }
+        let Some((upload_buf, upload_ptr, base_offset)) = pool.alloc(host, self.total) else {
+            shrink_scratch(&mut read);
+            return (size, None);
+        };
         last.hash = Some(hash);
-        self.detile(&read, &mut last.linear);
+        {
+            let mut linear = LINEAR_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+            self.detile(&read, &mut linear, upload_ptr);
+            shrink_scratch(&mut linear);
+        }
+        shrink_scratch(&mut read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, true)
+        (size, Some((upload_buf, base_offset)))
     }
 
-    /// Records `CopyTextureRegion` for every subresource from this staging
-    /// buffer into `texture` (which must already be in `COPY_DEST`).
-    pub(crate) fn record_copies(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+    /// Records `CopyTextureRegion` for every subresource from `upload` at
+    /// `base_offset` into `texture` (which must already be in `COPY_DEST`).
+    pub(crate) fn record_copies(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        texture: &ID3D12Resource,
+        upload: &ID3D12Resource,
+        base_offset: u64,
+    ) {
         for (i, footprint) in self.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -234,12 +357,14 @@ impl Staging {
                     SubresourceIndex: i as u32,
                 },
             };
+            let mut placed = *footprint;
+            placed.Offset += base_offset;
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(upload) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: *footprint,
+                    PlacedFootprint: placed,
                 },
             };
             // SAFETY: an open list; both locations name live resources.
@@ -255,11 +380,11 @@ impl Staging {
         self.gpu_uploads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer. The
-    /// buffer is a mapped upload heap (write-combined), where the scattered
-    /// writes of detiling are very slow: each subresource is detiled into
-    /// the cached `linear` memory, then copied over in one sequential pass.
-    fn detile(&self, tiled: &[u8], linear: &mut Vec<u8>) {
+    /// Detiles `tiled` (the texture's memory) into `dst` (at `footprint.Offset`
+    /// inside an upload pool slice). The buffer is a mapped upload heap
+    /// (write-combined), where scattered writes are slow, so each subresource is
+    /// detiled into `linear` and copied in one sequential pass.
+    fn detile(&self, tiled: &[u8], linear: &mut Vec<u8>, dst: *mut u8) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -299,12 +424,12 @@ impl Staging {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
-            // SAFETY: the subresource's part of the mapped staging buffer,
-            // `len` bytes, which does not overlap the scratch memory.
+            // SAFETY: `dst + footprint.Offset..dst + footprint.Offset + len`
+            // lies inside the upload pool slice allocated with `self.total` bytes.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     scratch.as_ptr(),
-                    self.data.add(footprint.Offset as usize),
+                    dst.add(footprint.Offset as usize),
                     len,
                 )
             };
@@ -436,16 +561,8 @@ fn create_staging(
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
     Some(Arc::new(Staging {
-        buffer,
-        data,
+        total,
         footprints,
         rows,
         layout,
@@ -900,5 +1017,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn upload_pool_allocates_zero_on_clean_and_reuses_chunk() {
+        let Some(host) = Host::new_warp() else {
+            return;
+        };
+        let (width, height) = (4, 4);
+        let (copy, tex) = make_rgba_texture(&host, width, height);
+        let layout = tex.planes[0].layout.clone();
+        let mut title_mem = vec![0u8; layout.size as usize];
+        fill_linear_rgba(&layout, &mut title_mem, [0x22, 0x33, 0x44, 0xff]);
+        let staging = create_staging(
+            &host,
+            std::ptr::null(),
+            &copy.texture,
+            layout.clone(),
+            title_mem.as_ptr(),
+        )
+        .expect("create staging");
+
+        let mut pool = UploadPool::new();
+        assert_eq!(pool.stats(), (0, 0));
+
+        // First refresh is dirty -> allocates 1 pool chunk.
+        assert!(staging.refresh(&host, &mut pool).is_some());
+        assert_eq!(pool.stats(), (1, 0));
+        pool.reset();
+
+        // Clean refresh -> 0 pool allocations, chunk count unchanged.
+        assert!(staging.refresh(&host, &mut pool).is_none());
+        assert_eq!(pool.stats(), (1, 0));
+
+        // Modify memory -> reuses existing chunk (still 1 chunk).
+        fill_linear_rgba(&layout, &mut title_mem, [0x55, 0x66, 0x77, 0xff]);
+        assert!(staging.refresh(&host, &mut pool).is_some());
+        assert_eq!(pool.stats(), (1, 0));
     }
 }

@@ -54,6 +54,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    texture_uploads: Mutex<crate::texture::UploadPool>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -293,6 +294,7 @@ impl Host {
                 messages,
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
+                texture_uploads: Mutex::new(crate::texture::UploadPool::new()),
             })
         }
     }
@@ -1223,10 +1225,11 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        let mut upload_pool = self.texture_uploads.lock().unwrap_or_else(|e| e.into_inner());
         let (_plans, back) = {
             let mut batch = Batch::default();
             for list in runs {
-                let uploads = list.run_deferred(&mut batch);
+                let uploads = list.run_deferred(&mut batch, self, &mut upload_pool);
                 firsts.push(lists.len());
                 if let Some(prelude) = list.prelude(&uploads) {
                     lists.push(Some(prelude));
@@ -1302,6 +1305,8 @@ impl Host {
             ));
         }
         bury(this_submission);
+        upload_pool.reset();
+        drop(upload_pool);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done.
         let copying = std::time::Instant::now();
@@ -1809,11 +1814,13 @@ impl HostList {
         uploads: &[(
             std::sync::Arc<crate::texture::Staging>,
             std::sync::Arc<crate::resource::HostTexture>,
+            ID3D12Resource,
+            u64,
         )],
     ) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
         let mut pre_barriers = Vec::new();
-        for (_, copy) in uploads {
+        for (_, copy, _, _) in uploads {
             let real = copy.state.swap(COPY_DEST, Ordering::Relaxed);
             if real != COPY_DEST {
                 pre_barriers.push(transition(
@@ -1857,8 +1864,8 @@ impl HostList {
                 if !pre_barriers.is_empty() {
                     list.ResourceBarrier(&pre_barriers);
                 }
-                for (staging, copy) in uploads {
-                    staging.record_copies(list, &copy.texture);
+                for (staging, copy, upload, base_offset) in uploads {
+                    staging.record_copies(list, &copy.texture, upload, *base_offset);
                 }
                 if !post_barriers.is_empty() {
                     list.ResourceBarrier(&post_barriers);
@@ -2196,9 +2203,13 @@ impl HostList {
     fn run_deferred(
         &self,
         batch: &mut Batch,
+        host: &Host,
+        pool: &mut crate::texture::UploadPool,
     ) -> Vec<(
         std::sync::Arc<crate::texture::Staging>,
         std::sync::Arc<crate::resource::HostTexture>,
+        ID3D12Resource,
+        u64,
     )> {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
@@ -2256,9 +2267,9 @@ impl HostList {
                 }
                 Step::Texture(staging, copy) => {
                     if batch.texture_due_range(staging, staging.memory_range())
-                        && staging.refresh()
+                        && let Some((upload, base_offset)) = staging.refresh(host, pool)
                     {
-                        uploads.push((staging.clone(), copy.clone()));
+                        uploads.push((staging.clone(), copy.clone(), upload, base_offset));
                     }
                     continue;
                 }
@@ -2449,18 +2460,43 @@ impl Batch {
         &mut self,
         mut pred: impl FnMut(&std::sync::Arc<crate::shadow::Shadow>, usize, usize) -> bool,
     ) {
+        let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)> = Vec::new();
+        let mut total_due_ranges = 0usize;
+        let mut all_spans: Ranges = Vec::new();
         for (shadow, ranges) in std::mem::take(&mut self.refreshes) {
             let (mut due, keep): (Ranges, Ranges) = ranges
                 .into_iter()
                 .partition(|&(from, to)| pred(&shadow, from, to));
             if !due.is_empty() {
                 coalesce_ranges(&mut due, crate::watch::PAGE);
-                for (from, to) in due {
-                    update(&shadow, from, to - from);
+                for &(from, to) in &due {
+                    total_due_ranges += 1;
+                    if shadow.can_use_prefetched(from, to) {
+                        all_spans.push((from, to));
+                    }
                 }
+                work.push((shadow.clone(), due));
             }
             if !keep.is_empty() {
                 self.refreshes.push((shadow, keep));
+            }
+        }
+        let prefetched: Vec<PrefetchedWatch> = if !all_spans.is_empty() {
+            coalesce_ranges(&mut all_spans, crate::watch::PAGE);
+            if all_spans.len() < total_due_ranges {
+                all_spans
+                    .into_iter()
+                    .map(|(f, t)| (f, t, crate::watch::writes(f, t, true)))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        for (shadow, due) in work {
+            for (from, to) in due {
+                update_with_prefetched(&shadow, from, to, &prefetched);
             }
         }
     }
@@ -2531,7 +2567,36 @@ impl Batch {
     }
 }
 
+type WatchAnswer = Option<(u64, Vec<(usize, u64)>)>;
+type PrefetchedWatch = (usize, usize, WatchAnswer);
+
+/// Brings `[from, to)` of a host copy up to date, reusing a pre-fetched
+/// cross-shadow `watch::writes` answer when `[from, to)` is covered.
+fn update_with_prefetched(
+    shadow: &crate::shadow::Shadow,
+    from: usize,
+    to: usize,
+    prefetched: &[PrefetchedWatch],
+) {
+    let idx = prefetched.partition_point(|&(sf, _, _)| sf <= from);
+    let found = idx
+        .checked_sub(1)
+        .and_then(|i| {
+            let (_, st, ref res) = prefetched[i];
+            (st >= to).then_some(res.as_ref()).flatten()
+        })
+        .map(|(now, list)| (*now, list.as_slice()));
+    let started = std::time::Instant::now();
+    let copied = shadow.update_with_watch(from, to - from, found);
+    let us = started.elapsed().as_micros() as u64;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::range(from, to - from, us, 0);
+    PREPARING[0].fetch_add(us, Ordering::Relaxed);
+    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+}
+
 /// Brings `[from, from + len)` of a host copy up to date now.
+#[allow(dead_code)]
 fn update(shadow: &crate::shadow::Shadow, from: usize, len: usize) {
     let started = std::time::Instant::now();
     let copied = shadow.update(from, len);
@@ -3579,6 +3644,51 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         batch.copy_written(0x10_0100, 256);
         assert!(batch.texture_due_range(&a, (0x10_0000, 0x10_0000 + p)));
         assert!(!batch.texture_due_range(&b, (0x20_0000, 0x20_0000 + p)));
+    }
+
+    #[test]
+    fn cross_shadow_coalescing_batches_watch_ask() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(_host) = super::host() else {
+            return;
+        };
+        let p = crate::watch::PAGE;
+        // SAFETY: fresh 2-page write-watched region freed at the end.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * p,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: committed read-write pages above.
+        unsafe {
+            (base as *mut u8).write_bytes(0x11, p);
+            ((base + p) as *mut u8).write_bytes(0x22, p);
+        }
+        crate::shadow::register(0x7001_0001, base as u64, p as u64);
+        crate::shadow::register(0x7001_0002, (base + p) as u64, p as u64);
+        let s1 = crate::shadow::find(base as u64, p as u64).unwrap();
+        let s2 = crate::shadow::find((base + p) as u64, p as u64).unwrap();
+
+        let asked = crate::watch::kernel_asked();
+        let mut batch = Batch::default();
+        batch.add(&s1, base, p);
+        batch.add(&s2, base + p, p);
+        batch.flush();
+        assert_eq!(crate::watch::kernel_asked(), asked + 1);
+        assert_eq!(s1.read_u32(0), 0x1111_1111);
+        assert_eq!(s2.read_u32(0), 0x2222_2222);
+
+        crate::shadow::unregister(0x7001_0001, base as u64);
+        crate::shadow::unregister(0x7001_0002, (base + p) as u64);
+        // SAFETY: freeing our own allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
     /// The hashing a submission does for textures in physical-page memory,
