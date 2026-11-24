@@ -9980,6 +9980,9 @@ impl<'a> Lower<'a> {
                     // GFX10 buffer_store_short writes one native 16-bit value. DXIL
                     // RawBufferStore.i16 preserves the write width; widening it to an
                     // i32 store would overwrite the adjacent halfword.
+                    // RawBufferStore.i16 is a DXIL 1.2 native low-precision
+                    // operation; advertise the SM 6.2 capability in the module.
+                    self.s.flags |= flags::NATIVE_LOW_PRECISION;
                     let i16 = self.s.m.int(16);
                     let value = self.s.m.cast(self.cur, Cast::Trunc, x, i16);
                     let undef = self.s.m.undef(i16);
