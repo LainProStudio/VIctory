@@ -407,6 +407,14 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
 }
 
+/// Whether root UAVs are bound as one-view tables of the buffer's host
+/// copy (reads return zeros and OOB writes are dropped) rather than root
+/// descriptors (unbounded). Set `VICTORY_ROOT_UAV_DIRECT=1` to go back.
+pub(crate) fn bounded_root_uavs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_UAV_DIRECT").is_none())
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -565,7 +573,16 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
-                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                    let bounded_range = match kind {
+                        D3D12_ROOT_PARAMETER_TYPE_SRV if bounded_root_srvs() => {
+                            Some(D3D12_DESCRIPTOR_RANGE_TYPE_SRV)
+                        }
+                        D3D12_ROOT_PARAMETER_TYPE_UAV if bounded_root_uavs() => {
+                            Some(D3D12_DESCRIPTOR_RANGE_TYPE_UAV)
+                        }
+                        _ => None,
+                    };
+                    if let Some(range_type) = bounded_range {
                         let param = if let Some(&(_, existing)) =
                             root_views.iter().find(|&&(k, _)| k == (kind.0, slot))
                         {
@@ -575,10 +592,10 @@ impl HostPipeline {
                             }
                             existing
                         } else {
-                            // A one-view table: the view's size bounds the reads,
+                            // A one-view table: the view's size bounds the accesses,
                             // which a root descriptor leaves unbounded.
                             ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                                RangeType: range_type,
                                 NumDescriptors: 1,
                                 BaseShaderRegister: u32::from(slot),
                                 RegisterSpace: ROOT_CBV_SPACE,

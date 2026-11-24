@@ -98,6 +98,9 @@ pub(crate) struct State {
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// Root UAVs bound as one-view tables in this list: (host heap, title
+    /// address) → dynamic slot.
+    root_uav_slots: std::collections::HashMap<(usize, u64), u32>,
 }
 
 impl Drop for State {
@@ -690,7 +693,10 @@ impl State {
                         bound_params |= 1u64 << param;
                     }
                     let uav = kind == RootView::Uav;
-                    if kind == RootView::Srv && crate::pipeline::host::bounded_root_srvs() {
+                    let use_table = (kind == RootView::Srv
+                        && crate::pipeline::host::bounded_root_srvs())
+                        || (uav && crate::pipeline::host::bounded_root_uavs());
+                    if use_table {
                         let address = match self.roots_ref(compute).get(usize::from(slot)) {
                             Some(&Root::View(address)) => Some(address),
                             _ => {
@@ -702,7 +708,7 @@ impl State {
                                 None
                             }
                         };
-                        if !self.root_srv_table(list, address, param, compute) {
+                        if !self.root_buffer_table(list, address, param, compute, uav) {
                             return false;
                         }
                         continue;
@@ -791,17 +797,19 @@ impl State {
         true
     }
 
-    /// Binds a root SRV as a one-view table (see
-    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
+    /// Binds a root SRV or UAV as a one-view table (see
+    /// [`crate::pipeline::host::bounded_root_srvs`] /
+    /// [`crate::pipeline::host::bounded_root_uavs`]): a raw view of the
     /// title buffer's host copy from `address` to the copy's end, or a null
-    /// view (no address, or no host copy). One slot per address per list.
-    /// False if no dynamic slot could be had (the draw is dropped).
-    fn root_srv_table(
+    /// view (no address, no host copy, or unaligned start). One slot per
+    /// address per view kind per list; false if no dynamic slot could be had.
+    fn root_buffer_table(
         &mut self,
         list: &HostList,
         address: Option<u64>,
         param: u32,
         compute: bool,
+        uav: bool,
     ) -> bool {
         let Some((heap, host)) = self
             .heaps
@@ -810,44 +818,74 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
         else {
-            once!("a root SRV without a bound view heap: the draw is dropped");
+            once!(uav, "a root buffer view without a bound view heap: the draw is dropped");
             return false;
         };
-        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let shadow = address
+            .filter(|&a| a != 0)
+            .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-        let index = match self.root_srv_slots.get(&key) {
+        let slots = if uav {
+            &mut self.root_uav_slots
+        } else {
+            &mut self.root_srv_slots
+        };
+        let index = match slots.get(&key) {
             Some(&index) => index,
             None => {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
-                self.root_srv_slots.insert(key, index);
+                slots.insert(key, index);
+                let install_null = |index: u32| {
+                    if uav {
+                        host.null_raw_uav_at(index);
+                    } else {
+                        host.null_raw_at(index);
+                    }
+                };
                 match &shadow {
                     Some((a, s)) => {
                         // SAFETY: a live buffer.
                         let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                         let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a));
+                        // SAFETY: a live buffer.
+                        let uav_ok = !uav
+                            || (unsafe { s.buffer.GetDesc() }.Flags.0
+                                & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
+                                != 0);
+                        if offset.is_multiple_of(16) && uav_ok {
+                            if uav {
+                                host.raw_uav_at(index, &s.buffer, offset, s.left(*a));
+                            } else {
+                                host.raw_at(index, &s.buffer, offset, s.left(*a));
+                            }
                         } else {
                             // Raw views start on 16 bytes; one from the
-                            // aligned start would shift every read.
+                            // aligned start would shift every access.
                             once!(
                                 address = format_args!("{a:#x}"),
-                                "a root SRV not on 16 bytes reads zeros"
+                                uav,
+                                "a root buffer view unaligned or non-UAV falls back to null"
                             );
-                            host.null_raw_at(index);
+                            install_null(index);
                         }
                     }
-                    None => host.null_raw_at(index),
+                    None => install_null(index),
                 }
                 index
             }
         };
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
-            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
+            let len = s.left(*a);
+            s.refresh(list, *a, len);
+            if uav {
+                s.gpu_writes(list, *a, len);
+                list.buffer_state(&s.buffer, crate::host::BUFFER_WRITE);
+            } else {
+                list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
+            }
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -2413,6 +2451,139 @@ mod tests {
         crate::shadow::unregister(srv_buf.ptr as usize, srv_buf.addr());
         crate::shadow::unregister(uav_buf.ptr as usize, uav_buf.addr());
         crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
+        let release =
+            |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(views), 0);
+        assert_eq!(release(pso), 0);
+    }
+
+    #[test]
+    fn bounded_root_uav_drops_out_of_bounds_writes_without_faulting() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // Synthesize a CS with 1 Root UAV (`slot=0`, user_data `0..2`):
+        // writes 0xDEAD_0001 at `+0xFFFF_B940` (OOB wrapping), 0xDEAD_0002 at `+0x20_0000` (past 64 KiB buffer),
+        // and 0x1234_5678 at `+0x100` (in bounds).
+        let s_mov_b32 =
+            |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32;
+        let vop1 = |op: u16, vdst: u8, src0: u16| -> u32 {
+            0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
+        };
+        let buffer_store_dword_offen = |vdata: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x1C << 18 | (1 << 12),
+                0x80 << 24
+                    | ((srsrc as u32 >> 2) & 0x1F) << 16
+                    | (vdata as u32) << 8
+                    | vaddr as u32,
+            ]
+        };
+
+        let mut words = Vec::new();
+        words.push(s_mov_b32(4, 0));
+        words.push(s_mov_b32(5, 1));
+        words.push(s_mov_b32(6, 0xC1));
+        words.extend_from_slice(&[s_mov_b32(7, 0xFF), 0x3101_4FAC]);
+        // 1) OOB wrapping write at 0xFFFF_B940
+        words.extend_from_slice(&[vop1(0x001, 0, 0xFF), 0xFFFF_B940]);
+        words.extend_from_slice(&[vop1(0x001, 1, 0xFF), 0xDEAD_0001]);
+        words.extend_from_slice(&buffer_store_dword_offen(1, 0, 4));
+        // 2) OOB write past buffer end at +0x20_0000
+        words.extend_from_slice(&[vop1(0x001, 0, 0xFF), 0x0020_0000]);
+        words.extend_from_slice(&[vop1(0x001, 1, 0xFF), 0xDEAD_0002]);
+        words.extend_from_slice(&buffer_store_dword_offen(1, 0, 4));
+        // 3) Valid in-bounds write at +0x100
+        words.extend_from_slice(&[vop1(0x001, 0, 0xFF), 0x0000_0100]);
+        words.extend_from_slice(&[vop1(0x001, 1, 0xFF), 0x1234_5678]);
+        words.extend_from_slice(&buffer_store_dword_offen(1, 0, 4));
+        words.push(0xBF81_0000); // s_endpgm
+
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = victory_shader::ir::build(&native.code, false, 4).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            total_size: 0,
+            parts: Vec::new(),
+        };
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+        let buf = Allocation::watched(64 << 10);
+        crate::shadow::register(buf.ptr as usize, buf.addr(), 64 << 10);
+
+        #[repr(C)]
+        struct ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC,
+            placement: [u64; 2],
+        }
+        let heap_desc = ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 8,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            placement: [0; 2],
+        };
+        let heap_iid = ID3D12DescriptorHeap::IID;
+        let mut views = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const heap_desc).cast(),
+                (&raw const heap_iid).cast(),
+                &mut views,
+            ),
+            crate::object::S_OK
+        );
+
+        let list = host.new_list().expect("new_list");
+        let mut state = State::default();
+        state.set_heaps(&[views]);
+        state.set_pipeline(pso);
+        state.set_view(true, 0, buf.addr());
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+
+        // SAFETY: reading back in-bounds DWORD at +0x100 written by the dispatch.
+        assert_eq!(unsafe { buf.ptr.add(0x100).cast::<u32>().read() }, 0x1234_5678);
+
+        crate::shadow::unregister(buf.ptr as usize, buf.addr());
         let release =
             |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(views), 0);
