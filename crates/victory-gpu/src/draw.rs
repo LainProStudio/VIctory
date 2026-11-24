@@ -897,6 +897,29 @@ impl State {
         }
     }
 
+    /// The vertices an indirect rectangle draw's expansion covers: the
+    /// fewest that any buffer the pipeline reads per vertex holds, in whole
+    /// rectangles (2^24 if it reads none: vertex ids only). None if a buffer
+    /// it reads is not bound or holds no rectangle.
+    /// shortcut: at most 4 MiB of expanded vertices per buffer, as the
+    /// expansion copies the bound buffers whole on the CPU at submission;
+    /// records past that draw nothing.
+    fn rectangle_vertices(&self) -> Option<u32> {
+        const EXPANDED: u32 = 4 << 20;
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let mut vertices = 1 << 24;
+        for e in p.inputs.iter().filter(|e| !e.per_instance) {
+            let v = self.vertex[e.slot as usize];
+            if v.address == 0 || v.stride == 0 {
+                return None;
+            }
+            vertices = (v.size / v.stride)
+                .min(EXPANDED / 2 / v.stride)
+                .min(vertices);
+        }
+        (vertices >= 3).then_some(vertices / 3 * 3)
+    }
+
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
@@ -1069,10 +1092,38 @@ impl State {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
+        // Rectangles: the draws of their expanded vertices, from records of
+        // our own (the bounded scratch returns to common at once).
+        let rects = kind == DRAW && self.topology == RECTANGLES;
+        let mut read = (bounded.clone(), 0u64, signature);
+        let mut expanded = 0;
+        if rects {
+            crate::indirect::done(list, &bounded);
+            // SAFETY: `bounded` is a live buffer returned by `bound`.
+            let bounded_gpu = unsafe { bounded.GetGPUVirtualAddress() };
+            let made = self
+                .rectangle_vertices()
+                .zip(host_signature(DRAW, 16))
+                .and_then(|(vertices, triangles)| {
+                    expanded = vertices;
+                    let records = (stride, max, vertices);
+                    let (buffer, at) =
+                        crate::indirect::rectangles(list, bounded_gpu, records)?;
+                    Some((buffer, at, triangles))
+                });
+            match made {
+                Some(made) => read = made,
+                None => {
+                    why("rectangles not expanded");
+                    return false;
+                }
+            }
+        }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+            DRAW if rects => self.prepare(list, false) && self.rectangles(list, expanded, 0),
+            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1081,7 +1132,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            crate::indirect::done(list, &read.0);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1103,15 +1154,15 @@ impl State {
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
-                &signature,
+                &read.2,
                 max,
-                &bounded,
-                0,
+                &read.0,
+                read.1,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &bounded);
+        crate::indirect::done(list, &read.0);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
