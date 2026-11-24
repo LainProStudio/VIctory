@@ -8,14 +8,33 @@
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{VIEW_TAG, View};
 use crate::host::host;
+
+const SHARDS: usize = 64;
+
+#[derive(Default)]
+struct SlotShard {
+    made: Vec<u64>,
+    kept: Vec<Option<ID3D12Resource>>,
+}
+
+#[derive(Default)]
+struct BounceState {
+    /// Persistent 256-byte-aligned bounce slices by `slot_index`.
+    slots: HashMap<u32, BounceSlot>,
+    /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
+    chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
+}
+
+// SAFETY: `ID3D12Resource` is free-threaded and `chunks` pointers are persistent mappings.
+unsafe impl Send for BounceState {}
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -25,13 +44,9 @@ pub(crate) struct HostHeap {
     /// their guard slot ([`HostHeap::guard_slot`]).
     count: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
-    /// The host resource each slot views, held while the slot does: shaders
-    /// index heaps directly, so a slot the title has not rewritten since it
-    /// released the resource may still be read, and a freed host resource
-    /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// Striped per-slot `(made, kept)` state: shard `index % SHARDS`, entry `index / SHARDS`.
+    /// Also serializes D3D12 CPU descriptor writes to slot `index`.
+    shards: Vec<Mutex<SlotShard>>,
     /// Number of dynamic slots appended past `count` (0 for sampler heaps).
     dynamic: u32,
     /// Where the search for free dynamic slots starts, and which are taken
@@ -40,6 +55,11 @@ pub(crate) struct HostHeap {
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
     strides: Option<StrideTable>,
+    /// Misaligned bindless CBV bounce slices, kept separate from `bindless` so
+    /// parallel slot resolution never contends with `bindless`.
+    bounce: Mutex<BounceState>,
+    /// Fast path: false until at least one misaligned CBV bounce is allocated.
+    any_bounce: AtomicBool,
     /// Populated buffer, constant-buffer, and placed-texture slots (`< count`)
     /// tracked for bindless `ResourceDescriptorHeap[]` materialization.
     bindless: Mutex<Bindless>,
@@ -126,9 +146,8 @@ impl ResolvedSlot {
         let Some((start, end)) = self.range() else {
             return false;
         };
-        remaps
-            .iter()
-            .any(|&(r_start, r_end)| start < r_end && r_start < end)
+        let idx = remaps.partition_point(|&(r_start, _)| r_start < end);
+        remaps[..idx].last().is_some_and(|&(_, r_end)| r_end > start)
     }
 }
 
@@ -139,10 +158,6 @@ struct Bindless {
     /// Subset of `slots` holding placed textures (`View::Placed(false, r, _)` with `r[0] != 1`).
     #[cfg_attr(not(test), allow(dead_code))]
     placed_tex: HashMap<u32, (u32, u32)>,
-    /// Persistent 256-byte-aligned bounce slices by `slot_index`.
-    cbv_bounce: HashMap<u32, BounceSlot>,
-    /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
-    bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
     /// Incremental resolution cache per tracked slot for unchanged slots.
     resolved: HashMap<u32, ResolvedSlot>,
     /// Global `(placed_epoch, remap_epoch, forget_epoch)` under which `resolved` was built.
@@ -184,20 +199,36 @@ pub(crate) fn bindless_memory_remapped(at: u64, end: u64) {
     log.push_back((epoch, at, end));
 }
 
-/// Returns remapped `(at, end)` ranges since `prev` up to `current`, or
-/// `None` if the bounded remap log overflowed past `prev`.
+/// Returns sorted, disjoint remapped `(at, end)` ranges since `prev` up to
+/// `current`, or `None` if the bounded remap log overflowed past `prev`.
 fn remaps_since(prev: u64, current: u64) -> Option<Vec<(u64, u64)>> {
-    let log = REMAP_LOG.lock().unwrap_or_else(|e| e.into_inner());
-    let first = log.front()?.0;
-    if prev + 1 < first {
-        return None;
-    }
-    Some(
+    let mut intervals: Vec<(u64, u64)> = {
+        let log = REMAP_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        let first = log.front()?.0;
+        if prev + 1 < first {
+            return None;
+        }
         log.iter()
             .filter(|&&(epoch, _, _)| epoch > prev && epoch <= current)
+            .filter(|&&(_, at, end)| at < end)
             .map(|&(_, at, end)| (at, end))
-            .collect(),
-    )
+            .collect()
+    };
+    if intervals.len() > 1 {
+        intervals.sort_unstable();
+        let mut out = 0;
+        for i in 1..intervals.len() {
+            let (a, e) = intervals[i];
+            if a <= intervals[out].1 {
+                intervals[out].1 = intervals[out].1.max(e);
+            } else {
+                out += 1;
+                intervals[out] = (a, e);
+            }
+        }
+        intervals.truncate(out + 1);
+    }
+    Some(intervals)
 }
 
 /// A viewed resource was released: bindless slots must prune stale views.
@@ -360,13 +391,23 @@ impl StrideTable {
     }
 }
 
+struct SendResource(#[allow(dead_code)] ID3D12Resource);
+// SAFETY: `ID3D12Resource` is free-threaded; moved once to the retirement queue.
+unsafe impl Send for SendResource {}
+
+struct SendResolved(u32, (u32, u32), ResolvedSlot);
+// SAFETY: `ResolvedSlot` contains only free-threaded D3D12 handles, `Arc`, and POD.
+unsafe impl Send for SendResolved {}
+
 impl Drop for HostHeap {
     fn drop(&mut self) {
-        if let Ok(mut kept) = self.kept.lock() {
-            for res in kept.drain(..).flatten() {
-                crate::host::retire(res);
+        let mut to_retire = Vec::new();
+        for shard in &self.shards {
+            if let Ok(mut shard) = shard.lock() {
+                to_retire.extend(shard.kept.drain(..).flatten().map(SendResource));
             }
         }
+        crate::host::retire_batch(to_retire);
     }
 }
 
@@ -503,17 +544,28 @@ impl HostHeap {
         } else {
             StrideTable::new(&host.device, total)
         };
+        let shards = (0..SHARDS)
+            .map(|s| {
+                let made_len = (count as usize).saturating_sub(s).div_ceil(SHARDS);
+                let kept_len = (total as usize).saturating_sub(s).div_ceil(SHARDS);
+                Mutex::new(SlotShard {
+                    made: vec![0; made_len],
+                    kept: vec![None; kept_len],
+                })
+            })
+            .collect();
         let h = HostHeap {
             heap,
             cpu,
             step,
             count,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; total as usize]),
+            shards,
             dynamic: extra,
             next: Mutex::new((0, vec![false; extra as usize])),
             strides,
+            bounce: Mutex::default(),
+            any_bounce: AtomicBool::new(false),
             bindless: Mutex::default(),
             revision: AtomicU64::new(0),
             #[cfg(test)]
@@ -701,6 +753,66 @@ impl HostHeap {
         }
     }
 
+    /// Makes a matched native UAV pair from the CPU view. The GPU slot is
+    /// held until list reset like the descriptors in a fresh table.
+    pub(crate) fn clear_texture_uav(
+        &self,
+        list: &crate::host::HostList,
+        resource: crate::object::This,
+        texture: &ID3D12Resource,
+        twin_format: Option<u32>,
+        words: Option<&[u32; 10]>,
+    ) -> Option<(u32, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)> {
+        let mut desc = words.map(uav_desc);
+        if let Some(format) = twin_format {
+            use crate::resource::{DEPTH_FORMATS, family};
+            let d = desc.get_or_insert_with(|| whole_uav(texture));
+            let own = d.Format.0 as u32;
+            if own == 0 || own == family(format) || DEPTH_FORMATS.iter().any(|&(f, _)| f == own) {
+                d.Format.0 = format as i32;
+            }
+        } else if let Some(view_fmt) = crate::resource::view_format(resource) {
+            let concrete = DXGI_FORMAT(view_fmt as i32);
+            match desc.as_mut() {
+                Some(d) if d.Format == DXGI_FORMAT_UNKNOWN => d.Format = concrete,
+                Some(_) => {}
+                None => desc = default_uav_desc(texture, concrete),
+            }
+        }
+        // SAFETY: a live host texture whose resource description is queried here.
+        let tex_desc = unsafe { texture.GetDesc() };
+        if !fits(&tex_desc, desc.as_mut().map(|d| &mut d.Format), true) {
+            return None;
+        }
+        let device = &host()?.device;
+        let cpu = list.clear_uav_cpu()?;
+        let slot = self.dynamic(1)?;
+        // SAFETY: both handles name live heap slots. Copy from the
+        // CPU-only heap to the shader-visible heap.
+        let gpu = unsafe {
+            device.CreateUnorderedAccessView(
+                texture,
+                None::<&ID3D12Resource>,
+                desc.as_ref().map(std::ptr::from_ref),
+                cpu,
+            );
+            device.CopyDescriptorsSimple(
+                1,
+                self.cpu(slot),
+                cpu,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: self.heap.GetGPUDescriptorHandleForHeapStart().ptr
+                    + u64::from(slot) * u64::from(self.step),
+            }
+        };
+        // The list's texture state retains the resource through execution.
+        self.keep(slot, None);
+        self.set_stride(slot, 0);
+        Some((slot, gpu, cpu))
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -770,17 +882,47 @@ impl HostHeap {
         self.set_stride(index, 0);
     }
 
+    fn shard(&self, index: u32) -> (std::sync::MutexGuard<'_, SlotShard>, usize) {
+        let s = index as usize % SHARDS;
+        let pos = index as usize / SHARDS;
+        (
+            self.shards[s].lock().unwrap_or_else(|e| e.into_inner()),
+            pos,
+        )
+    }
+
+    #[cfg(test)]
+    fn made_at(&self, index: u32) -> u64 {
+        let (shard, pos) = self.shard(index);
+        shard.made[pos]
+    }
+
     /// Slot `index` now views `resource` (or nothing of the host's). A
     /// previously viewed resource is retired rather than dropped inline so an
     /// in-flight GPU submission reading that slot cannot fault on freed memory.
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let old = {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.get_mut(index as usize)
+            let (mut shard, pos) = self.shard(index);
+            shard
+                .kept
+                .get_mut(pos)
                 .and_then(|slot| std::mem::replace(slot, resource))
         };
         if let Some(old) = old {
             crate::host::retire(old);
+        }
+    }
+
+    fn deactivate_bounce(&self, index: u32) {
+        if self.any_bounce.load(Ordering::Relaxed)
+            && let Some(slot) = self
+                .bounce
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .slots
+                .get_mut(&index)
+        {
+            slot.active = false;
         }
     }
 
@@ -943,16 +1085,29 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let view = (tag == VIEW_TAG)
+            .then(|| super::view_at(i, generation))
+            .flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            {
-                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-                if made[index as usize] != 0 {
-                    made[index as usize] = 0;
-                    self.make_null(index);
+            let old = {
+                let (mut shard, pos) = self.shard(index);
+                if shard.made[pos] != 0 {
+                    shard.made[pos] = 0;
+                    if self.sampler {
+                        self.null_sampler(index);
+                    } else {
+                        null_view(self.cpu(index));
+                    }
+                    shard.kept.get_mut(pos).and_then(Option::take)
+                } else {
+                    None
                 }
+            };
+            if let Some(old) = old {
+                crate::host::retire(old);
+                self.set_stride(index, 0);
             }
             if !self.sampler {
                 self.untrack_bindless(index);
@@ -961,11 +1116,12 @@ impl HostHeap {
         };
         let is_buf = !self.sampler && view.is_buffer();
         let is_placed_tex = !self.sampler && matches!(view, View::Placed(false, r, _) if r[0] != 1);
-        {
-            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if made[index as usize] != key {
+        let mut updated_stride = None;
+        let old = {
+            let (mut shard, pos) = self.shard(index);
+            if shard.made[pos] != key {
                 let later = !for_draw && is_buf;
-                made[index as usize] = if later { 0 } else { key };
+                shard.made[pos] = if later { 0 } else { key };
                 let kept = if later {
                     None
                 } else {
@@ -975,9 +1131,20 @@ impl HostHeap {
                 if !ok && !self.sampler {
                     null_for(&view, self.cpu(index));
                 }
-                self.keep(index, kept.flatten());
-                self.set_stride(index, if ok { view_stride(&view) } else { 0 });
+                updated_stride = Some(if ok { view_stride(&view) } else { 0 });
+                shard
+                    .kept
+                    .get_mut(pos)
+                    .and_then(|slot| std::mem::replace(slot, kept.flatten()))
+            } else {
+                None
             }
+        };
+        if let Some(old) = old {
+            crate::host::retire(old);
+        }
+        if let Some(stride) = updated_stride {
+            self.set_stride(index, stride);
         }
         if !self.sampler {
             if is_buf {
@@ -1002,53 +1169,79 @@ impl HostHeap {
     fn bump_placed(&self, _b: &Bindless) {}
 
     fn track_bindless(&self, index: u32, entry: (u32, u32), is_placed_tex: bool) {
-        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        if b.slots.insert(index, entry) != Some(entry) {
-            b.resolved.remove(&index);
-            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                bounce.active = false;
+        let removed_slot;
+        {
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            removed_slot = b.slots.insert(index, entry) != Some(entry);
+            if removed_slot {
+                b.resolved.remove(&index);
+                self.revision.fetch_add(1, Ordering::Release);
             }
-            self.revision.fetch_add(1, Ordering::Release);
-        }
-        if is_placed_tex {
-            if b.placed_tex.insert(index, entry) != Some(entry) {
+            if is_placed_tex {
+                if b.placed_tex.insert(index, entry) != Some(entry) {
+                    self.bump_placed(&b);
+                }
+            } else if b.placed_tex.remove(&index).is_some() {
                 self.bump_placed(&b);
             }
-        } else if b.placed_tex.remove(&index).is_some() {
-            self.bump_placed(&b);
+        }
+        if removed_slot {
+            self.deactivate_bounce(index);
         }
     }
 
     fn untrack_bindless(&self, index: u32) {
-        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        if b.slots.remove(&index).is_some() {
-            b.resolved.remove(&index);
-            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                bounce.active = false;
+        let removed_slot;
+        {
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            removed_slot = b.slots.remove(&index).is_some();
+            if removed_slot {
+                b.resolved.remove(&index);
+                self.revision.fetch_add(1, Ordering::Release);
             }
-            self.revision.fetch_add(1, Ordering::Release);
+            if b.placed_tex.remove(&index).is_some() {
+                self.bump_placed(&b);
+            }
         }
-        if b.placed_tex.remove(&index).is_some() {
-            self.bump_placed(&b);
-        }
-    }
-
-    fn clear_stale_slot(&self, index: u32) {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made[index as usize] != 0 {
-            made[index as usize] = 0;
-            self.make_null(index);
+        if removed_slot {
+            self.deactivate_bounce(index);
         }
     }
 
-    fn set_unmapped_null(&self, index: u32, view: &View) {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made[index as usize] = 0;
-        if !self.sampler {
-            null_for(view, self.cpu(index));
+    fn clear_stale_slot_into(&self, index: u32, retired: &mut Vec<SendResource>) {
+        let old = {
+            let (mut shard, pos) = self.shard(index);
+            if shard.made[pos] != 0 {
+                shard.made[pos] = 0;
+                if self.sampler {
+                    self.null_sampler(index);
+                } else {
+                    null_view(self.cpu(index));
+                }
+                self.set_stride(index, 0);
+                shard.kept.get_mut(pos).and_then(Option::take)
+            } else {
+                None
+            }
+        };
+        if let Some(old) = old {
+            retired.push(SendResource(old));
         }
-        self.keep(index, None);
-        self.set_stride(index, 0);
+    }
+
+    fn set_unmapped_null_into(&self, index: u32, view: &View, retired: &mut Vec<SendResource>) {
+        let old = {
+            let (mut shard, pos) = self.shard(index);
+            shard.made[pos] = 0;
+            if !self.sampler {
+                null_for(view, self.cpu(index));
+            }
+            self.set_stride(index, 0);
+            shard.kept.get_mut(pos).and_then(Option::take)
+        };
+        if let Some(old) = old {
+            retired.push(SendResource(old));
+        }
     }
 
     fn ensure_placed_slot(
@@ -1057,50 +1250,72 @@ impl HostHeap {
         key: u64,
         shader_view: &View,
         raw_tex: *mut std::ffi::c_void,
+        retired: &mut Vec<SendResource>,
     ) {
         use windows::core::Interface;
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let same_tex = self
-            .kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|r| r.as_raw() == raw_tex);
-        if made[index as usize] != key || !same_tex {
-            let kept = make(shader_view, self.cpu(index));
-            if kept.is_none() {
-                null_for(shader_view, self.cpu(index));
-                made[index as usize] = 0;
+        let old = {
+            let (mut shard, pos) = self.shard(index);
+            let same_tex = shard
+                .kept
+                .get(pos)
+                .and_then(Option::as_ref)
+                .is_some_and(|r| r.as_raw() == raw_tex);
+            if shard.made[pos] != key || !same_tex {
+                let kept = make(shader_view, self.cpu(index));
+                if kept.is_none() {
+                    null_for(shader_view, self.cpu(index));
+                    shard.made[pos] = 0;
+                } else {
+                    shard.made[pos] = key;
+                }
+                self.set_stride(index, 0);
+                shard
+                    .kept
+                    .get_mut(pos)
+                    .and_then(|slot| std::mem::replace(slot, kept.flatten()))
             } else {
-                made[index as usize] = key;
+                None
             }
-            self.keep(index, kept.flatten());
-            self.set_stride(index, 0);
+        };
+        if let Some(old) = old {
+            retired.push(SendResource(old));
         }
     }
 
-    fn ensure_buffer_slot(&self, index: u32, key: u64, view: &View) -> Option<ID3D12Resource> {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made[index as usize] != key {
-            let kept = make(view, self.cpu(index));
-            let ok = kept.is_some();
-            let res = kept.flatten();
-            if res.is_none() {
-                null_for(view, self.cpu(index));
-                made[index as usize] = 0;
+    fn ensure_buffer_slot(
+        &self,
+        index: u32,
+        key: u64,
+        view: &View,
+        retired: &mut Vec<SendResource>,
+    ) -> (Option<ID3D12Resource>, Option<Arc<crate::shadow::Shadow>>) {
+        let (res, shadow, old) = {
+            let (mut shard, pos) = self.shard(index);
+            if shard.made[pos] != key {
+                let (kept, shadow) = make_with_shadow(view, self.cpu(index));
+                let ok = kept.is_some();
+                let res = kept.flatten();
+                if res.is_none() {
+                    null_for(view, self.cpu(index));
+                    shard.made[pos] = 0;
+                } else {
+                    shard.made[pos] = key;
+                }
+                self.set_stride(index, if ok { view_stride(view) } else { 0 });
+                let old = shard
+                    .kept
+                    .get_mut(pos)
+                    .and_then(|slot| std::mem::replace(slot, res.clone()));
+                (res, shadow, old)
             } else {
-                made[index as usize] = key;
+                let res = shard.kept.get(pos).and_then(Option::clone);
+                (res, None, None)
             }
-            self.keep(index, res.clone());
-            self.set_stride(index, if ok { view_stride(view) } else { 0 });
-            return res;
+        };
+        if let Some(old) = old {
+            retired.push(SendResource(old));
         }
-        self.kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)
-            .and_then(Option::clone)
+        (res, shadow)
     }
 
     fn ensure_cbv_bounce(
@@ -1108,16 +1323,17 @@ impl HostHeap {
         index: u32,
         aligned: u32,
     ) -> Option<(u64, usize, ID3D12Resource, bool)> {
-        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = b.cbv_bounce.get_mut(&index)
+        let mut bounce = self.bounce.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = bounce.slots.get_mut(&index)
             && slot.cap >= aligned
         {
             let was_active = std::mem::replace(&mut slot.active, true);
+            self.any_bounce.store(true, Ordering::Release);
             return Some((slot.gpu, slot.cpu, slot.resource.clone(), was_active));
         }
         let needed = u64::from(aligned);
-        let need_chunk = b
-            .bounce_chunks
+        let need_chunk = bounce
+            .chunks
             .last()
             .is_none_or(|&(_, _, _, used)| used + needed > BOUNCE_CHUNK);
         if need_chunk {
@@ -1126,13 +1342,13 @@ impl HostHeap {
             crate::host::name(&res, || "bindless cbv bounce".into());
             // SAFETY: a live buffer.
             let gpu = unsafe { res.GetGPUVirtualAddress() };
-            b.bounce_chunks.push((res, data as usize, gpu, 0));
+            bounce.chunks.push((res, data as usize, gpu, 0));
         }
-        let last = b.bounce_chunks.last_mut()?;
+        let last = bounce.chunks.last_mut()?;
         let at = last.3;
         last.3 += needed;
         let (gpu, cpu, res) = (last.2 + at, last.1 + at as usize, last.0.clone());
-        b.cbv_bounce.insert(
+        bounce.slots.insert(
             index,
             BounceSlot {
                 gpu,
@@ -1142,6 +1358,7 @@ impl HostHeap {
                 active: true,
             },
         );
+        self.any_bounce.store(true, Ordering::Release);
         Some((gpu, cpu, res, false))
     }
 
@@ -1151,6 +1368,7 @@ impl HostHeap {
         key: u64,
         address: u64,
         capped: u32,
+        retired: &mut Vec<SendResource>,
     ) -> Option<ResolvedSlot> {
         let host = host()?;
         let aligned = capped.next_multiple_of(256);
@@ -1158,16 +1376,17 @@ impl HostHeap {
             && let Some(shadow) = crate::shadow::find(address, u64::from(capped))
             && shadow.gpu(address).is_multiple_of(256)
         {
-            let bounce_active = self
-                .bindless
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .cbv_bounce
-                .get(&index)
-                .is_some_and(|s| s.active);
-            {
-                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-                if made[index as usize] != key || bounce_active {
+            let bounce_active = self.any_bounce.load(Ordering::Acquire)
+                && self
+                    .bounce
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .slots
+                    .get(&index)
+                    .is_some_and(|s| s.active);
+            let old = {
+                let (mut shard, pos) = self.shard(index);
+                if shard.made[pos] != key || bounce_active {
                     let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                         BufferLocation: shadow.gpu(address),
                         SizeInBytes: aligned,
@@ -1177,20 +1396,21 @@ impl HostHeap {
                         host.device
                             .CreateConstantBufferView(Some(&desc), self.cpu(index))
                     };
-                    made[index as usize] = key;
-                    self.keep(index, Some(shadow.buffer.clone()));
+                    shard.made[pos] = key;
                     self.set_stride(index, 0);
+                    shard
+                        .kept
+                        .get_mut(pos)
+                        .and_then(|slot| slot.replace(shadow.buffer.clone()))
+                } else {
+                    None
                 }
+            };
+            if let Some(old) = old {
+                retired.push(SendResource(old));
             }
-            if bounce_active
-                && let Some(slot) = self
-                    .bindless
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .cbv_bounce
-                    .get_mut(&index)
-            {
-                slot.active = false;
+            if bounce_active {
+                self.deactivate_bounce(index);
             }
             let len = u64::from(capped).min(shadow.left(address)) as usize;
             return Some(ResolvedSlot::CbvDirect {
@@ -1202,9 +1422,9 @@ impl HostHeap {
         }
 
         let (gpu, cpu, res, was_active) = self.ensure_cbv_bounce(index, aligned)?;
-        {
-            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if made[index as usize] != key || !was_active {
+        let old = {
+            let (mut shard, pos) = self.shard(index);
+            if shard.made[pos] != key || !was_active {
                 let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                     BufferLocation: gpu,
                     SizeInBytes: aligned,
@@ -1214,10 +1434,18 @@ impl HostHeap {
                     host.device
                         .CreateConstantBufferView(Some(&desc), self.cpu(index))
                 };
-                made[index as usize] = key;
-                self.keep(index, Some(res.clone()));
+                shard.made[pos] = key;
                 self.set_stride(index, 0);
+                shard
+                    .kept
+                    .get_mut(pos)
+                    .and_then(|slot| slot.replace(res.clone()))
+            } else {
+                None
             }
+        };
+        if let Some(old) = old {
+            retired.push(SendResource(old));
         }
         Some(ResolvedSlot::CbvBounce {
             cpu,
@@ -1237,9 +1465,10 @@ impl HostHeap {
         let entries = self.placed_slots();
         let mut stale = Vec::new();
         let mut committed = CommittedCache::default();
+        let mut retired = Vec::new();
         for &(index, (vi, generation)) in entries.iter() {
-            let Some(view) = view_at(vi, generation) else {
-                self.clear_stale_slot(index);
+            let Some(view) = super::view_at(vi, generation) else {
+                self.clear_stale_slot_into(index, &mut retired);
                 stale.push(index);
                 continue;
             };
@@ -1252,46 +1481,47 @@ impl HostHeap {
             }
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             if !valid_title_address_cached(&mut committed, address, 1) {
-                self.set_unmapped_null(index, &view);
+                self.set_unmapped_null_into(index, &view, &mut retired);
                 continue;
             }
             let Some(placed) = placed_texture(&view) else {
-                self.set_unmapped_null(index, &view);
+                self.set_unmapped_null_into(index, &view, &mut retired);
                 continue;
             };
             let View::Shader(tex_res, _) = placed.view else {
-                self.set_unmapped_null(index, &view);
+                self.set_unmapped_null_into(index, &view, &mut retired);
                 continue;
             };
             let tex_this = tex_res as crate::object::This;
             let Some(host_tex) = crate::resource::host_resource(tex_this) else {
-                self.set_unmapped_null(index, &view);
+                self.set_unmapped_null_into(index, &view, &mut retired);
                 continue;
             };
             let key = u64::from(generation) << 32 | u64::from(vi);
-            self.ensure_placed_slot(index, key, &placed.view, host_tex.as_raw());
+            self.ensure_placed_slot(index, key, &placed.view, host_tex.as_raw(), &mut retired);
             if crate::texture::title_written(host_tex) {
                 crate::texture::upload(list, tex_this, host_tex);
             }
             const SHADER_RESOURCE: u32 = 0x40 | 0x80;
             crate::list::ensure_state(list, tex_this, SHADER_RESOURCE);
         }
+        crate::host::retire_batch(retired);
         if !stale.is_empty() {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let mut placed_changed = false;
-            for idx in stale {
-                b.resolved.remove(&idx);
-                if b.slots.remove(&idx).is_some()
-                    && let Some(bounce) = b.cbv_bounce.get_mut(&idx)
-                {
-                    bounce.active = false;
-                }
-                if b.placed_tex.remove(&idx).is_some() {
+            for idx in &stale {
+                b.resolved.remove(idx);
+                b.slots.remove(idx);
+                if b.placed_tex.remove(idx).is_some() {
                     placed_changed = true;
                 }
             }
             if placed_changed {
                 self.bump_placed(&b);
+            }
+            drop(b);
+            for idx in stale {
+                self.deactivate_bounce(idx);
             }
         }
     }
@@ -1385,34 +1615,42 @@ impl HostHeap {
             let dirty: Vec<(u32, (u32, u32))> = if check_forget {
                 let stale_forgotten = crate::descriptor::stale_slots(&entries_or_dirty);
                 let had_stale = !stale_forgotten.is_empty();
+                let mut retired = Vec::new();
                 for &idx in &stale_forgotten {
-                    self.clear_stale_slot(idx);
+                    self.clear_stale_slot_into(idx, &mut retired);
                 }
-                let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-                let mut placed_changed = false;
-                for idx in stale_forgotten {
-                    b.resolved.remove(&idx);
-                    if b.slots.remove(&idx).is_some()
-                        && let Some(bounce) = b.cbv_bounce.get_mut(&idx)
-                    {
-                        bounce.active = false;
+                crate::host::retire_batch(retired);
+                {
+                    let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut placed_changed = false;
+                    for &idx in &stale_forgotten {
+                        b.resolved.remove(&idx);
+                        b.slots.remove(&idx);
+                        if b.placed_tex.remove(&idx).is_some() {
+                            placed_changed = true;
+                        }
                     }
-                    if b.placed_tex.remove(&idx).is_some() {
-                        placed_changed = true;
-                    }
-                }
-                if placed_changed {
-                    self.bump_placed(&b);
-                }
-                if b.slots.is_empty() {
-                    if !b.placed_tex.is_empty() {
-                        b.placed_tex.clear();
+                    if placed_changed {
                         self.bump_placed(&b);
                     }
-                    b.resolved.clear();
-                    b.plan = None;
-                    return None;
+                    if b.slots.is_empty() {
+                        if !b.placed_tex.is_empty() {
+                            b.placed_tex.clear();
+                            self.bump_placed(&b);
+                        }
+                        b.resolved.clear();
+                        b.plan = None;
+                        drop(b);
+                        for idx in stale_forgotten {
+                            self.deactivate_bounce(idx);
+                        }
+                        return None;
+                    }
                 }
+                for &idx in &stale_forgotten {
+                    self.deactivate_bounce(idx);
+                }
+                let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
                 let dirty: Vec<(u32, (u32, u32))> = b
                     .slots
                     .iter()
@@ -1451,26 +1689,107 @@ impl HostHeap {
                 add(C::BindlessDirty, dirty.len() as u64);
             }
 
-            let mut committed = CommittedCache::default();
-            let mut newly_resolved: Vec<(u32, (u32, u32), ResolvedSlot)> =
-                Vec::with_capacity(dirty.len());
+            let looked_up = crate::descriptor::views_at(&dirty);
+            let mut work: Vec<(u32, (u32, u32), View)> = Vec::with_capacity(looked_up.len());
             let mut stale = Vec::new();
-            for (index, (vi, generation)) in dirty {
-                match self.resolve_bindless_slot(index, vi, generation, &mut committed) {
-                    Some(slot) => newly_resolved.push((index, (vi, generation), slot)),
-                    None => stale.push(index),
+            let mut to_retire: Vec<SendResource> = Vec::new();
+            for (index, entry, view) in looked_up {
+                match view {
+                    Some(v) if v.is_buffer() => work.push((index, entry, v)),
+                    Some(_) => stale.push(index),
+                    None => {
+                        self.clear_stale_slot_into(index, &mut to_retire);
+                        stale.push(index);
+                    }
                 }
             }
 
+            let newly_resolved: Vec<(u32, (u32, u32), ResolvedSlot)> = if work.len() < 64 {
+                let mut committed = CommittedCache::default();
+                let mut out = Vec::with_capacity(work.len());
+                for (index, (vi, generation), view) in work {
+                    match self.resolve_bindless_slot(
+                        index,
+                        vi,
+                        generation,
+                        &view,
+                        &mut committed,
+                        &mut to_retire,
+                    ) {
+                        Some(slot) => out.push((index, (vi, generation), slot)),
+                        None => stale.push(index),
+                    }
+                }
+                out
+            } else {
+                let workers = std::thread::available_parallelism()
+                    .map_or(4, |n| n.get())
+                    .min(8)
+                    .min(work.len() / 16)
+                    .max(1);
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let chunks: Vec<(Vec<SendResolved>, Vec<u32>, Vec<SendResource>)> =
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = (0..workers)
+                            .map(|_| {
+                                s.spawn(|| {
+                                    let mut committed = CommittedCache::default();
+                                    let mut resolved = Vec::new();
+                                    let mut local_stale = Vec::new();
+                                    let mut local_retired = Vec::new();
+                                    loop {
+                                        let start = next.fetch_add(16, Ordering::Relaxed);
+                                        if start >= work.len() {
+                                            break;
+                                        }
+                                        let end = (start + 16).min(work.len());
+                                        for (index, (vi, generation), view) in work[start..end].iter() {
+                                            match self.resolve_bindless_slot(
+                                                *index,
+                                                *vi,
+                                                *generation,
+                                                view,
+                                                &mut committed,
+                                                &mut local_retired,
+                                            ) {
+                                                Some(slot) => resolved.push(SendResolved(
+                                                    *index,
+                                                    (*vi, *generation),
+                                                    slot,
+                                                )),
+                                                None => local_stale.push(*index),
+                                            }
+                                        }
+                                    }
+                                    (resolved, local_stale, local_retired)
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or_default())
+                            .collect()
+                    });
+                let mut out = Vec::with_capacity(work.len());
+                for (resolved, local_stale, local_retired) in chunks {
+                    out.extend(resolved.into_iter().map(|SendResolved(i, e, r)| (i, e, r)));
+                    stale.extend(local_stale);
+                    to_retire.extend(local_retired);
+                }
+                out
+            };
+            crate::host::retire_batch(to_retire);
+
+            if !stale.is_empty() {
+                for &idx in &stale {
+                    self.deactivate_bounce(idx);
+                }
+            }
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let mut placed_changed = false;
             for idx in stale {
                 b.resolved.remove(&idx);
-                if b.slots.remove(&idx).is_some()
-                    && let Some(bounce) = b.cbv_bounce.get_mut(&idx)
-                {
-                    bounce.active = false;
-                }
+                b.slots.remove(&idx);
                 if b.placed_tex.remove(&idx).is_some() {
                     placed_changed = true;
                 }
@@ -1632,30 +1951,25 @@ impl HostHeap {
         index: u32,
         vi: u32,
         generation: u32,
+        view: &View,
         committed: &mut CommittedCache,
+        retired: &mut Vec<SendResource>,
     ) -> Option<ResolvedSlot> {
         use windows::core::Interface;
-        let Some(view) = view_at(vi, generation) else {
-            self.clear_stale_slot(index);
-            return None;
-        };
-        if !view.is_buffer() {
-            return None;
-        }
         let slot_key = u64::from(generation) << 32 | u64::from(vi);
-        match &view {
+        match view {
             &View::Constant(address, size) => {
                 let capped = size.min(65_536);
                 let range = (address >= 0x10000 && capped > 0)
                     .then(|| (address, address.saturating_add(u64::from(capped))));
                 if !valid_title_address_cached(committed, address, u64::from(capped)) {
-                    self.set_unmapped_null(index, &view);
+                    self.set_unmapped_null_into(index, view, retired);
                     return Some(ResolvedSlot::Null { range });
                 }
-                match self.materialize_bindless_cbv(index, slot_key, address, capped) {
+                match self.materialize_bindless_cbv(index, slot_key, address, capped, retired) {
                     Some(resolved) => Some(resolved),
                     None => {
-                        self.set_unmapped_null(index, &view);
+                        self.set_unmapped_null_into(index, view, retired);
                         Some(ResolvedSlot::Null { range })
                     }
                 }
@@ -1665,21 +1979,31 @@ impl HostHeap {
                 let end = crate::resource::placed_texture_end(address, resource);
                 let range = (address >= 0x10000).then_some((address, end));
                 if !valid_title_address_cached(committed, address, 1) {
-                    self.set_unmapped_null(index, &view);
+                    self.set_unmapped_null_into(index, view, retired);
                     return Some(ResolvedSlot::Null { range });
                 }
-                if let Some(placed) = placed_texture(&view)
+                if let Some(placed) = placed_texture(view)
                     && let View::Shader(tex_res, _) = placed.view
                     && let Some(copy) =
                         crate::resource::host_copy(tex_res as crate::object::This)
                 {
                     let tex_this = tex_res as crate::object::This;
                     let host_tex = &copy.texture;
-                    self.ensure_placed_slot(index, slot_key, &placed.view, host_tex.as_raw());
-                    let staging = crate::texture::title_written(host_tex)
+                    self.ensure_placed_slot(
+                        index,
+                        slot_key,
+                        &placed.view,
+                        host_tex.as_raw(),
+                        retired,
+                    );
+                    // Query `GetDesc` once for both `title_written` and `srv_state`.
+                    // SAFETY: `host_tex` is a live D3D12 resource kept alive by `copy`.
+                    let flags = unsafe { host_tex.GetDesc() }.Flags.0 as u32;
+                    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+                    let staging = (flags & TARGET_DEPTH_UNORDERED == 0)
                         .then(|| crate::texture::staging_for(tex_this, host_tex))
                         .flatten();
-                    let srv_state = crate::host::legal_state(host_tex, 0x40 | 0x80);
+                    let srv_state = crate::host::legal_for(flags, 0x40 | 0x80);
                     Some(ResolvedSlot::PlacedTex {
                         resource: tex_this as usize,
                         copy,
@@ -1689,25 +2013,25 @@ impl HostHeap {
                         end: placed.end,
                     })
                 } else {
-                    self.set_unmapped_null(index, &view);
+                    self.set_unmapped_null_into(index, view, retired);
                     Some(ResolvedSlot::Null { range })
                 }
             }
             _ => {
-                let Some((address, len)) = buffer_range(&view) else {
-                    self.set_unmapped_null(index, &view);
+                let Some((address, len)) = buffer_range(view) else {
+                    self.set_unmapped_null_into(index, view, retired);
                     return Some(ResolvedSlot::Null { range: None });
                 };
                 let range = (address >= 0x10000 && len > 0)
                     .then(|| (address, address.saturating_add(len)));
                 if !valid_title_address_cached(committed, address, len) {
-                    self.set_unmapped_null(index, &view);
+                    self.set_unmapped_null_into(index, view, retired);
                     return Some(ResolvedSlot::Null { range });
                 }
-                let res = self.ensure_buffer_slot(index, slot_key, &view);
+                let (res, found_shadow) = self.ensure_buffer_slot(index, slot_key, view, retired);
                 let mut read = None;
                 let mut write = None;
-                if let Some(shadow) = crate::shadow::find(address, len) {
+                if let Some(shadow) = found_shadow.or_else(|| crate::shadow::find(address, len)) {
                     let clamped = len.min(shadow.left(address)) as usize;
                     if clamped > 0 {
                         read = Some((shadow.clone(), address as usize, clamped));
@@ -1742,11 +2066,10 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self
-            .made
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)?;
+        let key = {
+            let (shard, pos) = self.shard(index);
+            *shard.made.get(pos)?
+        };
         if key == 0 {
             return Some("null".into());
         }
@@ -1762,10 +2085,18 @@ impl HostHeap {
 
 /// Per-call `VirtualQuery` region cache so querying hundreds of bindless slots
 /// inside the same contiguous allocation only asks the kernel once per region.
-#[derive(Default)]
 struct CommittedCache {
-    entries: [(u64, u64, bool); 16],
+    entries: [(u64, u64, bool); 64],
     next: usize,
+}
+
+impl Default for CommittedCache {
+    fn default() -> Self {
+        Self {
+            entries: [(0, 0, false); 64],
+            next: 0,
+        }
+    }
 }
 
 impl CommittedCache {
@@ -1780,6 +2111,7 @@ impl CommittedCache {
         }
         // SAFETY: querying process virtual memory metadata into a zeroed local struct.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `VirtualQuery` writes into `info` up to `size_of_val(&info)` bytes.
         let got = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
         if got != size_of_val(&info) || info.RegionSize == 0 {
             return false;
@@ -1968,12 +2300,12 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
     Some((start / 4, u32::try_from(dwords).ok()?))
 }
 
-fn buffer_srv(
+fn buffer_srv_with_shadow(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-) -> Option<Kept> {
+) -> Option<(Kept, Arc<crate::shadow::Shadow>)> {
     if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
         return None;
     }
@@ -2037,7 +2369,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some((Some(shadow.buffer.clone()), shadow))
 }
 
 /// Clamps `[first, first + count)` in `element`-byte units to `host_buffer`'s
@@ -2065,14 +2397,14 @@ fn clamp_buffer_view(
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
-/// bytes) on its host copy, as [`buffer_srv`]; false if the copy cannot be
-/// written by shaders (upload memory).
-fn buffer_uav(
+/// bytes) on its host copy, as [`buffer_srv_with_shadow`]; `None` if the copy
+/// cannot be written by shaders (upload memory).
+fn buffer_uav_with_shadow(
     address: u64,
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-) -> Option<Kept> {
+) -> Option<(Kept, Arc<crate::shadow::Shadow>)> {
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -2145,7 +2477,7 @@ fn buffer_uav(
             at,
         )
     };
-    Some(Some(shadow.buffer.clone()))
+    Some((Some(shadow.buffer.clone()), shadow))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -2400,22 +2732,33 @@ fn whole_uav(texture: &ID3D12Resource) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
-    let host = host()?;
+    make_with_shadow(view, at).0
+}
+
+fn make_with_shadow(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> (Option<Kept>, Option<Arc<crate::shadow::Shadow>>) {
+    let Some(host) = host() else {
+        return (None, None);
+    };
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
             if address == 0 || size == 0 {
-                return None;
+                return (None, None);
             }
             let capped = size.min(65_536);
-            let shadow = crate::shadow::find(address, u64::from(capped))?;
+            let Some(shadow) = crate::shadow::find(address, u64::from(capped)) else {
+                return (None, None);
+            };
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
                 );
-                return None;
+                return (None, None);
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
@@ -2423,7 +2766,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            (Some(Some(shadow.buffer.clone())), Some(shadow))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -2440,7 +2783,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 if !fits(&info, desc.as_mut().map(|d| &mut d.Format), false) {
-                    return None;
+                    return (None, None);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -2450,11 +2793,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                (Some(Some(texture.clone())), None)
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                match buffer_srv_with_shadow(data as u64, len, srv_desc(desc), at) {
+                    Some((kept, shadow)) => (Some(kept), Some(shadow)),
+                    None => (None, None),
+                }
             } else if resource.is_null()
                 && let Some(words) = desc
                 && words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
@@ -2462,15 +2808,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut host_desc = srv_desc(words);
                 // SAFETY: union member selected by `RAYTRACING_ACCELERATION_STRUCTURE`.
                 let title_va = unsafe { host_desc.Anonymous.RaytracingAccelerationStructure.Location };
-                let (as_res, host_va) = crate::raytracing::lookup_as(title_va)?;
+                let Some((as_res, host_va)) = crate::raytracing::lookup_as(title_va) else {
+                    return (None, None);
+                };
                 host_desc.Anonymous.RaytracingAccelerationStructure.Location = host_va;
                 // SAFETY: null resource is required for TLAS SRVs; `at` is our heap slot.
                 unsafe {
                     device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&host_desc), at)
                 };
-                Some(Some(as_res))
+                (Some(Some(as_res)), None)
             } else {
-                None
+                (None, None)
             }
         }
         View::Unordered(resource, _counter, desc) => {
@@ -2478,9 +2826,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let Some((texture, twin_format)) = crate::resource::host_unordered(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        match buffer_uav_with_shadow(data as u64, len, uav_desc(desc), at) {
+                            Some((kept, shadow)) => (Some(kept), Some(shadow)),
+                            None => (None, None),
+                        }
                     }
-                    _ => None,
+                    _ => (None, None),
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
@@ -2506,7 +2857,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // SAFETY: a live host texture whose resource description is queried here.
             let tex_desc = unsafe { texture.GetDesc() };
             if !fits(&tex_desc, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
+                return (None, None);
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
@@ -2517,7 +2868,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            (Some(Some(texture.clone())), None)
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -2528,17 +2879,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            (Some(None), None)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            (Some(None), None)
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(placed) = placed_texture(view) {
-                return make(&placed.view, at);
+                return make_with_shadow(&placed.view, at);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -2549,16 +2900,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     dimension = resource[0],
                     "placed unordered texture view not mirrored"
                 );
-                return None;
+                return (None, None);
             }
             // The resource description's width, after the alignment.
             let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
-            if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+            let res = if *unordered {
+                buffer_uav_with_shadow(address, len, uav_desc(words), at)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv_with_shadow(address, len, srv_desc(words), at)
+            };
+            match res {
+                Some((kept, shadow)) => (Some(kept), Some(shadow)),
+                None => (None, None),
             }
         }
     }
@@ -3136,10 +3491,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Views the host refuses are left null, as `HostHeap::mirror` leaves them.
         let mut placed = [0; 14];
         placed[0] = 1; // a buffer
-        if buffer_srv(start + 16, 128, srv, at(0)).is_none() {
+        if buffer_srv_with_shadow(start + 16, 128, srv, at(0)).is_none() {
             null_for(&View::Placed(false, placed, [0; 16]), at(0));
         }
-        if buffer_uav(start + 272, 128, uav(written), at(1)).is_none() {
+        if buffer_uav_with_shadow(start + 272, 128, uav(written), at(1)).is_none() {
             null_for(&View::Placed(true, placed, [0; 16]), at(1));
         }
         // What the shader read, as a raw view of 32 dwords of our own.
@@ -3518,7 +3873,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // `View::is_buffer()` slots (`made[idx] == 0`).
         for idx in 0..=5 {
             assert_eq!(
-                host_heap.made.lock().unwrap()[idx],
+                host_heap.made_at(idx as u32),
                 0,
                 "slot {idx} starts deferred"
             );

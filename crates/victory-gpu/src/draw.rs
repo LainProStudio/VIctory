@@ -53,6 +53,11 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+pub(crate) enum UavClear {
+    Uint([u32; 4]),
+    Float([f32; 4]),
+}
+
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
@@ -617,13 +622,8 @@ impl State {
             .map(|depth| depth.resource)
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
-    /// What draws and dispatches share: heaps, our root signature, the
-    /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        self.depth_sampled = false;
+    /// Binds the title's shader-visible heaps when they change.
+    fn bind_heaps(&mut self, list: &HostList) {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -644,6 +644,72 @@ impl State {
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
+    }
+
+    /// Records a clear of a resource-backed texture UAV in the bound heap.
+    pub(crate) fn clear_texture_uav(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        cpu: u64,
+        resource: This,
+        value: UavClear,
+        rects: &[RECT],
+    ) {
+        let heap_id = self.heaps[0];
+        if heap_id == 0 {
+            return;
+        }
+        let heap = crate::descriptor::heap(heap_id as This);
+        if heap.index(gpu).is_none() {
+            return;
+        }
+        let (Some(View::Unordered(cpu_resource, _, words)), Some(View::Unordered(gpu_resource, _, _))) =
+            (crate::descriptor::view(cpu), crate::descriptor::view(gpu))
+        else {
+            return;
+        };
+        if cpu_resource != resource as usize || gpu_resource != cpu_resource {
+            return;
+        }
+        let (Some((texture, twin_format)), Some(native_heap)) =
+            (crate::resource::host_unordered(resource), heap.host())
+        else {
+            return;
+        };
+        let Some((slot, gpu_handle, cpu_handle)) =
+            native_heap.clear_texture_uav(list, resource, texture, twin_format, words.as_ref())
+        else {
+            return;
+        };
+        self.lease.add(heap_id, slot, 1);
+        self.bind_heaps(list);
+        crate::list::ensure_state(list, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        // SAFETY: matched views, a live texture in UAV state, and the
+        // shader-visible descriptor's heap is bound on this list.
+        unsafe {
+            match value {
+                UavClear::Uint(values) => {
+                    list.list
+                        .ClearUnorderedAccessViewUint(gpu_handle, cpu_handle, texture, &values, rects);
+                }
+                UavClear::Float(values) => {
+                    list.list
+                        .ClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, texture, &values, rects);
+                }
+            }
+        }
+    }
+
+    /// A descriptor a shader reads through a table: its host slot made if
+    /// it changed, constant data copied, textures made readable.
+    /// What draws and dispatches share: heaps, our root signature, the
+    /// pipeline, and per stage the user data, root views and the
+    /// descriptors its tables hold.
+    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.depth_sampled = false;
+        let l = &list.list;
+        self.bind_heaps(list);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -2612,15 +2678,30 @@ mod tests {
             alloc.ptr.add(off_a).cast::<u32>().write(0xCAFE_1234);
         }
 
-        let list = host.new_list().expect("new_list");
         let shadow = crate::shadow::find(base, 4).expect("shadow");
+        let read_shadow_u32 = |offset: usize| -> u32 {
+            let (rb, rb_ptr) = host.readback_buffer(4).expect("readback buffer");
+            let rb_list = host.new_list().expect("rb list");
+            // SAFETY: open list and live buffers covering 4 bytes.
+            unsafe {
+                rb_list
+                    .list
+                    .CopyBufferRegion(&rb, 0, &shadow.buffer, offset as u64, 4);
+            }
+            rb_list.close();
+            host.execute(&[&rb_list]);
+            // SAFETY: fence completed; readback buffer holds 4 bytes.
+            unsafe { rb_ptr.cast::<u32>().read_unaligned() }
+        };
+
+        let list = host.new_list().expect("new_list");
         assert_eq!(
             root_view(&list, base, RootView::Srv),
             Some(shadow.gpu(base))
         );
         list.close();
         host.execute(&[&list]);
-        assert_eq!(shadow.read_u32(off_a), 0xCAFE_1234);
+        assert_eq!(read_shadow_u32(off_a), 0xCAFE_1234);
 
         // Second submission mutates another page past +1 MiB and verifies
         // incremental dirty-page refresh updates it too.
@@ -2635,8 +2716,8 @@ mod tests {
         );
         list.close();
         host.execute(&[&list]);
-        assert_eq!(shadow.read_u32(off_a), 0xCAFE_1234);
-        assert_eq!(shadow.read_u32(off_b), 0xBEEF_5678);
+        assert_eq!(read_shadow_u32(off_a), 0xCAFE_1234);
+        assert_eq!(read_shadow_u32(off_b), 0xBEEF_5678);
 
         crate::shadow::unregister(resource_id, base);
     }

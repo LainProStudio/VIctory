@@ -58,6 +58,12 @@ pub(crate) struct Host {
     /// Allocator and command list used once per submission for bindless texture
     /// uploads and initial `SHADER_RESOURCE` transitions before list preludes.
     bindless_prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// Dedicated lists and pooled staging arenas for `Shadow` VRAM transfers,
+    /// used only under `self.submitted`.
+    shadow_upload_list: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    shadow_readback_list: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    shadow_upload: Mutex<StagingArena>,
+    shadow_readback: Mutex<StagingArena>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -99,6 +105,24 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
+}
+
+/// Drops all `objects` once every submission running now has finished, taking
+/// the retirement lock at most once.
+pub(crate) fn retire_batch<T: 'static>(objects: Vec<T>) {
+    if objects.is_empty() {
+        return;
+    }
+    let started = STARTED.load(Ordering::Acquire);
+    if started <= FINISHED.load(Ordering::Acquire) {
+        drop(objects);
+        return;
+    }
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    retired.reserve(objects.len());
+    for object in objects {
+        retired.push((started, Retired(Box::new(object))));
+    }
 }
 
 /// Drops what waited for submissions up to `finished`.
@@ -282,15 +306,22 @@ impl Host {
             let wave64_mode = recommended_wave64_mode(&device);
             crate::shader_cache::set_wave64_mode(wave64_mode);
             tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
-            let bindless_allocator: ID3D12CommandAllocator = device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let bindless_list: ID3D12GraphicsCommandList = device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &bindless_allocator,
-                None,
-            )?;
-            bindless_list.Close()?;
+            let closed_list =
+                || -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+                    let allocator: ID3D12CommandAllocator =
+                        device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                };
+            let bindless_prelude = closed_list()?;
+            let shadow_upload_list = closed_list()?;
+            let shadow_readback_list = closed_list()?;
             Ok(Host {
                 device,
                 depth_bounds_supported,
@@ -307,7 +338,11 @@ impl Host {
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
                 texture_uploads: Mutex::new(crate::texture::UploadPool::new()),
-                bindless_prelude: (bindless_allocator, bindless_list),
+                bindless_prelude,
+                shadow_upload_list,
+                shadow_readback_list,
+                shadow_upload: Mutex::default(),
+                shadow_readback: Mutex::default(),
             })
         }
     }
@@ -886,6 +921,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    clear_uav_cpu: OnceLock<Option<ID3D12DescriptorHeap>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -1081,6 +1117,90 @@ unsafe impl Send for Arguments {}
 const ARGUMENT_CHUNK: u64 = 1 << 16;
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Pooled staging chunks (4 MiB each) reused across submissions for `Shadow`
+/// `UPLOAD` and `READBACK` transfers; oversized allocations live for one
+/// submission and are released on reset.
+#[derive(Clone, Copy)]
+enum StagingKind {
+    Upload,
+    Readback,
+}
+
+#[derive(Default)]
+struct StagingArena {
+    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    current: usize,
+    used: u64,
+    transient: Vec<(ID3D12Resource, usize, u64)>,
+}
+
+// SAFETY: pointers are persistent mappings of D3D12 upload/readback buffers
+// accessed only while holding the arena's mutex under `Host::submitted`.
+unsafe impl Send for StagingArena {}
+
+const STAGING_CHUNK: u64 = 4 << 20;
+const MAX_POOLED_STAGING_CHUNKS: usize = 4;
+
+impl StagingArena {
+    fn alloc(
+        &mut self,
+        host: &Host,
+        kind: StagingKind,
+        len: usize,
+    ) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let alloc_len = (len as u64).max(1).next_multiple_of(16);
+        let make = |size: u64| match kind {
+            StagingKind::Upload => {
+                let (buf, ptr) = host.upload_buffer(size)?;
+                name(&buf, || format!("shadow upload staging {size:#x}"));
+                Some((buf, ptr))
+            }
+            StagingKind::Readback => {
+                let (buf, ptr) = host.readback_buffer(size)?;
+                name(&buf, || format!("shadow readback staging {size:#x}"));
+                Some((buf, ptr))
+            }
+        };
+        if alloc_len > STAGING_CHUNK {
+            let (buf, ptr) = make(alloc_len)?;
+            self.transient.push((buf.clone(), ptr as usize, alloc_len));
+            return Some((buf, 0, ptr));
+        }
+        if self.used + alloc_len > STAGING_CHUNK && self.current < self.chunks.len() {
+            (self.current, self.used) = (self.current + 1, 0);
+        }
+        if self.current == self.chunks.len() {
+            let (buf, ptr) = make(STAGING_CHUNK)?;
+            self.chunks.push((buf, ptr as usize, STAGING_CHUNK));
+            self.used = 0;
+        }
+        let (buf, data, _) = &self.chunks[self.current];
+        let at = self.used;
+        self.used += alloc_len;
+        Some((buf.clone(), at, (*data + at as usize) as *mut u8))
+    }
+
+    fn reset(&mut self) {
+        self.current = 0;
+        self.used = 0;
+        self.transient.clear();
+        self.chunks.truncate(MAX_POOLED_STAGING_CHUNKS);
+    }
+}
+
+/// One merged `Shadow` range to read back before and after the submission.
+struct ReadbackPlan {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    from: usize,
+    len: usize,
+    before_res: ID3D12Resource,
+    before_off: u64,
+    before_ptr: *const u8,
+    after_res: ID3D12Resource,
+    after_off: u64,
+    after_ptr: *const u8,
+}
 
 /// Default-heap UAV chunks for clamped indirect arguments, always in
 /// `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` between indirect executions and
@@ -1302,6 +1422,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                clear_uav_cpu: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -1324,15 +1445,32 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut upload_pool = self.texture_uploads.lock().unwrap_or_else(|e| e.into_inner());
+        let mut upload_arena = self.shadow_upload.lock().unwrap_or_else(|e| e.into_inner());
+        let mut readback_arena = self
+            .shadow_readback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         let (mut deferred_us, mut prelude_us, mut tex_uploads) = (0u64, 0u64, 0usize);
-        let (mut list_uploads, bindless_prelude, bindless_timings, _plans, back) = {
+        let (
+            mut list_uploads,
+            bindless_prelude,
+            bindless_timings,
+            _plans,
+            batch_uploads,
+            back,
+        ) = {
+            // The copies below see title memory as at this submission: each
+            // page's written state is asked of the kernel once for all of them
+            // (again after a step that writes title memory).
+            let sweep = crate::watch::Sweep::begin();
             let mut batch = Batch::default();
             let mut list_uploads = Vec::with_capacity(runs.len());
             for list in runs {
                 #[cfg(feature = "diagnostics")]
                 let t0 = std::time::Instant::now();
-                let uploads = list.run_deferred(&mut batch, self, &mut upload_pool);
+                let uploads =
+                    list.run_deferred(&mut batch, self, &mut upload_pool, &mut upload_arena);
                 #[cfg(feature = "diagnostics")]
                 {
                     deferred_us += t0.elapsed().as_micros() as u64;
@@ -1340,8 +1478,13 @@ impl Host {
                 }
                 list_uploads.push(uploads);
             }
-            let (bindless_prelude, bindless_timings) =
-                batch.prepare_bindless(self, &mut upload_pool, &mut list_uploads);
+            let (bindless_prelude, bindless_timings) = batch.prepare_bindless(
+                self,
+                &mut upload_pool,
+                &mut upload_arena,
+                &mut list_uploads,
+            );
+            drop(sweep);
             #[cfg(feature = "diagnostics")]
             {
                 tex_uploads += bindless_timings.uploads;
@@ -1351,8 +1494,139 @@ impl Host {
                 bindless_prelude,
                 bindless_timings,
                 batch.plans,
+                batch.uploads,
                 batch.copy_back,
             )
+        };
+        // Merge shader-written ranges per shadow buffer (preserving first-declaration
+        // order across shadows) and stage readback slots for pre-submission ("before")
+        // and post-submission ("after") bytes.
+        let mut readback_plans: Vec<ReadbackPlan> = Vec::new();
+        let mut pending_shadows: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+        type ShadowRanges = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+        let mut grouped: Vec<ShadowRanges> = Vec::new();
+        for (shadow, address, len) in back {
+            if !pending_shadows
+                .iter()
+                .any(|s| std::sync::Arc::ptr_eq(s, &shadow))
+            {
+                pending_shadows.push(shadow.clone());
+            }
+            let (from, to) = shadow.inside(address, len);
+            if from >= to {
+                continue;
+            }
+            match grouped
+                .iter_mut()
+                .find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow))
+            {
+                Some((_, ranges)) => ranges.push((from, to)),
+                None => grouped.push((shadow, vec![(from, to)])),
+            }
+        }
+        for (shadow, mut ranges) in grouped {
+            crate::shadow::merge_ranges(&mut ranges);
+            for (from, to) in ranges {
+                let len = to - from;
+                if let (
+                    Some((before_res, before_off, before_ptr)),
+                    Some((after_res, after_off, after_ptr)),
+                ) = (
+                    readback_arena.alloc(self, StagingKind::Readback, len),
+                    readback_arena.alloc(self, StagingKind::Readback, len),
+                ) {
+                    readback_plans.push(ReadbackPlan {
+                        shadow: shadow.clone(),
+                        from,
+                        len,
+                        before_res,
+                        before_off,
+                        before_ptr: before_ptr.cast_const(),
+                        after_res,
+                        after_off,
+                        after_ptr: after_ptr.cast_const(),
+                    });
+                }
+            }
+        }
+        let upload_list: Option<ID3D12CommandList> =
+            if !batch_uploads.is_empty() || !readback_plans.is_empty() {
+                let (alloc, list) = &self.shadow_upload_list;
+                // SAFETY: previous submission has finished; all resources live through wait.
+                let recorded = unsafe {
+                    alloc.Reset().and_then(|()| {
+                        list.Reset(alloc, None)?;
+                        let mut uploaded = std::collections::HashSet::new();
+                        for u in &batch_uploads {
+                            list.CopyBufferRegion(
+                                &u.shadow.buffer,
+                                u.dst_offset,
+                                &u.src,
+                                u.src_offset,
+                                u.len,
+                            );
+                            uploaded.insert(u.shadow.buffer.as_raw() as usize);
+                        }
+                        if !readback_plans.is_empty() {
+                            let mut transitioned = std::collections::HashSet::new();
+                            let mut barriers = Vec::new();
+                            for r in &readback_plans {
+                                let raw = r.shadow.buffer.as_raw() as usize;
+                                if uploaded.contains(&raw) && transitioned.insert(raw) {
+                                    barriers.push(transition(
+                                        &r.shadow.buffer,
+                                        D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                    ));
+                                }
+                            }
+                            if !barriers.is_empty() {
+                                list.ResourceBarrier(&barriers);
+                            }
+                            for r in &readback_plans {
+                                list.CopyBufferRegion(
+                                    &r.before_res,
+                                    r.before_off,
+                                    &r.shadow.buffer,
+                                    r.from as u64,
+                                    r.len as u64,
+                                );
+                            }
+                        }
+                        list.Close()
+                    })
+                };
+                if let Err(e) = recorded {
+                    fail(format_args!("shadow upload prelude did not record ({e})"));
+                }
+                list.cast().ok()
+            } else {
+                None
+            };
+        let readback_list: Option<ID3D12CommandList> = if !readback_plans.is_empty() {
+            let (alloc, list) = &self.shadow_readback_list;
+            // SAFETY: previous submission has finished; all resources live through wait.
+            let recorded = unsafe {
+                alloc.Reset().and_then(|()| {
+                    list.Reset(alloc, None)?;
+                    for r in &readback_plans {
+                        list.CopyBufferRegion(
+                            &r.after_res,
+                            r.after_off,
+                            &r.shadow.buffer,
+                            r.from as u64,
+                            r.len as u64,
+                        );
+                    }
+                    list.Close()
+                })
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("shadow readback list did not record ({e})"));
+            }
+            list.cast().ok()
+        } else {
+            None
         };
         if let Some(prelude) = bindless_prelude {
             lists.push(Some(prelude));
@@ -1385,12 +1659,17 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
+        // Run shadow uploads in a separate ExecuteCommandLists call so all
+        // default-heap buffers decay cleanly back to COMMON before the title's
+        // lists run (no fence wait needed between calls on the same queue).
+        if let Some(up) = upload_list {
+            // SAFETY: closed list; all resources stay alive until after the fence wait.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(up)]) };
+        }
+        let wait_queue = |submitted: &mut u64| {
             *submitted += 1;
-            let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
+            // SAFETY: the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1402,17 +1681,42 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
-            #[cfg(feature = "diagnostics")]
-            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+        };
+        if groups.len() == 1 {
+            // SAFETY: closed lists; separate ExecuteCommandLists calls let buffers
+            // decay to COMMON between runs and readback with a single fence wait.
+            unsafe {
+                if !groups[0].is_empty() {
+                    self.queue.ExecuteCommandLists(groups[0]);
+                }
+                if let Some(rb) = readback_list {
+                    self.queue.ExecuteCommandLists(&[Some(rb)]);
                 }
             }
-            let _ = (i, started);
+            wait_queue(&mut submitted);
+        } else {
+            for (i, group) in groups.iter().enumerate() {
+                let started = std::time::Instant::now();
+                // SAFETY: closed lists.
+                unsafe { self.queue.ExecuteCommandLists(group) };
+                wait_queue(&mut submitted);
+                #[cfg(feature = "diagnostics")]
+                if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                    for (ms, op) in runs[i].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
+                }
+                let _ = (i, started);
+            }
+            if let Some(rb) = readback_list {
+                // SAFETY: closed list.
+                unsafe { self.queue.ExecuteCommandLists(&[Some(rb)]) };
+                wait_queue(&mut submitted);
+            }
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -1440,25 +1744,27 @@ impl Host {
         upload_pool.reset();
         drop(upload_pool);
         // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done. Coalesce overlapping ranges per
-        // shadow in first-appearance order before scanning.
+        // which tell the title the GPU is done.
         let copying = std::time::Instant::now();
-        let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
-            Vec::new();
-        for (shadow, address, len) in back {
-            match grouped
-                .iter_mut()
-                .find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow))
-            {
-                Some((_, ranges)) => ranges.push((address, len)),
-                None => grouped.push((shadow, vec![(address, len)])),
-            }
-        }
-        for (shadow, ranges) in grouped {
-            let written = shadow.copy_back_ranges(&ranges);
+        for r in &readback_plans {
+            // SAFETY: the fence completed and readback_arena is still alive and mapped.
+            let (old, after) = unsafe {
+                (
+                    std::slice::from_raw_parts(r.before_ptr, r.len),
+                    std::slice::from_raw_parts(r.after_ptr, r.len),
+                )
+            };
+            let written = r.shadow.copy_back_range(r.from, old, after);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
+        for shadow in pending_shadows {
+            shadow.clear_pending();
+        }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        drop(readback_plans);
+        drop(batch_uploads);
+        upload_arena.reset();
+        readback_arena.reset();
         #[cfg(feature = "diagnostics")]
         {
             let prep_ms = (prepared - started).as_millis() as u64;
@@ -2294,6 +2600,27 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
+    /// The CPU-only UAV slot used when recording a clear. D3D12 uses
+    /// this descriptor during recording, so the next clear may reuse it.
+    pub(crate) fn clear_uav_cpu(&self) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        let heap = self
+            .clear_uav_cpu
+            .get_or_init(|| {
+                // SAFETY: plain allocation of a CPU-only view heap.
+                unsafe {
+                    host()?.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                }
+                .ok()
+            })
+            .as_ref()?;
+        // SAFETY: the list owns this heap until it is dropped.
+        Some(unsafe { heap.GetCPUDescriptorHandleForHeapStart() })
+    }
+
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
@@ -2440,6 +2767,7 @@ impl HostList {
         batch: &mut Batch,
         host: &Host,
         pool: &mut crate::texture::UploadPool,
+        upload_arena: &mut StagingArena,
     ) -> Vec<(
         std::sync::Arc<crate::texture::Staging>,
         std::sync::Arc<crate::resource::HostTexture>,
@@ -2483,20 +2811,29 @@ impl HostList {
                 } else {
                     Vec::new()
                 };
-                for (staging, copy, (from, to)) in due {
-                    let idx = prefetched.partition_point(|&(sf, _, _)| sf <= from);
+                let mut work_items = Vec::new();
+                for (due_idx, (staging, _, (from, to))) in due.iter().enumerate() {
+                    let idx = prefetched.partition_point(|&(sf, _, _)| sf <= *from);
                     let found = idx
                         .checked_sub(1)
                         .and_then(|pi| {
                             let (_, st, ref res) = prefetched[pi];
-                            (st >= to).then_some(res.as_ref()).flatten()
+                            (st >= *to).then_some(res.as_ref()).flatten()
                         })
                         .map(|(now, list)| (*now, list.as_slice()));
-                    if let Some((upload, base_offset)) =
-                        staging.refresh_with_watch(host, pool, found)
-                    {
-                        uploads.push((staging.clone(), copy.clone(), upload, base_offset));
+                    match staging.check_watch_clean(found) {
+                        Some(None) => {}
+                        Some(Some(now)) => {
+                            work_items.push((due_idx, (*staging).clone(), Some(now)))
+                        }
+                        None => work_items.push((due_idx, (*staging).clone(), None)),
                     }
+                }
+                for (due_idx, upload, base_offset) in
+                    crate::texture::refresh_batch(host, pool, work_items)
+                {
+                    let (staging, copy, _) = due[due_idx];
+                    uploads.push((staging.clone(), copy.clone(), upload, base_offset));
                 }
                 continue;
             }
@@ -2510,7 +2847,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.copy_written(dst, len);
+                    batch.copy_written(host, upload_arena, dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2534,7 +2871,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                        batch.title_written(host, upload_arena);
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -2545,7 +2882,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    batch.gpu_write(shadow, *address, *len);
+                    batch.gpu_write(host, upload_arena, shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(..) => continue,
@@ -2572,6 +2909,8 @@ impl HostList {
 struct Batch {
     /// Per copy, `[from, to)` ranges in the order they came.
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)>,
+    /// Staged GPU upload copies to record on the shadow upload prelude list.
+    uploads: Vec<crate::shadow::UploadCopy>,
     /// Staging buffers (by address) refreshed since the last overlapping title
     /// write, mapped to the title memory `(start, end)` they cover.
     textures: std::collections::HashMap<usize, (usize, usize)>,
@@ -2661,31 +3000,35 @@ impl Batch {
     ) {
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if self.write_ranges.insert(key) {
-            shadow.writing(address, len);
+            shadow.mark_pending(address, len);
             self.copy_back.push((shadow.clone(), address, len));
         }
     }
 
     fn gpu_write(
         &mut self,
+        host: &Host,
+        upload_arena: &mut StagingArena,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
         // Flush only pending refreshes on `shadow` whose pages overlap this
         // GPU write range before declaring it busy.
-        self.flush_shadow_overlapping(shadow, address, address.saturating_add(len));
+        self.flush_shadow_overlapping(host, upload_arena, shadow, address, address.saturating_add(len));
         self.record_write(shadow, address, len);
     }
 
     /// Before a known copy into title memory `[start, start + len)`: flush only
-    /// overlapping pending refreshes and invalidate only overlapping textures.
-    fn copy_written(&mut self, start: usize, len: usize) {
+    /// overlapping pending refreshes, invalidate overlapping textures and
+    /// write-watch sweep pages.
+    fn copy_written(&mut self, host: &Host, upload_arena: &mut StagingArena, start: usize, len: usize) {
         if len == 0 {
             return;
         }
         let end = start.saturating_add(len);
-        self.flush_overlapping(start, end);
+        self.flush_overlapping(host, upload_arena, start, end);
+        crate::watch::Sweep::invalidate(start, len);
         let (p_start, p_end) = (start / crate::watch::PAGE, end.div_ceil(crate::watch::PAGE));
         self.textures.retain(|_, &mut (ts, te)| {
             if ts >= te {
@@ -2698,25 +3041,35 @@ impl Batch {
     }
 
     /// Before a step that may arbitrarily write title memory (`Step::Run`):
-    /// pending refreshes are done first, and textures are checked again after it.
-    fn title_written(&mut self) {
-        self.flush();
+    /// pending refreshes are done first, and textures and write-watch sweep
+    /// pages are checked again after it.
+    fn title_written(&mut self, host: &Host, upload_arena: &mut StagingArena) {
+        self.flush(host, upload_arena);
         self.textures.clear();
+        crate::watch::Sweep::title_written();
     }
 
-    fn flush(&mut self) {
-        self.flush_matching(|_, _, _| true);
+    fn flush(&mut self, host: &Host, upload_arena: &mut StagingArena) {
+        self.flush_matching(host, upload_arena, |_, _, _| true);
     }
 
-    fn flush_overlapping(&mut self, start: usize, end: usize) {
+    fn flush_overlapping(
+        &mut self,
+        host: &Host,
+        upload_arena: &mut StagingArena,
+        start: usize,
+        end: usize,
+    ) {
         let (p_start, p_end) = (start / crate::watch::PAGE, end.div_ceil(crate::watch::PAGE));
-        self.flush_matching(|_, from, to| {
+        self.flush_matching(host, upload_arena, |_, from, to| {
             from / crate::watch::PAGE < p_end && p_start < to.div_ceil(crate::watch::PAGE)
         });
     }
 
     fn flush_shadow_overlapping(
         &mut self,
+        host: &Host,
+        upload_arena: &mut StagingArena,
         target: &std::sync::Arc<crate::shadow::Shadow>,
         start: usize,
         end: usize,
@@ -2725,7 +3078,7 @@ impl Batch {
             return;
         }
         let (p_start, p_end) = (start / crate::watch::PAGE, end.div_ceil(crate::watch::PAGE));
-        self.flush_matching(|s, from, to| {
+        self.flush_matching(host, upload_arena, |s, from, to| {
             std::sync::Arc::ptr_eq(s, target)
                 && from / crate::watch::PAGE < p_end
                 && p_start < to.div_ceil(crate::watch::PAGE)
@@ -2734,6 +3087,8 @@ impl Batch {
 
     fn flush_matching(
         &mut self,
+        host: &Host,
+        upload_arena: &mut StagingArena,
         mut pred: impl FnMut(&std::sync::Arc<crate::shadow::Shadow>, usize, usize) -> bool,
     ) {
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)> = Vec::new();
@@ -2772,7 +3127,14 @@ impl Batch {
         };
         for (shadow, due) in work {
             for (from, to) in due {
-                update_with_prefetched(&shadow, from, to, &prefetched);
+                update_with_prefetched(
+                    &shadow,
+                    from,
+                    to,
+                    &prefetched,
+                    &mut |n| upload_arena.alloc(host, StagingKind::Upload, n),
+                    &mut self.uploads,
+                );
             }
         }
     }
@@ -2780,12 +3142,13 @@ impl Batch {
     /// After every list's steps (no title copy follows): each directly
     /// indexed heap's slots, once per submission however many lists and
     /// draws use it. Plan reads coalesce into `self.refreshes` before a single
-    /// flush, writable snapshots pre-size once per shadow, and deduplicated
+    /// flush, writable ranges mark pending once per shadow, and deduplicated
     /// placed textures refresh & upload once per submission via prefetched watch.
     fn prepare_bindless(
         &mut self,
         host: &Host,
         pool: &mut crate::texture::UploadPool,
+        upload_arena: &mut StagingArena,
         list_uploads: &mut [Vec<ListUpload>],
     ) -> (Option<ID3D12CommandList>, BindlessTimings) {
         #[allow(unused_mut)]
@@ -2816,7 +3179,7 @@ impl Batch {
 
         #[cfg(feature = "diagnostics")]
         let t_flush = std::time::Instant::now();
-        self.flush();
+        self.flush(host, upload_arena);
         #[cfg(feature = "diagnostics")]
         {
             timings.flush_us = t_flush.elapsed().as_micros() as u64;
@@ -2827,8 +3190,6 @@ impl Batch {
 
         #[cfg(feature = "diagnostics")]
         let t_snap = std::time::Instant::now();
-        let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
-            Vec::new();
         for (plan, writes) in &pending_plans {
             if !*writes {
                 continue;
@@ -2837,21 +3198,8 @@ impl Batch {
                 if len == 0 {
                     continue;
                 }
-                let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-                if self.write_ranges.insert(key) {
-                    self.copy_back.push((shadow.clone(), address, len));
-                    match grouped
-                        .iter_mut()
-                        .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
-                    {
-                        Some((_, ranges)) => ranges.push((address, len)),
-                        None => grouped.push((shadow.clone(), vec![(address, len)])),
-                    }
-                }
+                self.record_write(shadow, address, len);
             }
-        }
-        for (shadow, ranges) in grouped {
-            shadow.writing_batch(&ranges);
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -2880,14 +3228,15 @@ impl Batch {
             Vec::new()
         };
         let mut seen_copies = std::collections::HashSet::<usize>::new();
-        let mut bindless_uploads: Vec<BindlessUpload> = Vec::new();
-        let mut state_transitions: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32)> =
-            Vec::new();
+        let mut unique_targets = Vec::new();
+        let mut work_items = Vec::new();
         for (plan, _) in &pending_plans {
             for target in &plan.placed_textures {
                 if !seen_copies.insert(std::sync::Arc::as_ptr(&target.copy) as usize) {
                     continue;
                 }
+                let target_idx = unique_targets.len();
+                unique_targets.push(target);
                 if let (Some(staging), Some((from, to))) = (&target.staging, target.watch_range)
                     && !crate::texture::is_host_written(target.resource)
                     && self.texture_due_range(staging, (from, to))
@@ -2900,27 +3249,44 @@ impl Batch {
                             (st >= to).then_some(res.as_ref()).flatten()
                         })
                         .map(|(now, list)| (*now, list.as_slice()));
-                    if let Some((upload, base_offset)) =
-                        staging.refresh_with_watch(host, pool, found)
-                    {
-                        for uploads in list_uploads.iter_mut() {
-                            uploads.retain(|(_, c, _, _)| !std::sync::Arc::ptr_eq(c, &target.copy));
+                    match staging.check_watch_clean(found) {
+                        Some(None) => {}
+                        Some(Some(now)) => {
+                            work_items.push((target_idx, staging.clone(), Some(now)))
                         }
-                        bindless_uploads.push((
-                            staging.clone(),
-                            target.copy.clone(),
-                            upload,
-                            base_offset,
-                            target.srv_state,
-                        ));
-                        continue;
+                        None => work_items.push((target_idx, staging.clone(), None)),
                     }
                 }
-                if target.srv_state != 0
-                    && target.copy.state.load(Ordering::Relaxed) != target.srv_state
-                {
-                    state_transitions.push((target.copy.clone(), target.srv_state));
+            }
+        }
+        let mut uploaded_flags = vec![false; unique_targets.len()];
+        let mut bindless_uploads: Vec<BindlessUpload> = Vec::new();
+        let mut state_transitions: Vec<(std::sync::Arc<crate::resource::HostTexture>, u32)> =
+            Vec::new();
+        for (target_idx, upload, base_offset) in
+            crate::texture::refresh_batch(host, pool, work_items)
+        {
+            let target = unique_targets[target_idx];
+            if let Some(staging) = &target.staging {
+                uploaded_flags[target_idx] = true;
+                for uploads in list_uploads.iter_mut() {
+                    uploads.retain(|(_, c, _, _)| !std::sync::Arc::ptr_eq(c, &target.copy));
                 }
+                bindless_uploads.push((
+                    staging.clone(),
+                    target.copy.clone(),
+                    upload,
+                    base_offset,
+                    target.srv_state,
+                ));
+            }
+        }
+        for (target_idx, target) in unique_targets.into_iter().enumerate() {
+            if !uploaded_flags[target_idx]
+                && target.srv_state != 0
+                && target.copy.state.load(Ordering::Relaxed) != target.srv_state
+            {
+                state_transitions.push((target.copy.clone(), target.srv_state));
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -2977,10 +3343,12 @@ type PrefetchedWatch = (usize, usize, WatchAnswer);
 /// Brings `[from, to)` of a host copy up to date, reusing a pre-fetched
 /// cross-shadow `watch::writes` answer when `[from, to)` is covered.
 fn update_with_prefetched(
-    shadow: &crate::shadow::Shadow,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
     from: usize,
     to: usize,
     prefetched: &[PrefetchedWatch],
+    alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
+    out: &mut Vec<crate::shadow::UploadCopy>,
 ) {
     let idx = prefetched.partition_point(|&(sf, _, _)| sf <= from);
     let found = idx
@@ -2991,22 +3359,10 @@ fn update_with_prefetched(
         })
         .map(|(now, list)| (*now, list.as_slice()));
     let started = std::time::Instant::now();
-    let copied = shadow.update_with_watch(from, to - from, found);
+    let copied = shadow.update_with_watch(from, to - from, found, alloc, out);
     let us = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
     crate::copystat::range(from, to - from, us, 0);
-    PREPARING[0].fetch_add(us, Ordering::Relaxed);
-    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-}
-
-/// Brings `[from, from + len)` of a host copy up to date now.
-#[allow(dead_code)]
-fn update(shadow: &crate::shadow::Shadow, from: usize, len: usize) {
-    let started = std::time::Instant::now();
-    let copied = shadow.update(from, len);
-    let us = started.elapsed().as_micros() as u64;
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::range(from, len, us, 0);
     PREPARING[0].fetch_add(us, Ordering::Relaxed);
     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
 }
@@ -3688,6 +4044,59 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// A buffer in GPU-local VRAM (`D3D12_HEAP_TYPE_DEFAULT`) with unordered
+    /// access enabled: for host copies of title buffers, uploaded via staging
+    /// copies on submission. Starts in `COMMON` (buffers promote/decay cleanly).
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer(size)
+    }
+
+    /// A buffer in the readback heap, persistently mapped for CPU reading.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a readback buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
+                None
+            }
+        }
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
@@ -4025,7 +4434,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
-        batch.title_written();
+        assert!(batch.refreshes.is_empty());
+        batch.textures.clear();
+        crate::watch::Sweep::title_written();
         assert!(batch.texture_due(&a));
         assert!(!batch.texture_due(&a));
         // A fresh submission starts over.
@@ -4040,12 +4451,24 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let p = crate::watch::PAGE;
         assert!(batch.texture_due_range(&a, (0x10_0000, 0x10_0000 + p)));
         assert!(batch.texture_due_range(&b, (0x20_0000, 0x20_0000 + p)));
+        let invalidate = |batch: &mut Batch, start: usize, len: usize| {
+            let end = start.saturating_add(len);
+            let (p_start, p_end) = (start / crate::watch::PAGE, end.div_ceil(crate::watch::PAGE));
+            batch.textures.retain(|_, &mut (ts, te)| {
+                if ts >= te {
+                    return true;
+                }
+                let t_start = ts / crate::watch::PAGE;
+                let t_end = te.div_ceil(crate::watch::PAGE);
+                t_end <= p_start || p_end <= t_start
+            });
+        };
         // Writing to an unrelated range leaves both textures cached.
-        batch.copy_written(0x30_0000, 4096);
+        invalidate(&mut batch, 0x30_0000, 4096);
         assert!(!batch.texture_due_range(&a, (0x10_0000, 0x10_0000 + p)));
         assert!(!batch.texture_due_range(&b, (0x20_0000, 0x20_0000 + p)));
         // Writing onto `a`'s page invalidates only `a`.
-        batch.copy_written(0x10_0100, 256);
+        invalidate(&mut batch, 0x10_0100, 256);
         assert!(batch.texture_due_range(&a, (0x10_0000, 0x10_0000 + p)));
         assert!(!batch.texture_due_range(&b, (0x20_0000, 0x20_0000 + p)));
     }
@@ -4056,7 +4479,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
-        let Some(_host) = super::host() else {
+        let Some(host) = super::host() else {
             return;
         };
         let p = crate::watch::PAGE;
@@ -4081,13 +4504,25 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let s2 = crate::shadow::find((base + p) as u64, p as u64).unwrap();
 
         let asked = crate::watch::kernel_asked();
+        let mut arena = super::StagingArena::default();
         let mut batch = Batch::default();
         batch.add(&s1, base, p);
         batch.add(&s2, base + p, p);
-        batch.flush();
+        batch.flush(host, &mut arena);
         assert_eq!(crate::watch::kernel_asked(), asked + 1);
-        assert_eq!(s1.read_u32(0), 0x1111_1111);
-        assert_eq!(s2.read_u32(0), 0x2222_2222);
+        assert_eq!(batch.uploads.len(), 2);
+        let read_staged_u32 = |u: &crate::shadow::UploadCopy| -> u32 {
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: upload buffer mapped for at least `src_offset + 4` bytes.
+            unsafe {
+                u.src.Map(0, None, Some(&mut ptr)).unwrap();
+                let val = ptr.cast::<u8>().add(u.src_offset as usize).cast::<u32>().read_unaligned();
+                u.src.Unmap(0, None);
+                val
+            }
+        };
+        assert_eq!(read_staged_u32(&batch.uploads[0]), 0x1111_1111);
+        assert_eq!(read_staged_u32(&batch.uploads[1]), 0x2222_2222);
 
         crate::shadow::unregister(0x7001_0001, base as u64);
         crate::shadow::unregister(0x7001_0002, (base + p) as u64);

@@ -39,13 +39,132 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// The thread preparing a submission ([`Sweep`]), if one is.
+    sweeper: Option<std::thread::ThreadId>,
+    /// Page ranges that thread asked the kernel about in this sweep
+    /// (sorted, disjoint, end exclusive).
+    swept: Vec<(usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    sweeper: None,
+    swept: Vec::new(),
 });
+
+/// While alive, the calling thread prepares one submission: the title's
+/// writes it must see were all made before the submission began (but for
+/// steps the preparation runs itself, [`Sweep::title_written`] and
+/// [`Sweep::invalidate`]), so a page the kernel was asked about once in the
+/// sweep need not be asked about again.
+pub(crate) struct Sweep(());
+
+impl Sweep {
+    pub(crate) fn begin() -> Self {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.sweeper = Some(std::thread::current().id());
+        j.swept.clear();
+        Sweep(())
+    }
+
+    /// The thread in a sweep is about to write title memory itself (a step
+    /// run on the CPU between lists): what it asked about before must be
+    /// asked about again.
+    pub(crate) fn title_written() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if j.sweeper == Some(std::thread::current().id()) {
+            j.swept.clear();
+        }
+    }
+
+    /// The thread in a sweep is about to write title memory `[start, start + len)`:
+    /// drop only overlapping pages from `swept` so later askings re-query them.
+    pub(crate) fn invalidate(start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let first = start / PAGE;
+        let last = start.saturating_add(len).div_ceil(PAGE);
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if j.sweeper == Some(std::thread::current().id()) {
+            sweep_out(&mut j.swept, first, last);
+        }
+    }
+}
+
+impl Drop for Sweep {
+    fn drop(&mut self) {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.sweeper = None;
+        j.swept.clear();
+    }
+}
+
+/// The parts of `[first, last)` not in `swept` (sorted, disjoint).
+fn gaps(swept: &[(usize, usize)], first: usize, last: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = first;
+    for &(a, e) in swept {
+        if e <= at {
+            continue;
+        }
+        if a >= last {
+            break;
+        }
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(e);
+        if at >= last {
+            break;
+        }
+    }
+    if at < last {
+        out.push((at, last));
+    }
+    out
+}
+
+/// Adds `[first, last)` to `swept`, keeping it sorted and disjoint.
+fn sweep_in(swept: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let i = swept.partition_point(|&(_, e)| e < first);
+    let mut j = i;
+    let (mut a, mut e) = (first, last);
+    while j < swept.len() && swept[j].0 <= e {
+        a = a.min(swept[j].0);
+        e = e.max(swept[j].1);
+        j += 1;
+    }
+    swept.splice(i..j, [(a, e)]);
+}
+
+/// Removes `[first, last)` from `swept`, keeping it sorted and disjoint.
+fn sweep_out(swept: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    if first >= last || swept.is_empty() {
+        return;
+    }
+    let i = swept.partition_point(|&(_, e)| e <= first);
+    let mut j = i;
+    let mut replacement = Vec::new();
+    while j < swept.len() && swept[j].0 < last {
+        let (a, e) = swept[j];
+        if a < first {
+            replacement.push((a, first));
+        }
+        if e > last {
+            replacement.push((last, e));
+        }
+        j += 1;
+    }
+    if i < j {
+        swept.splice(i..j, replacement);
+    }
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -99,80 +218,107 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } else {
         None
     };
-    let (count, guarded_pages) = if let Some(pages) = known_view_pages {
-        (0, pages)
+    let (found_pages, guarded_pages) = if let Some(pages) = known_view_pages {
+        (Vec::new(), pages)
     } else {
-        let mut count = (last - first) * PAGE / KERNEL_PAGE;
-        j.found.resize(count.max(j.found.len()), 0);
-        let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        #[cfg(test)]
-        tests::KERNEL_ASKED.with(|n| n.set(n.get() + 1));
-        // SAFETY: the answer buffer holds `count` entries.
-        let failed = unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
-        let guarded_pages = if !failed {
+        // In a sweep, only what this thread has not asked about yet in it.
+        let sweeping = j.sweeper == Some(std::thread::current().id());
+        let asks = if sweeping {
+            gaps(&j.swept, first, last)
+        } else {
+            vec![(first, last)]
+        };
+        let mut found: Vec<usize> = Vec::new();
+        let mut not_watched = false;
+        for &(a, e) in &asks {
+            let mut count = (e - a) * PAGE / KERNEL_PAGE;
+            j.found.resize(count.max(j.found.len()), 0);
+            let mut granularity = 0;
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            #[cfg(test)]
+            tests::KERNEL_ASKED.with(|n| n.set(n.get() + 1));
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    (a * PAGE) as *const _,
+                    (e - a) * PAGE,
+                    j.found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            if !failed {
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add, direct_ok_range};
+                    let us = started.elapsed().as_micros() as u64;
+                    let len = (e - a) * PAGE;
+                    add(C::WatchDirectOk, 1);
+                    add(C::WatchDirectOkUs, us);
+                    add(C::WatchDirectBytes, len as u64);
+                    direct_ok_range(a * PAGE, len, us);
+                }
+                found.extend(j.found[..count].iter().map(|&at| at / PAGE));
+            } else {
+                #[cfg(feature = "diagnostics")]
+                let phase_started = std::time::Instant::now();
+                match by_allocation(a * PAGE, e * PAGE, &mut j.found) {
+                    Some(pages) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            use crate::copystat::{C, add};
+                            add(C::WatchByAlloc, 1);
+                            add(C::WatchByAllocUs, phase_started.elapsed().as_micros() as u64);
+                        }
+                        found.extend(pages);
+                    }
+                    None => {
+                        not_watched = true;
+                    }
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
-                use crate::copystat::{C, add, direct_ok_range};
-                let us = started.elapsed().as_micros() as u64;
-                let len = (last - first) * PAGE;
-                add(C::WatchDirectOk, 1);
-                add(C::WatchDirectOkUs, us);
-                add(C::WatchDirectBytes, len as u64);
-                direct_ok_range(first * PAGE, len, us);
+                use crate::copystat::{C, add};
+                add(C::Watches, 1);
+                add(C::WatchUs, started.elapsed().as_micros() as u64);
+            }
+            if not_watched {
+                break;
+            }
+        }
+        let guarded_pages = if not_watched {
+            // Not write-watched memory (the kernel answers for a whole
+            // allocation or not at all), so none of the range went in `swept`.
+            found.clear();
+            if !guarded {
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            let guard_started = std::time::Instant::now();
+            let pages = guard(first * PAGE, last * PAGE)?;
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::WatchGuardFallback, 1);
+                add(C::WatchGuardFallbackUs, guard_started.elapsed().as_micros() as u64);
+            }
+            pages
+        } else {
+            if sweeping {
+                for &(a, e) in &asks {
+                    sweep_in(&mut j.swept, a, e);
+                }
             }
             Vec::new()
-        } else {
-            count = 0;
-            #[cfg(feature = "diagnostics")]
-            let phase_started = std::time::Instant::now();
-            match by_allocation(first * PAGE, last * PAGE, &mut j.found) {
-                Some(pages) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        use crate::copystat::{C, add};
-                        add(C::WatchByAlloc, 1);
-                        add(C::WatchByAllocUs, phase_started.elapsed().as_micros() as u64);
-                    }
-                    pages
-                }
-                None if !guarded => return None,
-                None => {
-                    let pages = guard(first * PAGE, last * PAGE)?;
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        use crate::copystat::{C, add};
-                        add(C::WatchGuardFallback, 1);
-                        add(C::WatchGuardFallbackUs, phase_started.elapsed().as_micros() as u64);
-                    }
-                    pages
-                }
-            }
         };
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::WatchUs, started.elapsed().as_micros() as u64);
-        }
-        (count, guarded_pages)
+        (found, guarded_pages)
     };
     j.asked += 1;
     let now = j.asked;
-    for &at in &j.found[..count] {
-        j.written.insert(at / PAGE, now);
-    }
-    for page in guarded_pages {
+    for page in found_pages.into_iter().chain(guarded_pages) {
         j.written.insert(page, now);
     }
     Some((
@@ -1462,5 +1608,85 @@ mod tests {
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
         forget_journal(v, 2 * BLOCK);
         title_memory_remapped(v, 2 * BLOCK);
+    }
+
+    #[test]
+    fn gaps_and_sweeps_keep_ranges_disjoint() {
+        let mut s = Vec::new();
+        assert_eq!(gaps(&s, 0, 10), [(0, 10)]);
+        sweep_in(&mut s, 4, 6);
+        sweep_in(&mut s, 10, 12);
+        assert_eq!(gaps(&s, 0, 20), [(0, 4), (6, 10), (12, 20)]);
+        assert_eq!(gaps(&s, 4, 6), []);
+        assert_eq!(gaps(&s, 5, 11), [(6, 10)]);
+        sweep_in(&mut s, 6, 10); // touching both: one range
+        assert_eq!(s, [(4, 12)]);
+        sweep_in(&mut s, 0, 2);
+        sweep_in(&mut s, 1, 5);
+        assert_eq!(s, [(0, 12)]);
+        sweep_out(&mut s, 3, 7);
+        assert_eq!(s, [(0, 3), (7, 12)]);
+        sweep_out(&mut s, 2, 8);
+        assert_eq!(s, [(0, 2), (8, 12)]);
+    }
+
+    /// A fresh write-watched allocation of `pages` pages. Never freed: the
+    /// journal keeps its pages, and a later test given the same addresses
+    /// would find them written.
+    fn watched(pages: usize) -> usize {
+        // SAFETY: a fresh allocation, kept for the rest of the run.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                pages * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        p
+    }
+
+    /// In a sweep a nested range is not asked about again, yet sees what
+    /// the outer asking found; after the sweep the kernel is asked as before.
+    #[test]
+    fn a_sweep_shares_the_kernels_answer_with_nested_ranges() {
+        let p = watched(4);
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 2 * PAGE) as *mut u8).write(1) };
+        let sweep = Sweep::begin();
+        let (outer, all) = writes(p, p + 4 * PAGE, false).expect("watched");
+        assert_eq!(all, [(p / PAGE + 2, outer)]);
+        // Written after the outer asking by another party, inside the
+        // sweep: seen from the next submission's sweep on.
+        // SAFETY: as above.
+        unsafe { ((p + 3 * PAGE) as *mut u8).write(1) };
+        let (inner, nested) = writes(p + 2 * PAGE, p + 4 * PAGE, false).expect("watched");
+        assert!(inner > outer);
+        assert_eq!(nested, [(p / PAGE + 2, outer)]);
+        drop(sweep);
+        let (later, after) = writes(p + 2 * PAGE, p + 4 * PAGE, false).expect("watched");
+        assert_eq!(after, [(p / PAGE + 2, outer), (p / PAGE + 3, later)]);
+    }
+
+    /// A write the sweeping thread makes itself (after `title_written` or
+    /// `invalidate`) is seen by the next asking in the same sweep.
+    #[test]
+    fn a_sweep_asks_again_after_its_own_write() {
+        let p = watched(3);
+        let sweep = Sweep::begin();
+        let (_, before) = writes(p, p + 3 * PAGE, false).expect("watched");
+        assert!(before.is_empty());
+        Sweep::invalidate(p + PAGE, PAGE);
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE) as *mut u8).write(1) };
+        let (inv, after_inv) = writes(p, p + 3 * PAGE, false).expect("watched");
+        assert_eq!(after_inv, [(p / PAGE + 1, inv)]);
+        Sweep::title_written();
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 2 * PAGE) as *mut u8).write(1) };
+        let (now, after) = writes(p, p + 3 * PAGE, false).expect("watched");
+        assert_eq!(after, [(p / PAGE + 1, inv), (p / PAGE + 2, now)]);
+        drop(sweep);
     }
 }
