@@ -110,8 +110,21 @@ struct Totals {
     files_with_shaders: usize,
 }
 
-pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
+pub fn run(
+    paths: Vec<PathBuf>,
+    verbose: bool,
+    disasm: bool,
+    hash: Option<String>,
+) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let hash_filters: Vec<String> = hash
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut t = Totals::default();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -138,6 +151,10 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
+                let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                if !hash_filters.is_empty() && !hash_filters.iter().any(|p| hash.starts_with(p)) {
+                    continue;
+                }
                 found_here += 1;
                 t.containers += 1;
                 let dxil = container.part(FourCC::DXIL);
@@ -208,7 +225,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    println!("{}{} [{hash}]: {line}", path.display(), source.label());
                     for l in &listing {
                         println!("{l}");
                     }

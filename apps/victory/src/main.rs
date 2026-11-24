@@ -83,6 +83,9 @@ enum Command {
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Only inspect containers whose blake3 hash prefix matches (comma-separated).
+        #[arg(long)]
+        hash: Option<String>,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -169,7 +172,8 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+            hash,
+        } => shader::run(paths, verbose || disasm, disasm, hash),
         Command::Translate {
             paths,
             validate,
