@@ -82,6 +82,7 @@ fn write_cache_warms_each_distinct_container_once() {
     let scan = |cache| {
         let seen = Mutex::default();
         let mut checks = Checks {
+            hashes: None,
             keep: None,
             validator: None,
             host: None,
@@ -108,4 +109,51 @@ fn write_cache_warms_each_distinct_container_once() {
     assert_eq!((cold.cached, cold.duplicates), (2, 1));
     assert_eq!((warm.cache_hits, warm.duplicates), (2, 1));
     assert_eq!((survey.cs_emitted, survey.duplicates), (1, 2));
+}
+
+#[test]
+fn filters_shared_dxil_containers_by_runtime_hash_before_deduplication() {
+    let first = container(1);
+    let second = container(2);
+    let first_hash = blake3::hash(&first).to_hex()[..16].to_owned();
+    let second_hash = blake3::hash(&second).to_hex()[..16].to_owned();
+    let scan = |hashes: Option<&[String]>| {
+        let seen = Mutex::default();
+        let mut checks = Checks {
+            hashes,
+            keep: None,
+            validator: None,
+            host: None,
+            cache: None,
+        };
+        let mut t = Tally::default();
+        for data in [&first, &second, &second] {
+            translate(
+                &Source::Raw { offset: 0, data },
+                Path::new("synthetic"),
+                &seen,
+                &mut t,
+                &mut checks,
+            );
+        }
+        (t.containers, t.cs_emitted, t.duplicates)
+    };
+    assert_eq!(scan(Some(&[second_hash[..12].into()])), (2, 1, 1));
+    assert_eq!(scan(Some(&[first_hash, second_hash])), (3, 2, 1));
+    assert_eq!(scan(Some(&["ffffffffffffffff".into()])), (0, 0, 0));
+    assert_eq!(scan(Some(&[])), (0, 0, 0));
+    assert_eq!(scan(None), (3, 1, 2));
+}
+
+#[test]
+fn combines_command_line_and_commented_hash_file() {
+    let path = std::env::temp_dir().join(format!("victory-hashes-{}.txt", std::process::id()));
+    fs::write(&path, "\u{feff}# header\r\n\n Cc, DD\tee # ff\r\n11").unwrap();
+    let options = HashOptions {
+        hash: Some(" A, b".into()),
+        hash_file: Some(path.clone()),
+    };
+    let parsed = options.prefixes();
+    fs::remove_file(path).unwrap();
+    assert_eq!(parsed.unwrap().unwrap(), ["a", "b", "cc", "dd", "ee", "11"]);
 }

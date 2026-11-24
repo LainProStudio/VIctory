@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_gpu::shader_cache;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
@@ -186,6 +186,7 @@ impl<'a> PairShaders<'a> {
 
 /// The optional checks and outputs after emission, one set per worker thread.
 struct Checks<'a> {
+    hashes: Option<&'a [String]>,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<&'a Mutex<PairShaders<'a>>>,
@@ -276,6 +277,34 @@ impl WorkQueue {
     }
 }
 
+#[derive(clap::Args)]
+pub struct HashOptions {
+    /// Only translate matching container hash prefixes (comma-separated).
+    #[arg(long)]
+    hash: Option<String>,
+    /// Additional prefixes separated by whitespace or commas; # starts a comment.
+    #[arg(long)]
+    hash_file: Option<PathBuf>,
+}
+
+impl HashOptions {
+    fn prefixes(&self) -> Result<Option<Vec<String>>> {
+        let mut prefixes = crate::shader::hash_prefixes(self.hash.as_deref().unwrap_or_default());
+        if let Some(path) = &self.hash_file {
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("reading hash file {}", path.display()))?;
+            for line in contents.trim_start_matches('\u{feff}').lines() {
+                let body = line.split('#').next().unwrap_or_default();
+                prefixes.extend(
+                    body.split_whitespace()
+                        .flat_map(crate::shader::hash_prefixes),
+                );
+            }
+        }
+        Ok((self.hash_file.is_some() || !prefixes.is_empty()).then_some(prefixes))
+    }
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -283,7 +312,9 @@ pub fn run(
     list: bool,
     write_cache: bool,
     jobs: Option<usize>,
+    hashes: HashOptions,
 ) -> Result<()> {
+    let hashes = hashes.prefixes()?;
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -297,9 +328,7 @@ pub fn run(
     if pipelines {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         shader_cache::set_wave64_mode(host.recommended_wave64_mode());
-    } else if write_cache
-        && let Ok(host) = Host::new(false)
-    {
+    } else if write_cache && let Ok(host) = Host::new(false) {
         shader_cache::set_wave64_mode(host.recommended_wave64_mode());
     }
     let cache = if write_cache {
@@ -333,6 +362,7 @@ pub fn run(
                     ..Tally::default()
                 };
                 let mut checks = Checks {
+                    hashes: hashes.as_deref(),
                     keep: (!pairs.is_empty()).then_some(&kept),
                     validator: validate
                         .then(|| Validator::load(dll.as_deref()).ok())
@@ -504,6 +534,12 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    let full_hash = checks.hashes.map(|_| blake3::hash(&bytes));
+    if let (Some(prefixes), Some(hash)) = (checks.hashes, full_hash)
+        && !crate::shader::matches_hash(prefixes, &hash.to_hex()[..16])
+    {
+        return;
+    }
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -513,8 +549,12 @@ fn translate(
     };
     // The runtime cache keys on the complete container, including its other parts.
     let container_bytes = &bytes[..container.total_size];
-    let input = if checks.cache.is_some() { container_bytes } else { dxil };
-    let hash = blake3::hash(input);
+    let input = if checks.cache.is_some() {
+        container_bytes
+    } else {
+        dxil
+    };
+    let hash = full_hash.unwrap_or_else(|| blake3::hash(input));
     if !lock(seen).insert(hash) {
         t.duplicates += 1;
         return;
@@ -905,6 +945,7 @@ mod tests {
         ];
         let kept = Mutex::new(PairShaders::new(&pairs));
         let mut checks = Checks {
+            hashes: None,
             keep: Some(&kept),
             validator: None,
             host: None,

@@ -91,6 +91,8 @@ enum Command {
     /// translator and report what it cannot handle yet.
     Translate {
         paths: Vec<PathBuf>,
+        #[command(flatten)]
+        hashes: translate::HashOptions,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
         /// else the newest Windows SDK's).
         #[arg(long)]
@@ -176,12 +178,13 @@ fn main() -> Result<()> {
         } => shader::run(paths, verbose || disasm, disasm, hash),
         Command::Translate {
             paths,
+            hashes,
             validate,
             pipelines,
             list,
             write_cache,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, write_cache, jobs),
+        } => translate::run(paths, validate, pipelines, list, write_cache, jobs, hashes),
         Command::Run {
             exe,
             unimplemented,

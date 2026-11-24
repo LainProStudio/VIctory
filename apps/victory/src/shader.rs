@@ -110,21 +110,22 @@ struct Totals {
     files_with_shaders: usize,
 }
 
-pub fn run(
-    paths: Vec<PathBuf>,
-    verbose: bool,
-    disasm: bool,
-    hash: Option<String>,
-) -> Result<()> {
+pub(crate) fn hash_prefixes(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+pub(crate) fn matches_hash(prefixes: &[String], hash: &str) -> bool {
+    prefixes.iter().any(|prefix| hash.starts_with(prefix))
+}
+
+pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, hash: Option<String>) -> Result<()> {
     let paths = crate::default_paths(paths)?;
-    let hash_filters: Vec<String> = hash
-        .map(|s| {
-            s.split(',')
-                .map(|p| p.trim().to_ascii_lowercase())
-                .filter(|p| !p.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let hash_filters = hash_prefixes(hash.as_deref().unwrap_or_default());
     let mut t = Totals::default();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -152,7 +153,7 @@ pub fn run(
                     continue;
                 };
                 let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
-                if !hash_filters.is_empty() && !hash_filters.iter().any(|p| hash.starts_with(p)) {
+                if !hash_filters.is_empty() && !matches_hash(&hash_filters, &hash) {
                     continue;
                 }
                 found_here += 1;
