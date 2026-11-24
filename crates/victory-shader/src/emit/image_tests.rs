@@ -272,14 +272,6 @@ fn run(
 ) -> Result<Vec<u32>, String> {
     let s = translate(inst, literals).map_err(|e| e.to_string())?;
     let (root, pso) = host.compute_pipeline(&s)?;
-    let mut data = vec![0; s.user_data_dwords().max(1) as usize];
-    for u in &s.user_data {
-        data[u.index as usize] = match u.slot {
-            1 | 2 => 0,
-            3 => 2 * 32,
-            n => panic!("user data of slot {n}"),
-        };
-    }
     let words: Vec<u32> = addr.iter().flatten().copied().collect();
     let views = [
         image,
@@ -289,13 +281,27 @@ fn run(
         },
         out,
     ];
+    let samplers = [sampler];
+    let mut data = vec![0; s.user_data_dwords().max(1) as usize];
+    for u in &s.user_data {
+        data[u.index as usize] = if let Some(g) = super::host::guard(u.root, views.len(), samplers.len())
+        {
+            g
+        } else {
+            match u.slot {
+                1 | 2 => 0,
+                3 => 2 * 32,
+                n => panic!("user data of slot {n}"),
+            }
+        };
+    }
     let out = host.dispatch(
         &root,
         &pso,
         &Dispatch {
             roots: vec![(0, Root::Constants(data))],
             views: &views,
-            samplers: &[sampler],
+            samplers: &samplers,
             groups: [1, 1, 1],
         },
     )?;

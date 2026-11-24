@@ -211,6 +211,8 @@ fn dispatch_on_all(
             ud[u.index as usize] = match (u.root, u.slot) {
                 (RootType::Constants, 0) => constants[u.dword as usize],
                 (RootType::Table, 1) => 0,
+                (RootType::ResourceHeap, _) => 1,
+                (RootType::SamplerHeap, _) => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
         }
@@ -329,6 +331,8 @@ fn wave64_small_group_runs_on_wave32_host() {
             ud[u.index as usize] = match (u.root, u.slot) {
                 (RootType::Constants, 0) => [base, 0, 0, 0][u.dword as usize],
                 (RootType::Table, 1) => 0,
+                (RootType::ResourceHeap, _) => 1,
+                (RootType::SamplerHeap, _) => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
         }

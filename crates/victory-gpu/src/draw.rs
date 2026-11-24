@@ -846,7 +846,7 @@ impl State {
             }
         };
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a).min(1 << 20));
+            s.refresh(list, *a, s.left(*a));
             list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
         }
         let handle = host.gpu_handle(index);
@@ -2160,11 +2160,38 @@ mod tests {
             srv_buf.ptr.add(off).cast::<u32>().write(0xDEAD_BEEF);
         }
 
+        #[repr(C)]
+        struct ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC,
+            placement: [u64; 2],
+        }
+        let heap_desc = ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 8,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            placement: [0; 2],
+        };
+        let heap_iid = ID3D12DescriptorHeap::IID;
+        let mut views = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const heap_desc).cast(),
+                (&raw const heap_iid).cast(),
+                &mut views,
+            ),
+            crate::object::S_OK
+        );
+
         // 1) Dispatch with slot 0 unset, slot 1 = null (0x0), slot 2 = unmapped VA:
         //    ZERO fallback serves CBV/SRV as 0, SINK absorbs the UAV store at +1.5 MiB
         //    without faulting or dirtying ZERO.
         let list = host.new_list().expect("new_list");
         let mut state = State::default();
+        state.set_heaps(&[views]);
         state.set_pipeline(pso);
         state.set_view(true, 1, 0);
         state.set_view(true, 2, mid_unmapped);
@@ -2177,6 +2204,7 @@ mod tests {
         //    0 ^ 0 ^ 0xA5A5_5A5A = 0xA5A5_5A5A in CPU title memory.
         list.reset();
         state.reset(pso);
+        state.set_heaps(&[views]);
         state.set_view(true, 2, uav_buf.addr());
         state.dispatch(&list, 1, 1, 1);
         list.close();
@@ -2192,6 +2220,7 @@ mod tests {
         //    UAV writing +1.5 MiB) and verify full extent refresh + write-back.
         list.reset();
         state.reset(pso);
+        state.set_heaps(&[views]);
         state.set_view(true, 0, cbv_buf.addr());
         state.set_view(true, 1, srv_buf.addr());
         state.set_view(true, 2, uav_buf.addr());
@@ -2213,6 +2242,7 @@ mod tests {
         }
         list.reset();
         state.reset(pso);
+        state.set_heaps(&[views]);
         state.set_view(true, 0, cbv_buf.addr());
         state.set_view(true, 1, srv_buf.addr());
         state.set_view(true, 2, uav_buf.addr());
@@ -2227,7 +2257,9 @@ mod tests {
         crate::shadow::unregister(srv_buf.ptr as usize, srv_buf.addr());
         crate::shadow::unregister(uav_buf.ptr as usize, uav_buf.addr());
         crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
-        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        let release =
+            |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(views), 0);
         assert_eq!(release(pso), 0);
     }
 

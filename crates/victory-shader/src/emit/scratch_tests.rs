@@ -213,6 +213,8 @@ fn run(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => k[u.dword as usize],
                     (RootType::Table, 1) => 0,
+                    (RootType::ResourceHeap, _) => 1,
+                    (RootType::SamplerHeap, _) => 0,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }

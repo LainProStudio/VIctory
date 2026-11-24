@@ -103,13 +103,17 @@ fn build_cs_with_store(body: &[u32], lds_blocks: u32, store: [u32; 2]) -> HostSh
     words.extend_from_slice(body);
     words.extend_from_slice(&store);
     words.push(S_ENDPGM);
-    lower_cs(&words)
+    lower_cs_lds(&words, lds_blocks)
 }
 
 /// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
 fn lower_cs(words: &[u32]) -> HostShader {
+    lower_cs_lds(words, 0)
+}
+
+fn lower_cs_lds(words: &[u32], lds_blocks: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -316,12 +320,18 @@ fn scalar_buffer_load_uses_byte_offsets_with_a_raw_host_view() {
         .or_else(|_| Host::new(true))
         .expect("SM 6.6 device");
     let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+    let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let Some(g) = super::host::guard(u.root, 2, 0) {
+            ud[u.index as usize] = g;
+        }
+    }
     let out = host
         .dispatch(
             &root,
             &pipeline,
             &Dispatch {
-                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                roots: vec![(0, Root::Constants(ud))],
                 views: &[
                     View::Buffer {
                         data: &data,
@@ -1679,6 +1689,8 @@ fn oob_lds_reads_writes_and_atomics_clamp_and_drop() {
             ud[u.index as usize] = match (u.root, u.slot) {
                 (RootType::Constants, 0) => inputs[u.dword as usize],
                 (RootType::Table, 1) => 0,
+                (RootType::ResourceHeap, _) => 1,
+                (RootType::SamplerHeap, _) => 0,
                 other => panic!("unexpected {other:?}"),
             };
         }
@@ -1987,6 +1999,8 @@ fn dispatch_wave32(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
+                    (RootType::ResourceHeap, _) => 1,
+                    (RootType::SamplerHeap, _) => 0,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }

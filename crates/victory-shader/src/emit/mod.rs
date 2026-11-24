@@ -1299,13 +1299,19 @@ mod tests {
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let srv_data: Vec<u32> = (100..112).collect();
+            let mut ud = vec![0u32; cs.user_data_dwords().max(5) as usize];
+            for u in &cs.user_data {
+                if let Some(g) = super::host::guard(u.root, 2, 0) {
+                    ud[u.index as usize] = g;
+                }
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &super::host::Dispatch {
                         roots: vec![
-                            (0, super::host::Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (0, super::host::Root::Constants(ud)),
                             (
                                 1,
                                 super::host::Root::View {

@@ -1159,7 +1159,7 @@ pub(crate) fn host_unordered<'a>(
     if this.is_null() {
         return None;
     }
-    let host = resource(this).host.as_deref()?;
+    let host = resource(this).host()?;
     let Some(twin) = &host.twin else {
         return Some((&host.texture, None));
     };
