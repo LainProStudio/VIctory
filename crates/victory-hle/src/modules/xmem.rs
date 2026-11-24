@@ -22,7 +22,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_WRITE, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT,
+    CreateFileMappingW, FILE_MAP_WRITE, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT,
     MEM_EXTENDED_PARAMETER, MEM_MAPPED, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
     MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
     MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3,
@@ -1004,24 +1004,84 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, warn_on_f
     true
 }
 
-/// Commits the section pages a view shows (once per page, whichever view).
+/// How much one `VirtualAlloc` commits. The host charges the whole call
+/// before it answers and refuses one larger than the page file's free commit
+/// (error 1455), so a huge contiguous range fails as a unit; in pieces the
+/// same request commits as far as the host allows.
+const COMMIT_PIECE: usize = 64 * MIB;
+
+/// The host's commit limit and how much of it is taken, in bytes
+/// (`PERFORMANCE_INFORMATION` counts pages).
+fn commit_budget() -> (usize, usize) {
+    // SAFETY: plain counters, zeroed and sized for the host.
+    let mut info: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+    info.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+    // SAFETY: our own process and a structure sized by `cb`.
+    unsafe { K32GetPerformanceInfo(&raw mut info, info.cb) };
+    (
+        info.CommitLimit.saturating_mul(info.PageSize),
+        info.CommitTotal.saturating_mul(info.PageSize),
+    )
+}
+
+/// Commits `[base, base + len)` piece by piece and returns the bytes
+/// committed before the host refused.
+fn commit_pieces(base: usize, len: usize) -> usize {
+    let mut done = 0;
+    while done < len {
+        let piece = COMMIT_PIECE.min(len - done);
+        // SAFETY: `[base + done, base + done + piece)` is reserved section, in `len`.
+        let at = unsafe {
+            VirtualAlloc(
+                (base + done) as *const c_void,
+                piece,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if at.is_null() {
+            let error = std::io::Error::last_os_error();
+            let (limit, used) = commit_budget();
+            tracing::warn!(
+                done,
+                len,
+                commit_limit = limit,
+                commit_used = used,
+                %error,
+                "commit stopped at the host's commit limit"
+            );
+            if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
+                let mut info = PERFORMANCE_INFORMATION::default();
+                info.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+                // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+                let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
+                victory_loader::log_crash(&commit_limit_message(
+                    piece,
+                    &error,
+                    queried.then_some(&info),
+                ));
+            }
+            break;
+        }
+        done += piece;
+    }
+    done
+}
+
+/// Commits the section pages a view shows (once per page, whichever view):
+/// all of them or nothing, because a map has no count to report a short one.
 fn commit(base: usize, len: usize) -> bool {
     if on_wine() {
         return true; // sections are committed whole there
     }
-    // SAFETY: `[base, base + len)` is a view of a reserved section.
-    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+    let committed = commit_pieces(base, len);
+    if committed == len {
         return true;
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
-        let mut info = PERFORMANCE_INFORMATION::default();
-        info.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
-        // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
-        let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
-        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
-    } else {
-        tracing::warn!(len, %error, "committing physical pages failed");
+    if committed > 0 {
+        // SAFETY: the committed head of a range whose `ensure_committed` failed;
+        // its charge must not outlive the attempt.
+        unsafe { VirtualFree(base as *mut c_void, committed, MEM_DECOMMIT) };
     }
     false
 }
@@ -1237,6 +1297,16 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 }
 
 pub(crate) fn module() -> HleModule {
+    // Before the title can ask for its 6.5 GB: name the ceiling the host
+    // will hold it to, so a short physical-page count or commit failure is
+    // explained up front instead of surfacing as an opaque failure later.
+    let (limit, used) = commit_budget();
+    tracing::info!(
+        commit_limit = limit,
+        commit_used = used,
+        available = limit.saturating_sub(used),
+        "xmem: host commit budget"
+    );
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll"],
@@ -1798,5 +1868,65 @@ mod tests {
         }
         assert_eq!(XMemFreePhysicalPages(a_pages.len(), a_pages.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(b_pages.len(), b_pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn allocated_physical_pages_are_committed() {
+        let asked = 4;
+        let mut n = asked;
+        let mut pages = [0usize; 4];
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        assert!(n > 0 && n <= asked, "got {n} pages of {asked}");
+        let reserve = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!reserve.is_null());
+        assert_eq!(XMemMapPhysicalPages(reserve, n, pages.as_ptr()), reserve);
+        // The last byte of the last page: committed, not merely reserved.
+        let last = reserve.cast::<u8>().wrapping_add(n * PAGE - 1);
+        // SAFETY: `n * PAGE` bytes are mapped read-write.
+        unsafe {
+            last.write(0xa5);
+            assert_eq!(last.read(), 0xa5);
+        }
+        assert_eq!(XMemMapPhysicalPages(reserve, n, std::ptr::null()), reserve);
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+        // SAFETY: our own reservation, released by us.
+        assert_ne!(unsafe { VirtualFree(reserve, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn commits_across_a_piece_boundary() {
+        // One `VirtualAlloc` per piece, so a range that is not a whole number
+        // of pieces needs its last, short one committed too; and pages already
+        // committed must not be charged twice when the range is committed again.
+        let pages = COMMIT_PIECE / PAGE + 2;
+        let size = pages * PAGE;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        let section = Section::new(handle, pages).expect("persistent view");
+        let base = section.page_ptr(0) as usize;
+        assert_eq!(commit_pieces(base, size), size);
+        assert_eq!(
+            commit_pieces(base, size),
+            size,
+            "committed pages commit again"
+        );
+        assert!(section.ensure_committed(0, pages));
+        assert!(section.all_committed(0, pages));
     }
 }
