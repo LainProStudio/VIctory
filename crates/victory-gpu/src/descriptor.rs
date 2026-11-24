@@ -85,10 +85,12 @@ impl Heap {
             return None;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // A recorder can take the fast path as soon as the OnceLock is
+        // initialized. Publish only after replaying the queued writes.
         self.host
             .get_or_init(|| {
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
                 let step = u64::from(increment(self.desc.kind)?);
+                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
