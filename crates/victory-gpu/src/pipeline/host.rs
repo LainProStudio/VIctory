@@ -397,6 +397,16 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
+/// Whether root SRVs are bound as one-view tables of the buffer's host
+/// copy (reads past its end return zeros) rather than root descriptors
+/// (unbounded: a mesh shader's vertex fetch, which has no record limit,
+/// read past the copy into memory the host had freed). Set
+/// `VICTORY_ROOT_SRV_DIRECT=1` to go back.
+pub(crate) fn bounded_root_srvs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -494,6 +504,9 @@ impl HostPipeline {
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        // Ranges the table parameters point at, alive until the root
+        // signature is made.
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
@@ -552,6 +565,47 @@ impl HostPipeline {
                 ),
             ] {
                 for &slot in slots {
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                        let param = if let Some(&(_, existing)) =
+                            root_views.iter().find(|&&(k, _)| k == (kind.0, slot))
+                        {
+                            if params[existing as usize].ShaderVisibility != visibility {
+                                params[existing as usize].ShaderVisibility =
+                                    D3D12_SHADER_VISIBILITY_ALL;
+                            }
+                            existing
+                        } else {
+                            // A one-view table: the view's size bounds the reads,
+                            // which a root descriptor leaves unbounded.
+                            ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                                NumDescriptors: 1,
+                                BaseShaderRegister: u32::from(slot),
+                                RegisterSpace: ROOT_CBV_SPACE,
+                                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                                OffsetInDescriptorsFromTableStart: 0,
+                            }));
+                            let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                            let idx = params.len() as u32;
+                            root_views.push(((kind.0, slot), idx));
+                            params.push(D3D12_ROOT_PARAMETER1 {
+                                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                        NumDescriptorRanges: 1,
+                                        pDescriptorRanges: range,
+                                    },
+                                },
+                                ShaderVisibility: visibility,
+                            });
+                            idx
+                        };
+                        if !out.contains(&(slot, param)) {
+                            out.push((slot, param));
+                        }
+                        continue;
+                    }
                     let param =
                         push_root_view(&mut params, &mut root_views, kind, slot, visibility);
                     if !out.contains(&(slot, param)) {
