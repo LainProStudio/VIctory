@@ -478,7 +478,11 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    // The runtime cache keys on the complete container, including its other parts.
+    let container_bytes = &bytes[..container.total_size];
+    let input = if checks.cache.is_some() { container_bytes } else { dxil };
+    let hash = blake3::hash(input);
+    if !lock(seen).insert(hash) {
         t.duplicates += 1;
         return;
     }
@@ -494,7 +498,6 @@ fn translate(
             HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
         )
     });
-    let container_bytes = &bytes[..container.total_size];
     for (program_index, p) in programs.into_iter().enumerate() {
         t.programs += 1;
         match build_program(&p) {
@@ -914,3 +917,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cache_tests;
