@@ -6385,13 +6385,14 @@ impl<'a> Lower<'a> {
             // reference, a dword each (an a16 bias is an f16 in the low
             // half, LLVM SIISelLowering::lowerImage); the derivatives, x
             // then y; the coordinates, then the level or level clamp.
-            // Derivatives are 16-bit with a16 or g16, coordinates and levels
-            // with a16: two per dword, low half first, each direction
-            // starting a dword.
+            // Derivatives are 16-bit in the g16 opcodes, coordinates and
+            // levels with a16 (GFX10.3 keeps the two apart, as LLVM's
+            // lowerImage does where hasG16): two per dword, low half first,
+            // each direction starting a dword.
             let whole = usize::from(f.o) + usize::from(f.b) + usize::from(f.c);
             let bias_at = (usize::from(f.o), a16.then_some(0));
             let grads = if f.d { spatial } else { 0 };
-            let g16 = *a16 || f.g16;
+            let g16 = f.g16;
             let per_direction = if g16 { grads.div_ceil(2) } else { grads };
             let grad_at = |dir: usize, k: usize| {
                 if g16 {

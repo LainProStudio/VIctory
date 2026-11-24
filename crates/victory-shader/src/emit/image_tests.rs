@@ -316,6 +316,13 @@ fn h(x: f32) -> u32 {
     }
 }
 
+/// f16 bits of a value an f16 holds exactly (texel centres).
+fn half(x: f32) -> u32 {
+    let b = x.to_bits();
+    assert_eq!(b & 0x1FFF, 0, "{x} is not an f16");
+    h(x) | (b >> 13 & 0x3FF)
+}
+
 fn offset_word(dx: i32, dy: i32) -> u32 {
     (dx as u32 & 0x3F) | (dy as u32 & 0x3F) << 8
 }
@@ -579,6 +586,24 @@ fn texel_offsets_and_levels_sample_the_texels_they_name() {
             let g = h((1 << n) as f32 / 8.0);
             ([g, g << 16, f(u), f(v)].to_vec(), texel(n, (u, v), (0, 0)))
         }),
+        // a16 packs the coordinates, not the derivatives.
+        case(
+            "d (a16)",
+            Mimg {
+                a16: true,
+                ..mimg("image_sample_d", 0xF)
+            },
+            &[],
+            |l| {
+                let (u, v) = centre(l);
+                let n = (l % 3) as u32;
+                let g = f((1 << n) as f32 / 8.0);
+                (
+                    [g, 0, 0, g, half(u) | half(v) << 16].to_vec(),
+                    texel(n, (u, v), (0, 0)),
+                )
+            },
+        ),
         case(
             "d_cl_o_g16",
             mimg("image_sample_d_cl_o_g16", 0xF),
