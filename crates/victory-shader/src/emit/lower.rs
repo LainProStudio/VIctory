@@ -7888,29 +7888,51 @@ impl<'a> Lower<'a> {
                         a = self.s.m.select(c, up, above, a);
                     }
                 }
-                // D3D's conversions saturate and give 0 for NaN, as the
-                // hardware's two plain ones do (checked on the RX 6700 XT
-                // and WARP).
-                let op = if name == "v_cvt_u32_f32" {
-                    Cast::FpToUi
+                // Guard the float before Cast::FpToUi / Cast::FpToSi so out-of-range,
+                // Inf, and NaN inputs never enter DXIL fptoui/fptosi as poison/UB,
+                // then select RDNA2 ISA saturation / NaN results.
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let zero_f = self.s.m.f32(0.0f32.to_bits());
+                let a_bits = self.as_int(a);
+                let r = if name == "v_cvt_u32_f32" {
+                    let (inf, limit, max, zero) = (
+                        k(self, 0x7F80_0000),
+                        k(self, 0x4F80_0000),
+                        k(self, u32::MAX),
+                        k(self, 0),
+                    );
+                    let in_range = self.s.m.cmp(c, pred::IULT, a_bits, limit);
+                    let safe = self.s.m.select(c, in_range, a, zero_f);
+                    let r = self.s.m.cast(c, Cast::FpToUi, safe, self.s.t.i32);
+                    let neg_or_nan = self.s.m.cmp(c, pred::IUGT, a_bits, inf);
+                    let sat = self.s.m.select(c, neg_or_nan, zero, max);
+                    self.s.m.select(c, in_range, r, sat)
                 } else {
-                    Cast::FpToSi
-                };
-                let mut r = self.s.m.cast(c, op, a, self.s.t.i32);
-                if name == "v_cvt_flr_i32_f32" || name == "v_cvt_rpi_i32_f32" {
-                    // These two saturate a NaN too, by its sign (its
-                    // exponent is above 30, as that of any other magnitude
-                    // too great).
-                    let bits = self.as_int(x);
-                    let k = |l: &mut Self, v: u32| l.s.m.i32(v);
                     let (abs, inf, zero) = (k(self, 0x7FFF_FFFF), k(self, 0x7F80_0000), k(self, 0));
-                    let (max, min) = (k(self, 0x7FFF_FFFF), k(self, 0x8000_0000));
-                    let mag = self.s.m.bin(c, Bin::And, bits, abs);
-                    let nan = self.s.m.cmp(c, pred::IUGT, mag, inf);
-                    let neg = self.s.m.cmp(c, pred::SLT, bits, zero);
+                    let (limit, max, min) = (
+                        k(self, 0x4F00_0000),
+                        k(self, 0x7FFF_FFFF),
+                        k(self, 0x8000_0000),
+                    );
+                    let mag = self.s.m.bin(c, Bin::And, a_bits, abs);
+                    let in_range = self.s.m.cmp(c, pred::IULT, mag, limit);
+                    let safe = self.s.m.select(c, in_range, a, zero_f);
+                    let r = self.s.m.cast(c, Cast::FpToSi, safe, self.s.t.i32);
+                    let neg = self.s.m.cmp(c, pred::SLT, a_bits, zero);
                     let sat = self.s.m.select(c, neg, min, max);
-                    r = self.s.m.select(c, nan, sat, r);
-                }
+                    let r = self.s.m.select(c, in_range, r, sat);
+                    let x_bits = self.as_int(x);
+                    let x_mag = self.s.m.bin(c, Bin::And, x_bits, abs);
+                    let nan = self.s.m.cmp(c, pred::IUGT, x_mag, inf);
+                    if name == "v_cvt_i32_f32" {
+                        self.s.m.select(c, nan, zero, r)
+                    } else {
+                        // flr/rpi saturate a NaN by its sign.
+                        let x_neg = self.s.m.cmp(c, pred::SLT, x_bits, zero);
+                        let sat_nan = self.s.m.select(c, x_neg, min, max);
+                        self.s.m.select(c, nan, sat_nan, r)
+                    }
+                };
                 int(self, r)
             }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
@@ -10855,27 +10877,26 @@ impl<'a> Lower<'a> {
                 (h, ok, None, so)
             };
             let coords = |byte| safe_idx.map_or([byte, iu], |i| [i, byte]);
-            if let Some((width, signed, half)) = sub_load {
-                // Root SRVs have no size in DXIL.
-                let bounds = match (!matches!(src, Source::Built { .. }))
-                    .then(|| self.buffer_bounds(h, index, off, stride, width / 8))
-                {
-                    Some(b) => self.s.m.bin(c, Bin::And, b, in_bounds),
-                    None => in_bounds,
-                };
+            let width = sub_load.map(|(w, ..)| w).or(sub_store).unwrap();
+            // Root descriptors have no size in DXIL.
+            let bounds = match (!matches!(src, Source::Built { .. }))
+                .then(|| self.buffer_bounds(h, index, off, stride, width / 8))
+            {
+                Some(b) => self.s.m.bin(c, Bin::And, b, in_bounds),
+                None => in_bounds,
+            };
+            if let Some((_, signed, half)) = sub_load {
                 let at = self.begin_guarded(Some(bounds));
                 let x = self.read_subword(safe_off, width, signed, |l, at| Ok(l.raw_dword(h, coords(at))))?;
                 let zero = self.s.m.i32(0);
                 let x = self.end_guarded(at, &[(x, zero)])[0];
                 self.write_subword_result(inst, reg, x, half, guard)?;
-            } else if let Some(width) = sub_store {
+            } else {
                 let mut x = self.vgprs(inst, data, 1)?[0];
                 if name.ends_with("_hi") {
                     let sixteen = self.s.m.i32(16);
                     x = self.s.m.bin(c, Bin::LShr, x, sixteen);
                 }
-                let bounds = self.buffer_bounds(h, index, off, stride, width / 8);
-                let bounds = self.s.m.bin(c, Bin::And, bounds, in_bounds);
                 let active = self.buffer_store_guard(bounds, guard);
                 let at = self.begin_guarded(Some(active));
                 if width == 16 && self.s.m.known(off).is_some_and(|v| v & 1 == 0) {

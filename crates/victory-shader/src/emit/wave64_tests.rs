@@ -1139,4 +1139,117 @@ mod gpu {
             false,
         );
     }
+
+    #[test]
+    fn gpu_bvh_wave64_prefix_and_root_subword_store() {
+        use crate::emit::host::Root;
+        use crate::native::{ResourceType, UsedResource};
+
+        // BVH-style 64-lane exclusive prefix sum (s_or_saveexec_b64 + v_cndmask_b32 + dpp
+        // + v_permlanex16_b32 fi:1 + split exec_lo/exec_hi + v_readlane_b32) + Root UAV
+        // buffer_store_short (subword CAS path, skipping dx.op.getDimensions).
+        let mut code = vec![
+            sop2(1, 0x10, 1, LIT),
+            0x0001_0000,             // s_or_b32 s1, s1, 0x10000
+            s_mov_b32(2, inline_u(0)),
+            s_mov_b32(3, NEG_ONE),
+            v_and_b32(1, inline_u(63), 0),
+            v_add_nc_u32(1, inline_u(1), 1), // v1 = tid + 1
+            s_or_saveexec_b64(12, NEG_ONE),
+        ];
+        code.extend_from_slice(&v_cndmask_b32(2, inline_u(0), vgpr(1), 12));
+        for shift in [0x111u32, 0x112, 0x114, 0x118] {
+            code.extend_from_slice(&dpp_row_shr(0x25, 2, 2, 2, shift, 0xF));
+        }
+        code.push(s_mov_b32(EXEC_LO, LIT));
+        code.push(0xFFFF_0000);
+        code.push(s_mov_b32(EXEC_HI, LIT));
+        code.push(0xFFFF_0000);
+        code.extend_from_slice(&[0xD778_4803, 0x0305_8302]); // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+        code.push(v_add_nc_u32(2, vgpr(3), 2));
+        code.extend_from_slice(&v_readlane_b32(14, 2, inline_u(31)));
+        code.push(s_mov_b32(EXEC_LO, inline_u(0)));
+        code.push(s_mov_b32(EXEC_HI, NEG_ONE));
+        code.push(v_add_nc_u32(2, 14, 2));
+        code.push(s_mov_b64(EXEC_LO, 12));
+        code.push(v_sub_nc_u32(2, vgpr(1), 2)); // v2 = prefix - v1 -> Wait: negate or keep v2 = inclusive!
+        code.pop();
+        code.push(v_lshlrev_b32(4, inline_u(1), 0)); // v4 = tid * 2 byte offset
+        code.extend_from_slice(&[0xE068_1000, 0x8000_0204]); // buffer_store_short v2, v4, s[0:3], 0 offen
+        code.push(S_ENDPGM);
+
+        let prog = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 1,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [64, 1, 1],
+            }),
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+
+        let expected: Vec<u32> = (0..32u32)
+            .map(|k| {
+                let lo = ((2 * k + 1) * (2 * k + 2) / 2) & 0xFFFF;
+                let hi = ((2 * k + 2) * (2 * k + 3) / 2) & 0xFFFF;
+                lo | (hi << 16)
+            })
+            .collect();
+
+        with_hosts(|hosts| {
+            for (warp_idx, host) in hosts.iter().enumerate() {
+                let Some(host) = host else {
+                    continue;
+                };
+                let warp = warp_idx == 1;
+                let mut modes = vec![Wave64Mode::Emulate];
+                if host.supports_wave32() {
+                    modes.push(Wave64Mode::Wave32);
+                }
+                for mode in modes {
+                    let shader = emit_cs(&prog, mode).unwrap();
+                    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize])),
+                                    (1, Root::Uav(32)),
+                                ],
+                                views: &[],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        &out[0][..32],
+                        &expected[..],
+                        "gpu_bvh_wave64_prefix_and_root_subword_store ({mode:?}, warp={warp})"
+                    );
+                }
+            }
+        });
+    }
 }
