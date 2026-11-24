@@ -243,13 +243,15 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded. Restores write
-/// access in case [`guard`] marked blocks read-only while the remap ran.
+/// shows is new and read-write, so it is no longer guarded, and any placed
+/// textures backed by that range are evicted.
 pub fn title_memory_remapped(at: usize, len: usize) {
     if len == 0 {
         return;
     }
     open(&mut guards(), at, at + len);
+    let end = at.saturating_add(len);
+    crate::resource::evict_placed_textures(at as u64, end as u64);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

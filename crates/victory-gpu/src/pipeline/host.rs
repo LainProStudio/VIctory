@@ -944,7 +944,6 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
-<<<<<<< HEAD
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::{

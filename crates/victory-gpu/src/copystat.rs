@@ -37,12 +37,8 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
-    DirectSlots,
-    DirectRanges,
-    DirectBytes,
-    DirectUs,
 }
-const COUNTERS: usize = C::DirectUs as usize + 1;
+const COUNTERS: usize = C::TexChanged as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -136,15 +132,6 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
-    if c[C::DirectSlots as usize] > 0.0 {
-        tracing::info!(
-            "direct SRVs per frame: {:.0} slots, {:.0} merged ranges, {:.2} MB copied, {:.2} ms preparing",
-            c[C::DirectSlots as usize],
-            c[C::DirectRanges as usize],
-            mb(c[C::DirectBytes as usize]),
-            ms(c[C::DirectUs as usize]),
-        );
-    }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

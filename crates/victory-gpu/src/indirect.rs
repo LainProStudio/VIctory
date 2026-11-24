@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{BUFFER_READ, BUFFER_WRITE, HostList, host};
+use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -473,6 +473,7 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::transition;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;

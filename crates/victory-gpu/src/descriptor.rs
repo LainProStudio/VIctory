@@ -76,7 +76,18 @@ impl Heap {
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
-    pub(crate) fn host(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
+    pub(crate) fn host(&self) -> Option<&host::HostHeap> {
+        self.host_arc_ref().map(std::sync::Arc::as_ref)
+    }
+
+    /// Shared reference to the host heap for submission-time bindless sync.
+    #[cfg(windows)]
+    pub(crate) fn host_arc(&self) -> Option<std::sync::Arc<host::HostHeap>> {
+        self.host_arc_ref().cloned()
+    }
+
+    #[cfg(windows)]
+    fn host_arc_ref(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
         if let Some(h) = self.host.get() {
             return h.as_ref();
         }
@@ -506,29 +517,11 @@ pub(crate) fn forget(resource: usize) {
 }
 
 /// The view of entry `i` if `generation` is still its own.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn view_at(i: u32, generation: u32) -> Option<View> {
-    with_view_at(i, generation, View::clone)
-}
-
 #[cfg(windows)]
-fn with_view_at<T>(i: u32, generation: u32, f: impl FnOnce(&View) -> T) -> Option<T> {
+fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| f(view))
-}
-
-/// Protect object-backed title memory from release during CPU refresh.
-/// Take snapshots of heap metadata before entering this section.
-#[cfg(windows)]
-pub(crate) fn with_live_views<T>(f: impl FnOnce(&dyn Fn(u64) -> bool) -> T) -> T {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    f(&|key| {
-        views
-            .list
-            .get(key as u32 as usize)
-            .is_some_and(|(_, generation)| *generation == (key >> 32) as u32)
-    })
+    (*current == generation).then(|| view.clone())
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -795,10 +788,6 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
-
-    #[cfg(windows)]
-    #[path = "coherency.rs"]
-    mod coherency;
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
