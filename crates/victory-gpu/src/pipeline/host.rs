@@ -92,6 +92,87 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// Copies owned input layout elements and semantic names from a title
+    /// `D3D12_INPUT_LAYOUT_DESC`.
+    ///
+    /// # Safety
+    /// If `layout.pInputElementDescs` is non-null, it must point to
+    /// `layout.NumElements` valid `D3D12_INPUT_ELEMENT_DESC` entries whose
+    /// non-null `SemanticName` pointers are NUL-terminated C strings.
+    unsafe fn copy_input_layout(
+        layout: D3D12_INPUT_LAYOUT_DESC,
+    ) -> (Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<CString>) {
+        if layout.pInputElementDescs.is_null() || layout.NumElements == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        // SAFETY: caller guarantees `NumElements` valid input element entries.
+        let elements = unsafe {
+            std::slice::from_raw_parts(layout.pInputElementDescs, layout.NumElements as usize)
+        };
+        let names: Vec<CString> = elements
+            .iter()
+            .map(|e| {
+                if e.SemanticName.0.is_null() {
+                    CString::default()
+                } else {
+                    // SAFETY: caller guarantees valid NUL-terminated C string.
+                    unsafe { CStr::from_ptr(e.SemanticName.0.cast()).to_owned() }
+                }
+            })
+            .collect();
+        let inputs = elements
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.Format.0 as u32) as i32),
+                ..*e
+            })
+            .collect();
+        (inputs, names)
+    }
+
+    /// Captures owned graphics state from a plain
+    /// `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
+    ///
+    /// # Safety
+    /// `desc` must be a valid `D3D12_GRAPHICS_PIPELINE_STATE_DESC` whose
+    /// `InputLayout` pointers (if non-null) are valid for the duration of
+    /// this call.
+    pub(crate) unsafe fn from_graphics_desc(desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Self {
+        // SAFETY: caller guarantees `desc.InputLayout` is valid.
+        let (inputs, names) = unsafe { Self::copy_input_layout(desc.InputLayout) };
+        let mut rt_formats = desc.RTVFormats;
+        for f in &mut rt_formats {
+            f.0 = crate::resource::target_format(f.0 as u32) as i32;
+        }
+        let samples = if desc.SampleDesc.Count == 0 {
+            DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            }
+        } else {
+            desc.SampleDesc
+        };
+        GraphicsState {
+            blend: desc.BlendState,
+            sample_mask: desc.SampleMask,
+            rasterizer: desc.RasterizerState,
+            depth: desc.DepthStencilState,
+            depth_bounds: false,
+            inputs,
+            names,
+            strip_cut: desc.IBStripCutValue,
+            topology: desc.PrimitiveTopologyType,
+            targets: D3D12_RT_FORMAT_ARRAY {
+                RTFormats: rt_formats,
+                NumRenderTargets: desc.NumRenderTargets.min(8),
+            },
+            depth_format: DXGI_FORMAT(crate::resource::pc_format(desc.DSVFormat.0 as u32) as i32),
+            samples,
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -124,30 +205,71 @@ impl GraphicsState {
                         BackFace: d.BackFace,
                     };
                 }
+                26 => {
+                    let d = data.cast::<D3D12_DEPTH_STENCIL_DESC2>().read_unaligned();
+                    self.depth = D3D12_DEPTH_STENCIL_DESC {
+                        DepthEnable: d.DepthEnable,
+                        DepthWriteMask: d.DepthWriteMask,
+                        DepthFunc: d.DepthFunc,
+                        StencilEnable: d.StencilEnable,
+                        StencilReadMask: d.FrontFace.StencilReadMask,
+                        StencilWriteMask: d.FrontFace.StencilWriteMask,
+                        FrontFace: D3D12_DEPTH_STENCILOP_DESC {
+                            StencilFailOp: d.FrontFace.StencilFailOp,
+                            StencilDepthFailOp: d.FrontFace.StencilDepthFailOp,
+                            StencilPassOp: d.FrontFace.StencilPassOp,
+                            StencilFunc: d.FrontFace.StencilFunc,
+                        },
+                        BackFace: D3D12_DEPTH_STENCILOP_DESC {
+                            StencilFailOp: d.BackFace.StencilFailOp,
+                            StencilDepthFailOp: d.BackFace.StencilDepthFailOp,
+                            StencilPassOp: d.BackFace.StencilPassOp,
+                            StencilFunc: d.BackFace.StencilFunc,
+                        },
+                    };
+                }
+                27 => {
+                    let d = data.cast::<D3D12_RASTERIZER_DESC1>().read_unaligned();
+                    self.rasterizer = D3D12_RASTERIZER_DESC {
+                        FillMode: d.FillMode,
+                        CullMode: d.CullMode,
+                        FrontCounterClockwise: d.FrontCounterClockwise,
+                        DepthBias: d.DepthBias as i32,
+                        DepthBiasClamp: d.DepthBiasClamp,
+                        SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+                        DepthClipEnable: d.DepthClipEnable,
+                        MultisampleEnable: d.MultisampleEnable,
+                        AntialiasedLineEnable: d.AntialiasedLineEnable,
+                        ForcedSampleCount: d.ForcedSampleCount,
+                        ConservativeRaster: d.ConservativeRaster,
+                    };
+                }
+                28 => {
+                    let d = data.cast::<D3D12_RASTERIZER_DESC2>().read_unaligned();
+                    let multisample = matches!(
+                        d.LineRasterizationMode,
+                        D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE
+                            | D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW
+                    );
+                    let antialiased =
+                        d.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED;
+                    self.rasterizer = D3D12_RASTERIZER_DESC {
+                        FillMode: d.FillMode,
+                        CullMode: d.CullMode,
+                        FrontCounterClockwise: d.FrontCounterClockwise,
+                        DepthBias: d.DepthBias as i32,
+                        DepthBiasClamp: d.DepthBiasClamp,
+                        SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+                        DepthClipEnable: d.DepthClipEnable,
+                        MultisampleEnable: multisample.into(),
+                        AntialiasedLineEnable: antialiased.into(),
+                        ForcedSampleCount: d.ForcedSampleCount,
+                        ConservativeRaster: d.ConservativeRaster,
+                    };
+                }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
-                        return;
-                    }
-                    let elements = std::slice::from_raw_parts(
-                        layout.pInputElementDescs,
-                        layout.NumElements as usize,
-                    );
-                    self.names = elements
-                        .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
-                        .collect();
-                    self.inputs = elements
-                        .iter()
-                        .zip(&self.names)
-                        .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
-                            SemanticName: PCSTR(name.as_ptr().cast()),
-                            Format: DXGI_FORMAT(
-                                crate::resource::pc_format(e.Format.0 as u32) as i32
-                            ),
-                            ..*e
-                        })
-                        .collect();
+                    (self.inputs, self.names) = Self::copy_input_layout(layout);
                 }
                 13 => {
                     self.strip_cut =
