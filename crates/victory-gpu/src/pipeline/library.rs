@@ -49,6 +49,7 @@ struct Library {
 unsafe impl Send for Library {}
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+const SCHEMA_FILE: &str = "library-schema.txt";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most (sized for full
 /// open-world pipeline counts while keeping memory bounded).
@@ -63,9 +64,24 @@ fn library() -> Option<&'static Mutex<Library>> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            let expected = crate::shader_cache::CACHE_SCHEMA_VERSION.to_string();
             let blob = DIR
                 .get()
-                .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
+                .and_then(|d| {
+                    let schema = std::fs::read_to_string(d.join(SCHEMA_FILE)).ok();
+                    if schema.as_deref().map(str::trim) != Some(expected.as_str()) {
+                        let bin = d.join(LIBRARY_FILE);
+                        if bin.exists() {
+                            tracing::info!(
+                                schema = expected,
+                                "host pipeline library schema changed; starting fresh"
+                            );
+                            let _ = std::fs::remove_file(&bin);
+                        }
+                        return None;
+                    }
+                    std::fs::read(d.join(LIBRARY_FILE)).ok()
+                })
                 .unwrap_or_default();
             let library = open(&device, blob);
             if library.is_none() {
@@ -317,6 +333,8 @@ fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
             ok = false;
         } else {
             lib_bytes = len;
+            let schema = crate::shader_cache::CACHE_SCHEMA_VERSION.to_string();
+            let _ = write_atomically(&dir.join(SCHEMA_FILE), schema.as_bytes());
         }
     }
     let mut early_count = 0usize;
@@ -346,7 +364,7 @@ fn perform_save(dir: &Path, buf: &mut Vec<u8>) {
 /// completion.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
     let Some(dir) = DIR.get() else { return };
     if !now && !LIBRARY_DIRTY.load(Ordering::Relaxed) && !USED_CHANGED.load(Ordering::Relaxed) {
         return;

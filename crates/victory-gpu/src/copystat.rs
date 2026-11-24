@@ -47,6 +47,7 @@ pub(crate) enum C {
     WatchKnownViewUs,
     WatchDirectOk,
     WatchDirectOkUs,
+    WatchDirectBytes,
     WatchByAlloc,
     WatchByAllocUs,
     WatchGuardFallback,
@@ -54,6 +55,16 @@ pub(crate) enum C {
 }
 const COUNTERS: usize = C::WatchGuardFallbackUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+
+/// Per `direct_ok` watched range `(start, len)`: `(calls, microseconds)`.
+static DIRECT_RANGES: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(None);
+
+pub(crate) fn direct_ok_range(src: usize, len: usize, us: u64) {
+    let mut map = DIRECT_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += us;
+}
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -144,17 +155,32 @@ pub(crate) fn log(frames: f64) {
     if c[C::Watches as usize] > 0.0 || c[C::WatchCleanHits as usize] > 0.0 {
         tracing::info!(
             "watches breakdown: clean_hits {:.0}; known_view {:.0} ({:.2} ms); \
-             direct_ok {:.0} ({:.2} ms); by_alloc {:.0} ({:.2} ms); guard_fallback {:.0} ({:.2} ms)",
+             direct_ok {:.0} ({:.2} ms, {:.1} MB); by_alloc {:.0} ({:.2} ms); guard_fallback {:.0} ({:.2} ms)",
             c[C::WatchCleanHits as usize],
             c[C::WatchKnownView as usize],
             ms(c[C::WatchKnownViewUs as usize]),
             c[C::WatchDirectOk as usize],
             ms(c[C::WatchDirectOkUs as usize]),
+            mb(c[C::WatchDirectBytes as usize]),
             c[C::WatchByAlloc as usize],
             ms(c[C::WatchByAllocUs as usize]),
             c[C::WatchGuardFallback as usize],
             ms(c[C::WatchGuardFallbackUs as usize]),
         );
+    }
+    let direct_ranges = DIRECT_RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if c[C::WatchDirectOkUs as usize] > 0.0
+        && let Some(map) = direct_ranges
+    {
+        let mut entries: Vec<_> = map.into_iter().collect();
+        entries.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+        for ((src, len), (n, us)) in entries.into_iter().take(5) {
+            tracing::info!(
+                "  direct_ok top: {src:#x}+{len:#x}: {:.1}x/frame, {:.2} ms/frame",
+                n as f64 / frames,
+                us as f64 / 1e3 / frames
+            );
+        }
     }
     if c[C::BindlessUs as usize] > 0.0 || c[C::BindlessRebuilds as usize] > 0.0 {
         tracing::info!(

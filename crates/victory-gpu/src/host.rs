@@ -1308,11 +1308,22 @@ impl Host {
         upload_pool.reset();
         drop(upload_pool);
         // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done.
+        // which tell the title the GPU is done. Coalesce overlapping ranges per
+        // shadow in first-appearance order before scanning.
         let copying = std::time::Instant::now();
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            Vec::new();
+        for (shadow, address, len) in back {
+            match grouped
+                .iter_mut()
+                .find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow))
+            {
+                Some((_, ranges)) => ranges.push((address, len)),
+                None => grouped.push((shadow, vec![(address, len)])),
+            }
+        }
+        for (shadow, ranges) in grouped {
+            let written = shadow.copy_back_ranges(&ranges);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2218,7 +2229,55 @@ impl HostList {
         for (heap, writes) in &deferred.bindless {
             batch.bindless(heap, *writes);
         }
-        for step in &deferred.copies {
+        let mut i = 0;
+        while i < deferred.copies.len() {
+            if matches!(deferred.copies[i], Step::Texture(..)) {
+                let run_start = i;
+                while i < deferred.copies.len() && matches!(deferred.copies[i], Step::Texture(..))
+                {
+                    i += 1;
+                }
+                let mut due = Vec::new();
+                for step in &deferred.copies[run_start..i] {
+                    if let Step::Texture(staging, copy) = step
+                        && batch.texture_due_range(staging, staging.memory_range())
+                    {
+                        due.push((staging, copy, staging.memory_range()));
+                    }
+                }
+                let mut spans: Ranges = due.iter().map(|&(_, _, r)| r).collect();
+                let prefetched: Vec<PrefetchedWatch> = if due.len() > 1 {
+                    coalesce_ranges(&mut spans, crate::watch::PAGE);
+                    if spans.len() < due.len() {
+                        spans
+                            .into_iter()
+                            .map(|(f, t)| (f, t, crate::watch::writes(f, t, true)))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                for (staging, copy, (from, to)) in due {
+                    let idx = prefetched.partition_point(|&(sf, _, _)| sf <= from);
+                    let found = idx
+                        .checked_sub(1)
+                        .and_then(|pi| {
+                            let (_, st, ref res) = prefetched[pi];
+                            (st >= to).then_some(res.as_ref()).flatten()
+                        })
+                        .map(|(now, list)| (*now, list.as_slice()));
+                    if let Some((upload, base_offset)) =
+                        staging.refresh_with_watch(host, pool, found)
+                    {
+                        uploads.push((staging.clone(), copy.clone(), upload, base_offset));
+                    }
+                }
+                continue;
+            }
+            let step = &deferred.copies[i];
+            i += 1;
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -2265,14 +2324,7 @@ impl HostList {
                     batch.gpu_write(shadow, *address, *len);
                     continue;
                 }
-                Step::Texture(staging, copy) => {
-                    if batch.texture_due_range(staging, staging.memory_range())
-                        && let Some((upload, base_offset)) = staging.refresh(host, pool)
-                    {
-                        uploads.push((staging.clone(), copy.clone(), upload, base_offset));
-                    }
-                    continue;
-                }
+                Step::Texture(..) => continue,
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);

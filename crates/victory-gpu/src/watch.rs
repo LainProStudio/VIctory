@@ -123,9 +123,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let guarded_pages = if !failed {
             #[cfg(feature = "diagnostics")]
             {
-                use crate::copystat::{C, add};
+                use crate::copystat::{C, add, direct_ok_range};
+                let us = started.elapsed().as_micros() as u64;
+                let len = (last - first) * PAGE;
                 add(C::WatchDirectOk, 1);
-                add(C::WatchDirectOkUs, started.elapsed().as_micros() as u64);
+                add(C::WatchDirectOkUs, us);
+                add(C::WatchDirectBytes, len as u64);
+                direct_ok_range(first * PAGE, len, us);
             }
             Vec::new()
         } else {

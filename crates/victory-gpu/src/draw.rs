@@ -90,10 +90,13 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
-    /// Last bindless view heap prepared on this list: `(heap, revision, copy_epoch)`.
+    /// The dynamic slots the list holds (title heap, first, count), given
+    /// back when the list is reset or released, or earlier when a heap runs
+    /// short after the list ran (see [`crate::descriptor::lease`]).
+    lease: std::sync::Arc<crate::descriptor::lease::Lease>,
+    /// A fresh table of the stage being bound could not be made.
+    table_failed: bool,
+    /// Last bindless view heap prepared on this list: `(heap, placed_revision, copy_epoch)`.
     bindless_prepared: Option<(usize, (u64, u64, u64, u64), u64)>,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
@@ -105,7 +108,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for (heap, first, n) in self.lease.take() {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
@@ -298,6 +301,44 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+    }
+
+    /// The list's slots, to start and finish its submissions.
+    pub(crate) fn lease(&self) -> &std::sync::Arc<crate::descriptor::lease::Lease> {
+        &self.lease
+    }
+
+    /// `n` consecutive dynamic slots of `host` (the host heap of the title
+    /// heap at address `key`), held by this list. When the heap has no room,
+    /// the slots of the oldest list that already ran are taken back first,
+    /// one list at a time, instead of dropping the draw.
+    fn take_dynamic(
+        &mut self,
+        host: &crate::descriptor::host::HostHeap,
+        key: usize,
+        n: u32,
+    ) -> Option<u32> {
+        let mut reclaimed = false;
+        loop {
+            if let Some(first) = host.dynamic(n) {
+                self.lease.add(key, first, n);
+                return Some(first);
+            }
+            let more = crate::descriptor::lease::reclaim(key, |(heap, first, n)| {
+                if heap == key {
+                    host.release(first, n);
+                } else {
+                    crate::descriptor::release_dynamic(heap, first, n);
+                }
+            });
+            if !more {
+                return None;
+            }
+            if !reclaimed {
+                reclaimed = true;
+                once!("dynamic descriptor slots of lists that already ran are taken back");
+            }
+        }
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -641,18 +682,32 @@ impl State {
             && self.heaps[0] != 0
             && let Some(host_heap) = crate::descriptor::heap(self.heaps[0] as This).host_arc()
         {
-            let epoch = list.title_write_epoch();
-            let key = (self.heaps[0], host_heap.revision(), epoch);
-            if self.bindless_prepared != Some(key) {
-                host_heap.prepare_bindless_record(list);
-                self.bindless_prepared = Some((self.heaps[0], host_heap.revision(), epoch));
+            let placed_rev = host_heap.placed_revision();
+            if placed_rev != (0, 0, 0, 0) {
+                let epoch = list.title_write_epoch();
+                let key = (self.heaps[0], placed_rev, epoch);
+                if self.bindless_prepared != Some(key) {
+                    host_heap.prepare_bindless_record(list);
+                    self.bindless_prepared = Some(key);
+                }
             }
             let writes = p.stages.iter().any(|s| s.translated().writes_memory);
             list.defer_bindless(&host_heap, writes);
         }
         for stage in &p.stages {
             let t = stage.translated();
+            self.table_failed = false;
             let Some(made) = self.tables(list, &t.used, compute) else {
+                if self.table_failed {
+                    static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                    let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(
+                            dropped = n,
+                            "a draw or dispatch dropped: no dynamic slots for its tables"
+                        );
+                    }
+                }
                 return false;
             };
             if let Some((param, dwords)) = stage.user_data {
@@ -836,19 +891,22 @@ impl State {
             .filter(|&a| a != 0)
             .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-        let slots = if uav {
-            &mut self.root_uav_slots
+        let existing = if uav {
+            self.root_uav_slots.get(&key).copied()
         } else {
-            &mut self.root_srv_slots
+            self.root_srv_slots.get(&key).copied()
         };
-        let index = match slots.get(&key) {
-            Some(&index) => index,
+        let index = match existing {
+            Some(index) => index,
             None => {
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.take_dynamic(host, key.0, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
-                slots.insert(key, index);
+                if uav {
+                    self.root_uav_slots.insert(key, index);
+                } else {
+                    self.root_srv_slots.insert(key, index);
+                }
                 let install_null = |index: u32| {
                     if uav {
                         host.null_raw_uav_at(index);
@@ -1142,12 +1200,11 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = self.take_dynamic(host, std::ptr::from_ref(heap) as usize, n) else {
+                self.table_failed = true;
                 return None;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -2875,5 +2932,72 @@ mod tests {
             readback.Unmap(0, None);
         }
         assert_eq!(pixels, [[0, 255, 0, 255]; (SIDE * SIDE) as usize]);
+    }
+
+    fn heap_capacity(heap: &crate::descriptor::host::HostHeap) -> u32 {
+        let mut n = 0;
+        while heap.dynamic(1).is_some() {
+            n += 1;
+        }
+        heap.release(heap.count(), n);
+        n
+    }
+
+    #[test]
+    fn a_full_heap_takes_back_the_slots_of_a_list_that_ran() {
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 4) else {
+            return;
+        };
+        let key = 0x2000_0001;
+        let total = heap_capacity(&heap);
+        let chunk = 1000;
+        let mut ran = State::default();
+        let mut taken = 0;
+        while ran.take_dynamic(&heap, key, chunk).is_some() {
+            taken += chunk;
+        }
+        assert!(taken >= total - chunk, "the list filled the heap");
+        let mut other = State::default();
+        assert_eq!(other.take_dynamic(&heap, key, chunk), None);
+        assert!(!ran.lease().is_lost());
+        assert!(ran.lease().start());
+        ran.lease().finish();
+        assert!(other.take_dynamic(&heap, key, chunk).is_some());
+        assert!(ran.lease().is_lost());
+        assert!(
+            !ran.lease().start(),
+            "a list that lost its slots must not run"
+        );
+        assert!(ran.lease().take().is_empty());
+        assert_eq!(heap_capacity(&heap), total - chunk);
+        let mut third = State::default();
+        assert_eq!(third.take_dynamic(&heap, key, total), None);
+    }
+
+    #[test]
+    fn a_running_or_reset_list_is_not_taken_back() {
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 4) else {
+            return;
+        };
+        let key = 0x2000_0002;
+        let total = heap_capacity(&heap);
+        let mut running = State::default();
+        let first = running.take_dynamic(&heap, key, total).unwrap();
+        assert_eq!(first, heap.count());
+        running.lease().finish();
+        assert!(running.lease().start());
+        let mut other = State::default();
+        assert_eq!(other.take_dynamic(&heap, key, 1), None);
+        assert!(!running.lease().is_lost());
+        running.lease().finish();
+        assert_eq!(other.take_dynamic(&heap, key, 1), Some(heap.count()));
+        assert!(running.lease().is_lost());
+        let mut reset = State::default();
+        assert!(reset.take_dynamic(&heap, key, 1).is_some());
+        reset.lease().finish();
+        assert_eq!(reset.lease().take().len(), 1);
+        let mut last = State::default();
+        assert_eq!(last.take_dynamic(&heap, key, total), None);
+        assert!(!reset.lease().is_lost());
     }
 }

@@ -8,7 +8,7 @@
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -45,6 +45,10 @@ pub(crate) struct HostHeap {
     bindless: Mutex<Bindless>,
     /// Incremented whenever `bindless.slots` changes.
     revision: AtomicU64,
+    /// Incremented only when `bindless.placed_tex` changes (not buffers/CBVs).
+    placed_revision: AtomicU64,
+    /// Number of placed textures currently tracked in `bindless.placed_tex`.
+    placed_count: AtomicU32,
 }
 
 // SAFETY: D3D12 descriptor heaps and resources are free-threaded; mutable
@@ -127,6 +131,8 @@ impl ResolvedSlot {
 struct Bindless {
     /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
     slots: BTreeMap<u32, (u32, u32)>,
+    /// Subset of `slots` holding placed textures (`View::Placed(false, r, _)` with `r[0] != 1`).
+    placed_tex: HashMap<u32, (u32, u32)>,
     /// Persistent 256-byte-aligned bounce slices by `slot_index`.
     cbv_bounce: HashMap<u32, BounceSlot>,
     /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
@@ -138,7 +144,7 @@ struct Bindless {
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
     /// The placed-texture slots draws prepare at recording, keyed only by
-    /// `(slots_revision, VIEWED_FORGET)`.
+    /// `(placed_revision, VIEWED_FORGET)`.
     placed: Option<((u64, u64), PlacedSlots)>,
 }
 
@@ -457,6 +463,8 @@ impl HostHeap {
             strides,
             bindless: Mutex::default(),
             revision: AtomicU64::new(0),
+            placed_revision: AtomicU64::new(0),
+            placed_count: AtomicU32::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -588,6 +596,20 @@ impl HostHeap {
     pub(crate) fn revision(&self) -> (u64, u64, u64, u64) {
         (
             self.revision.load(Ordering::Acquire),
+            crate::resource::placed_epoch(),
+            VIEWED_REMAP.load(Ordering::Acquire),
+            VIEWED_FORGET.load(Ordering::Acquire),
+        )
+    }
+
+    /// Current placed-texture revision, placed-texture, remap, and forget epochs.
+    /// Returns `(0, 0, 0, 0)` in O(1) when this heap tracks zero placed textures.
+    pub(crate) fn placed_revision(&self) -> (u64, u64, u64, u64) {
+        if self.placed_count.load(Ordering::Acquire) == 0 {
+            return (0, 0, 0, 0);
+        }
+        (
+            self.placed_revision.load(Ordering::Acquire),
             crate::resource::placed_epoch(),
             VIEWED_REMAP.load(Ordering::Acquire),
             VIEWED_FORGET.load(Ordering::Acquire),
@@ -881,6 +903,7 @@ impl HostHeap {
             return None;
         };
         let is_buf = !self.sampler && view.is_buffer();
+        let is_placed_tex = !self.sampler && matches!(view, View::Placed(false, r, _) if r[0] != 1);
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             if made[index as usize] != key {
@@ -901,7 +924,7 @@ impl HostHeap {
         }
         if !self.sampler {
             if is_buf {
-                self.track_bindless(index, (i, generation));
+                self.track_bindless(index, (i, generation), is_placed_tex);
             } else {
                 self.untrack_bindless(index);
             }
@@ -909,7 +932,13 @@ impl HostHeap {
         Some(view)
     }
 
-    fn track_bindless(&self, index: u32, entry: (u32, u32)) {
+    fn bump_placed(&self, b: &Bindless) {
+        self.placed_count
+            .store(b.placed_tex.len() as u32, Ordering::Release);
+        self.placed_revision.fetch_add(1, Ordering::Release);
+    }
+
+    fn track_bindless(&self, index: u32, entry: (u32, u32), is_placed_tex: bool) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         if b.slots.insert(index, entry) != Some(entry) {
             b.resolved.remove(&index);
@@ -917,6 +946,13 @@ impl HostHeap {
                 bounce.active = false;
             }
             self.revision.fetch_add(1, Ordering::Release);
+        }
+        if is_placed_tex {
+            if b.placed_tex.insert(index, entry) != Some(entry) {
+                self.bump_placed(&b);
+            }
+        } else if b.placed_tex.remove(&index).is_some() {
+            self.bump_placed(&b);
         }
     }
 
@@ -928,6 +964,9 @@ impl HostHeap {
                 bounce.active = false;
             }
             self.revision.fetch_add(1, Ordering::Release);
+        }
+        if b.placed_tex.remove(&index).is_some() {
+            self.bump_placed(&b);
         }
     }
 
@@ -1178,6 +1217,7 @@ impl HostHeap {
         }
         if !stale.is_empty() {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            let mut placed_changed = false;
             for idx in stale {
                 b.resolved.remove(&idx);
                 if b.slots.remove(&idx).is_some()
@@ -1185,40 +1225,32 @@ impl HostHeap {
                 {
                     bounce.active = false;
                 }
+                if b.placed_tex.remove(&idx).is_some() {
+                    placed_changed = true;
+                }
+            }
+            if placed_changed {
+                self.bump_placed(&b);
             }
         }
     }
 
     /// The slots viewing placed textures (not buffers), which draws prepare
-    /// as they are recorded; found again only when the slots or forget epoch change.
+    /// as they are recorded; found again only when placed texture slots or
+    /// forget epoch change.
     fn placed_slots(&self) -> PlacedSlots {
         let key = (
-            self.revision.load(Ordering::Acquire),
+            self.placed_revision.load(Ordering::Acquire),
             VIEWED_FORGET.load(Ordering::Acquire),
         );
-        let entries: Vec<(u32, (u32, u32))> = {
-            let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((k, placed)) = &b.placed
-                && *k == key
-            {
-                return placed.clone();
-            }
-            b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
-        };
-        let placed: Arc<Vec<_>> = Arc::new(
-            entries
-                .into_iter()
-                .filter(|&(_, (vi, generation))| {
-                    // Stale slots are kept so that the caller prunes them.
-                    view_at(vi, generation)
-                        .is_none_or(|v| matches!(v, View::Placed(false, r, _) if r[0] != 1))
-                })
-                .collect(),
-        );
-        self.bindless
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .placed = Some((key, placed.clone()));
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, placed)) = &b.placed
+            && *k == key
+        {
+            return placed.clone();
+        }
+        let placed: Arc<Vec<_>> = Arc::new(b.placed_tex.iter().map(|(&idx, &v)| (idx, v)).collect());
+        b.placed = Some((key, placed.clone()));
         placed
     }
 
@@ -1242,6 +1274,10 @@ impl HostHeap {
                     return Some(plan.clone());
                 }
                 if b.slots.is_empty() {
+                    if !b.placed_tex.is_empty() {
+                        b.placed_tex.clear();
+                        self.bump_placed(&b);
+                    }
                     b.resolved.clear();
                     b.resolved_global = global;
                     b.plan = None;
@@ -1275,6 +1311,7 @@ impl HostHeap {
                     self.clear_stale_slot(idx);
                 }
                 let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+                let mut placed_changed = false;
                 for idx in stale_forgotten {
                     b.resolved.remove(&idx);
                     if b.slots.remove(&idx).is_some()
@@ -1282,8 +1319,18 @@ impl HostHeap {
                     {
                         bounce.active = false;
                     }
+                    if b.placed_tex.remove(&idx).is_some() {
+                        placed_changed = true;
+                    }
+                }
+                if placed_changed {
+                    self.bump_placed(&b);
                 }
                 if b.slots.is_empty() {
+                    if !b.placed_tex.is_empty() {
+                        b.placed_tex.clear();
+                        self.bump_placed(&b);
+                    }
                     b.resolved.clear();
                     b.plan = None;
                     return None;
@@ -1335,6 +1382,7 @@ impl HostHeap {
                 // `b.resolved_global.2` as-is so the next iteration prunes incrementally.
                 continue;
             }
+            let mut placed_changed = false;
             for idx in stale {
                 b.resolved.remove(&idx);
                 if b.slots.remove(&idx).is_some()
@@ -1342,6 +1390,12 @@ impl HostHeap {
                 {
                     bounce.active = false;
                 }
+                if b.placed_tex.remove(&idx).is_some() {
+                    placed_changed = true;
+                }
+            }
+            if placed_changed {
+                self.bump_placed(&b);
             }
             for (index, entry, resolved) in newly_resolved {
                 if b.slots.get(&index) == Some(&entry) {
@@ -1349,6 +1403,10 @@ impl HostHeap {
                 }
             }
             if b.slots.is_empty() {
+                if !b.placed_tex.is_empty() {
+                    b.placed_tex.clear();
+                    self.bump_placed(&b);
+                }
                 b.resolved.clear();
                 b.plan = None;
                 return None;
@@ -3875,5 +3933,40 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut past = 16u64;
         let mut past_count = 4u32;
         assert!(!clamp_buffer_view(&buf, 4, &mut past, &mut past_count));
+    }
+
+    #[test]
+    fn buffer_slot_updates_do_not_bump_placed_revision() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(8);
+        let mem = crate::resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        assert_eq!(host_heap.placed_revision(), (0, 0, 0, 0));
+
+        let rev0 = host_heap.revision();
+        create_cbv(
+            std::ptr::null(),
+            &[mem.address() as u32, (mem.address() >> 32) as u32, 256, 0],
+            base,
+        );
+        assert_ne!(host_heap.revision(), rev0);
+        assert_eq!(host_heap.placed_revision(), (0, 0, 0, 0));
+
+        host_heap.track_bindless(2, (11, 1), true);
+        let prev1 = host_heap.placed_revision();
+        assert_ne!(prev1, (0, 0, 0, 0));
+        assert_eq!(host_heap.placed_slots().as_slice(), &[(2, (11, 1))]);
+
+        host_heap.track_bindless(3, (12, 1), false);
+        assert_eq!(host_heap.placed_revision(), prev1);
+
+        host_heap.untrack_bindless(2);
+        assert_eq!(host_heap.placed_revision(), (0, 0, 0, 0));
+        assert!(host_heap.placed_slots().is_empty());
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
     }
 }

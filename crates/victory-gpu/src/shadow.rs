@@ -275,102 +275,192 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
+    #[cfg(test)]
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        self.copy_back_ranges(&[(address, len)])
+    }
+
+    /// Coalesced [`Shadow::copy_back`] across multiple `(address, len)` ranges
+    /// belonging to the same shadow in one submission, scanning overlapping
+    /// bytes at most once and re-arming write-watch only on synced pages.
+    pub(crate) fn copy_back_ranges(&self, ranges: &[(usize, usize)]) -> usize {
+        fn flush_run(
+            chunk_start: usize,
+            chunk_len: usize,
+            s: usize,
+            end_i: usize,
+            title: &[u8],
+            opened_chunk: &mut bool,
+            written: &mut usize,
+        ) {
+            if !*opened_chunk {
+                crate::watch::writing(chunk_start, chunk_len);
+                *opened_chunk = true;
+            }
+            let dst = chunk_start + s;
+            let run_len = end_i - s;
+            crate::host::write_mapped(dst as *mut u8, title[s..].as_ptr(), run_len);
+            *written += run_len;
+        }
+
+        let mut clamped: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|&(address, len)| self.inside(address, len))
+            .filter(|&(from, to)| from < to)
+            .collect();
+        clamped.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(clamped.len());
+        for (from, to) in clamped {
+            match merged.last_mut() {
+                Some((_, end)) if from <= *end => *end = (*end).max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
         let start = self.start as usize;
+        let shadow_len = self.len as usize;
         if let Some((taken, before)) = &mut *snapshot
-            && *taken <= from
-            && to <= *taken + before.len()
-            && from < to
+            && !merged.is_empty()
         {
-            let before = &mut before[from - *taken..to - *taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
+            let snap_end = *taken + before.len();
             COPY_BACK_SCRATCH.with(|buf| {
                 let mut title_buf = buf.borrow_mut();
                 if title_buf.len() < PIECE {
                     title_buf.resize(PIECE, 0);
                 }
                 let mut synced = Vec::new();
-                let mut at = from;
-                while at < to {
-                    let n = (PIECE - (start + at) % PIECE).min(to - at);
-                    // SAFETY: inside the mapping; only the submitting thread
-                    // writes it.
-                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let old = &mut before[at - from..at - from + n];
-                    let title = &mut title_buf[..n];
-                    if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                        // Only write contiguous byte runs the GPU actually modified
-                        // (avoiding a 64 KiB RMW overwrite of concurrent CPU writes
-                        // elsewhere in the same chunk). Sync both `host` and `old` to
-                        // the merged title bytes.
-                        let mut dirty_start: Option<usize> = None;
-                        for i in 0..n {
-                            let h = host[i];
-                            let t = title[i];
-                            let merged = if h != old[i] && t != h {
-                                title[i] = h;
-                                dirty_start.get_or_insert(i);
-                                h
-                            } else {
-                                if let Some(s) = dirty_start.take() {
-                                    let dst = start + at + s;
-                                    let run_len = i - s;
-                                    crate::watch::writing(dst, run_len);
-                                    crate::host::write_mapped(dst as *mut u8, title[s..].as_ptr(), run_len);
-                                    written += run_len;
-                                }
-                                t
-                            };
-                            host[i] = merged;
-                            old[i] = merged;
-                        }
-                        if let Some(s) = dirty_start {
-                            let dst = start + at + s;
-                            let run_len = n - s;
-                            crate::watch::writing(dst, run_len);
-                            crate::host::write_mapped(dst as *mut u8, title[s..].as_ptr(), run_len);
-                            written += run_len;
-                        }
-                        synced.push((start + at) / PAGE);
+                for &(from, to) in &merged {
+                    let (f, t) = (from.max(*taken), to.min(snap_end));
+                    if f >= t {
+                        continue;
                     }
-                    at += n;
+                    let mut at = f;
+                    while at < t {
+                        let n = (PIECE - (start + at) % PIECE).min(t - at);
+                        // SAFETY: inside the mapping; only the submitting thread writes it.
+                        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        let old = &mut before[at - *taken..at - *taken + n];
+                        let title = &mut title_buf[..n];
+                        if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                            let mut opened_chunk = false;
+                            let mut dirty_start: Option<usize> = None;
+                            let mut i = 0usize;
+                            while i < n {
+                                if i + 8 <= n && host[i..i + 8] == old[i..i + 8] {
+                                    if let Some(s) = dirty_start.take() {
+                                        flush_run(
+                                            start + at,
+                                            n,
+                                            s,
+                                            i,
+                                            title,
+                                            &mut opened_chunk,
+                                            &mut written,
+                                        );
+                                    }
+                                    host[i..i + 8].copy_from_slice(&title[i..i + 8]);
+                                    old[i..i + 8].copy_from_slice(&title[i..i + 8]);
+                                    i += 8;
+                                    continue;
+                                }
+                                let end_j = (i + 8).min(n);
+                                for j in i..end_j {
+                                    let h = host[j];
+                                    let t_byte = title[j];
+                                    if h != old[j] && t_byte != h {
+                                        title[j] = h;
+                                        dirty_start.get_or_insert(j);
+                                        old[j] = h;
+                                    } else {
+                                        if let Some(s) = dirty_start.take() {
+                                            flush_run(
+                                                start + at,
+                                                n,
+                                                s,
+                                                j,
+                                                title,
+                                                &mut opened_chunk,
+                                                &mut written,
+                                            );
+                                        }
+                                        host[j] = t_byte;
+                                        old[j] = t_byte;
+                                    }
+                                }
+                                i = end_j;
+                            }
+                            if let Some(s) = dirty_start {
+                                flush_run(
+                                    start + at,
+                                    n,
+                                    s,
+                                    n,
+                                    title,
+                                    &mut opened_chunk,
+                                    &mut written,
+                                );
+                            }
+                            synced.push((start + at) / PAGE);
+                        }
+                        at += n;
+                    }
                 }
-                // Pages made equal to title memory are current in the copy, so
-                // our own write is not taken for the title's; others keep what
-                // they had (a title write there shows at the next refresh).
-                let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-                if first < last
-                    && !synced.is_empty()
-                    && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                    && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-                {
+                // Re-arm write-watch only on contiguous runs of full pages synced above
+                // so unrelated untouched subranges avoid multi-MB kernel queries.
+                let covers_full_page = |p: usize| -> bool {
+                    let Some(pf) = (p * PAGE).checked_sub(start) else {
+                        return false;
+                    };
+                    let pt = pf + PAGE;
+                    pt <= shadow_len && merged.iter().any(|&(f, t)| f <= pf && pt <= t)
+                };
+                synced.retain(|&p| covers_full_page(p));
+                synced.sort_unstable();
+                synced.dedup();
+                if !synced.is_empty() && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
                     let base = start / PAGE;
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                        copied[page - base] = now;
+                    let mut idx = 0;
+                    while idx < synced.len() {
+                        let run_start = synced[idx];
+                        let mut run_end = run_start + 1;
+                        while idx + 1 < synced.len() && synced[idx + 1] == run_end {
+                            idx += 1;
+                            run_end += 1;
+                        }
+                        if let Some((now, _)) =
+                            crate::watch::writes(run_start * PAGE, run_end * PAGE, true)
+                        {
+                            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                            for page in run_start..run_end {
+                                copied[page - base] = now;
+                            }
+                        }
+                        idx += 1;
                     }
                 }
             });
         }
         #[cfg(feature = "diagnostics")]
         if written > 0 && log_copyback() {
+            let (first_addr, first_len) = ranges.first().copied().unwrap_or((0, 0));
             tracing::info!(
                 shadow_start = format_args!("{:#x}", self.start),
-                address = format_args!("{address:#x}"),
-                len,
+                address = format_args!("{first_addr:#x}"),
+                len = first_len,
+                ranges = ranges.len(),
                 written,
                 "shadow copy_back"
             );
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // Every submitted step that declared these ranges is done with them,
+        // and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        for &(address, len) in ranges {
+            pending.retain(|&r| r != (address, address + len));
+        }
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -1055,5 +1145,55 @@ mod tests {
         assert_eq!(s.copy_back(p1, PAGE), 1);
         assert_eq!(peek(p1 + 2), 0xaa);
         assert_eq!(peek(p1 + 1), 0x22);
+    }
+
+    #[test]
+    fn copy_back_ranges_coalesces_overlaps_and_preserves_concurrent_cpu_writes() {
+        let Some((_memory, base, s)) = title() else {
+            return;
+        };
+        let copy = |at: usize| s.data as usize + (at - base);
+        for off in 0..2 * PAGE {
+            poke(base + off, 0x10);
+        }
+        s.update(base, 2 * PAGE);
+        s.writing(base, PAGE + 1024);
+        s.writing(base + 512, 2 * PAGE - 512);
+        poke(copy(base + 20), 0xde);
+        poke(copy(base + 600), 0xad);
+        poke(copy(base + PAGE + 64), 0xbe);
+        poke(base + 700, 0x55);
+
+        let written = s.copy_back_ranges(&[(base, PAGE + 1024), (base + 512, 2 * PAGE - 512)]);
+        assert_eq!(written, 3);
+        assert_eq!(peek(base + 20), 0xde);
+        assert_eq!(peek(base + 600), 0xad);
+        assert_eq!(peek(base + PAGE + 64), 0xbe);
+        assert_eq!(peek(base + 700), 0x55);
+        assert!(s.pending.lock().unwrap().is_empty());
+        assert!(s.before.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn copy_back_only_watches_synced_pages() {
+        let Some((_memory, base, s)) = title() else {
+            return;
+        };
+        let copy = |at: usize| s.data as usize + (at - base);
+        for p in 0..3 {
+            poke(base + p * PAGE + 4, 0x11 + p as u8);
+        }
+        s.update(base, 3 * PAGE);
+        s.writing(base, 3 * PAGE);
+        // GPU modifies only page 1 while CPU modifies page 0 and page 2 concurrently.
+        poke(copy(base + PAGE + 8), 0xef);
+        poke(base + 12, 0x77);
+        poke(base + 2 * PAGE + 12, 0x99);
+        assert_eq!(s.copy_back(base, 3 * PAGE), 1);
+        assert_eq!(peek(base + PAGE + 8), 0xef);
+        // Updating the full shadow must still pick up CPU writes on page 0 and page 2.
+        s.update(base, 3 * PAGE);
+        assert_eq!(peek(copy(base + 12)), 0x77);
+        assert_eq!(peek(copy(base + 2 * PAGE + 12)), 0x99);
     }
 }

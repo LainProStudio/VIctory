@@ -89,7 +89,7 @@ unsafe impl Send for UploadPool {}
 
 impl UploadPool {
     const CHUNK_BYTES: u64 = 32 << 20;
-    const MAX_POOLED_BYTES: u64 = 128 << 20;
+    const MAX_POOLED_BYTES: u64 = 256 << 20;
 
     pub(crate) const fn new() -> Self {
         Self {
@@ -239,14 +239,25 @@ impl Staging {
     /// Detiles the texture memory into `pool` only when it changed since the last
     /// time (and is mapped at all). Returns `Some((upload_buffer, base_offset))`
     /// when a copy to the host texture is required.
+    #[cfg(test)]
     pub(crate) fn refresh(
         &self,
         host: &crate::host::Host,
         pool: &mut UploadPool,
     ) -> Option<(ID3D12Resource, u64)> {
+        self.refresh_with_watch(host, pool, None)
+    }
+
+    /// As [`Staging::refresh`], reusing a pre-fetched write-watch answer when provided.
+    pub(crate) fn refresh_with_watch(
+        &self,
+        host: &crate::host::Host,
+        pool: &mut UploadPool,
+        prefetched: Option<(u64, &[(usize, u64)])>,
+    ) -> Option<(ID3D12Resource, u64)> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, uploaded) = self.refresh_now(host, pool);
+        let (read, uploaded) = self.refresh_now(host, pool, prefetched);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -258,14 +269,24 @@ impl Staging {
         &self,
         host: &crate::host::Host,
         pool: &mut UploadPool,
+        prefetched: Option<(u64, &[(usize, u64)])>,
     ) -> (usize, Option<(ID3D12Resource, u64)>) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) =
-            crate::watch::writes(start, start + size, !hash_textures())
+        let watched_answer = if let (false, Some((now, all_written))) = (hash_textures(), prefetched)
         {
+            let first = start / crate::watch::PAGE;
+            let last_page = (start + size).div_ceil(crate::watch::PAGE);
+            let lo = all_written.partition_point(|&(p, _)| p < first);
+            let hi = all_written.partition_point(|&(p, _)| p < last_page);
+            Some((now, std::borrow::Cow::Borrowed(&all_written[lo..hi])))
+        } else {
+            crate::watch::writes(start, start + size, !hash_textures())
+                .map(|(now, v)| (now, std::borrow::Cow::Owned(v)))
+        };
+        if let Some((now, written)) = watched_answer {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return (0, None);
             }
