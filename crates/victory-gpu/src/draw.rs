@@ -1961,6 +1961,7 @@ mod tests {
     impl Drop for Allocation {
         fn drop(&mut self) {
             crate::host::forget_unreadable(self.ptr as usize, self.len);
+            crate::watch::forget_journal(self.ptr as usize, self.len);
             // SAFETY: `self.ptr` came from `VirtualAlloc`.
             unsafe {
                 VirtualFree(self.ptr.cast(), 0, MEM_RELEASE);

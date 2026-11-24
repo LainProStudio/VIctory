@@ -442,6 +442,9 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) use tests::forget_journal;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
@@ -486,7 +489,7 @@ mod tests {
         view
     }
 
-    fn forget_journal(start: usize, len: usize) {
+    pub fn forget_journal(start: usize, len: usize) {
         let pages = start / PAGE..(start + len).div_ceil(PAGE);
         JOURNAL
             .lock()
@@ -703,6 +706,7 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        forget_journal(start, 4 * PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
@@ -722,6 +726,7 @@ mod tests {
             )
             .is_none()
         );
+        forget_journal(start, 4 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
