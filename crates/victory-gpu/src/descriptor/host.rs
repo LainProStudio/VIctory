@@ -199,6 +199,28 @@ impl Bindless {
         }
     }
 
+    fn dirty_entries(&self) -> Vec<(u32, (u32, u32))> {
+        self.dirty.iter()
+            .filter_map(|idx| self.slots.get(idx).map(|&v| (*idx, v)))
+            .collect()
+    }
+
+    fn invalidate_remaps(&mut self, remaps: &[(u64, u64)]) {
+        if remaps.is_empty() {
+            return;
+        }
+        let evicted: Vec<_> = self.resolved.iter()
+            .filter(|(_, slot)| slot.overlaps(remaps))
+            .map(|(&idx, _)| idx)
+            .collect();
+        for idx in evicted {
+            self.remove_resolved(idx);
+            if self.slots.contains_key(&idx) {
+                self.dirty.insert(idx);
+            }
+        }
+    }
+
     fn clear_resolved(&mut self) {
         self.resolved.clear();
         self.incremental.clear();
@@ -341,7 +363,7 @@ pub(crate) struct BindlessPlan {
     /// Misaligned constant buffers: bounce slice, title address, bytes.
     bounces: Arc<Vec<(usize, u64, u32)>>,
     /// The host resources the slots view, held while a submission runs.
-    _retained: Arc<Vec<ID3D12Resource>>,
+    _retained: RetainedPages<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 resources are free-threaded; the rest is plain data.
@@ -487,6 +509,65 @@ impl ShadowSpanSet {
     }
 }
 
+// A submission holds one directory Arc. A dirty descriptor copies at most its
+// resource page on first write after publication. Counts live outside the
+// snapshot so duplicate views do not copy even that page.
+const RETAINED_PAGE: usize = 32;
+type RetainedPages<T> = Arc<Vec<Arc<[Option<T>; RETAINED_PAGE]>>>;
+
+struct RetainedResources<T> {
+    pages: RetainedPages<T>,
+    // Native resource identity -> (page slot, active descriptor count).
+    entries: HashMap<usize, (usize, usize)>,
+    free: Vec<usize>,
+    next: usize,
+}
+
+impl<T> Default for RetainedResources<T> {
+    fn default() -> Self {
+        Self { pages: Arc::default(), entries: HashMap::new(), free: Vec::new(), next: 0 }
+    }
+}
+
+impl<T: Clone> RetainedResources<T> {
+    fn insert(&mut self, key: usize, resource: &T) {
+        let entry = match self.entries.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().1 += 1;
+                return;
+            }
+            std::collections::hash_map::Entry::Vacant(e) => e,
+        };
+        let index = self.free.pop().unwrap_or_else(|| {
+            let next = self.next;
+            self.next += 1;
+            next
+        });
+        entry.insert((index, 1));
+        let pages = Arc::make_mut(&mut self.pages);
+        let page = index / RETAINED_PAGE;
+        if page == pages.len() {
+            pages.push(Arc::new(std::array::from_fn(|_| None)));
+        }
+        Arc::make_mut(&mut pages[page])[index % RETAINED_PAGE] = Some(resource.clone());
+    }
+
+    fn remove(&mut self, key: usize) {
+        let std::collections::hash_map::Entry::Occupied(mut entry) = self.entries.entry(key) else {
+            return;
+        };
+        let (index, count) = entry.get_mut();
+        *count -= 1;
+        if *count == 0 {
+            let index = *index;
+            entry.remove();
+            self.free.push(index);
+            let pages = Arc::make_mut(&mut self.pages);
+            Arc::make_mut(&mut pages[index / RETAINED_PAGE])[index % RETAINED_PAGE] = None;
+        }
+    }
+}
+
 #[derive(Default)]
 struct IncrementalPlan {
     slot_count: usize,
@@ -494,12 +575,11 @@ struct IncrementalPlan {
     writes: BTreeMap<usize, ShadowSpanSet>,
     bounces: HashMap<u32, (usize, u64, u32)>,
     placed: HashMap<usize, (PlacedTextureTarget, u32)>,
-    retained: HashMap<usize, (ID3D12Resource, u32)>,
+    retained: RetainedResources<ID3D12Resource>,
     reads_cache: Option<ShadowSpanList>,
     writes_cache: Option<ShadowSpanList>,
     bounces_cache: Option<Arc<Vec<(usize, u64, u32)>>>,
     placed_cache: Option<PlacedCache>,
-    retained_cache: Option<Arc<Vec<ID3D12Resource>>>,
 }
 
 // SAFETY: all contained D3D12 resources and `Arc` wrappers are free-threaded.
@@ -512,35 +592,21 @@ impl IncrementalPlan {
         self.writes.clear();
         self.bounces.clear();
         self.placed.clear();
-        self.retained.clear();
+        self.retained = RetainedResources::default();
         self.reads_cache = None;
         self.writes_cache = None;
         self.bounces_cache = None;
         self.placed_cache = None;
-        self.retained_cache = None;
     }
 
     fn add_retained(&mut self, res: &ID3D12Resource) {
         use windows::core::Interface;
-        let key = res.as_raw() as usize;
-        if let Some((_, count)) = self.retained.get_mut(&key) {
-            *count += 1;
-        } else {
-            self.retained.insert(key, (res.clone(), 1));
-            self.retained_cache = None;
-        }
+        self.retained.insert(res.as_raw() as usize, res);
     }
 
     fn remove_retained(&mut self, res: &ID3D12Resource) {
         use windows::core::Interface;
-        let key = res.as_raw() as usize;
-        if let Some((_, count)) = self.retained.get_mut(&key) {
-            *count -= 1;
-            if *count == 0 {
-                self.retained.remove(&key);
-                self.retained_cache = None;
-            }
-        }
+        self.retained.remove(res.as_raw() as usize);
     }
 
     fn add_span(
@@ -779,19 +845,13 @@ impl IncrementalPlan {
                 (Arc::new(targets), Arc::new(spans))
             })
             .clone();
-        let _retained = self
-            .retained_cache
-            .get_or_insert_with(|| {
-                Arc::new(self.retained.values().map(|(r, _)| r.clone()).collect())
-            })
-            .clone();
         Arc::new(BindlessPlan {
             reads,
             writes,
             placed_textures,
             placed_watch_spans,
             bounces,
-            _retained,
+            _retained: self.retained.pages.clone(),
         })
     }
 }
@@ -2047,20 +2107,7 @@ impl HostHeap {
                 if prev.1 != global.1 {
                     let before = b.resolved.len();
                     if let Some(remaps) = remaps_since(prev.1, global.1) {
-                        if !remaps.is_empty() {
-                            let evicted: Vec<u32> = b
-                                .resolved
-                                .iter()
-                                .filter(|(_, v)| v.overlaps(&remaps))
-                                .map(|(&idx, _)| idx)
-                                .collect();
-                            for idx in evicted {
-                                b.remove_resolved(idx);
-                                if b.slots.contains_key(&idx) {
-                                    b.dirty.insert(idx);
-                                }
-                            }
-                        }
+                        b.invalidate_remaps(&remaps);
                         remap_checked_eviction = true;
                     } else {
                         b.clear_resolved();
@@ -2085,10 +2132,7 @@ impl HostHeap {
                         .filter_map(|idx| b.slots.get(idx).map(|&v| (*idx, v)))
                         .collect()
                 } else {
-                    b.dirty
-                        .iter()
-                        .filter_map(|idx| b.slots.get(idx).map(|&v| (*idx, v)))
-                        .collect()
+                    b.dirty_entries()
                 };
                 (need_forget, list)
             };
@@ -2162,10 +2206,7 @@ impl HostHeap {
                         return Some(plan.clone());
                     }
                 }
-                b.dirty
-                    .iter()
-                    .filter_map(|idx| b.slots.get(idx).map(|&v| (*idx, v)))
-                    .collect()
+                b.dirty_entries()
             } else {
                 entries_or_dirty
             };
@@ -2305,20 +2346,7 @@ impl HostHeap {
             let remap_changed = b.resolved_global.1 != current_global.1;
             if remap_changed {
                 if let Some(remaps) = remaps_since(b.resolved_global.1, current_global.1) {
-                    if !remaps.is_empty() {
-                        let evicted: Vec<u32> = b
-                            .resolved
-                            .iter()
-                            .filter(|(_, v)| v.overlaps(&remaps))
-                            .map(|(&idx, _)| idx)
-                            .collect();
-                        for idx in evicted {
-                            b.remove_resolved(idx);
-                            if b.slots.contains_key(&idx) {
-                                b.dirty.insert(idx);
-                            }
-                        }
-                    }
+                    b.invalidate_remaps(&remaps);
                     for (index, entry, resolved, forgettable) in newly_resolved {
                         if b.slots.get(&index) == Some(&entry) && !resolved.overlaps(&remaps) {
                             b.set_resolved(index, resolved);
@@ -4969,7 +4997,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         let host_heap = heap(title_heap).host_arc().unwrap();
         let plan = host_heap.bindless_plan().unwrap();
-        assert_eq!(plan._retained.len(), 1);
+        assert_eq!(plan._retained.iter().flat_map(|p| p.iter().flatten()).count(), 1);
         assert_eq!(plan.reads.len(), 1);
 
         crate::shadow::unregister(0x30_0002, mem.address());
@@ -5184,6 +5212,78 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         if let Some(heap) = HostHeap::new(false, 1_048_576) {
             assert!(heap.count + heap.dynamic <= PORTABLE_VIEWS);
+        }
+    }
+
+    #[test]
+    fn incremental_plan_resolves_only_dirty_and_remapped_slots() {
+        let mut heap = Bindless::default();
+        let slot = |i: u32| ResolvedSlot::Null {
+            range: Some((u64::from(i) * 64, u64::from(i + 1) * 64)),
+        };
+        for i in 0..1024 {
+            heap.slots.insert(i, (i, 0));
+            heap.set_resolved(i, slot(i));
+        }
+        heap.slots.insert(91, (91, 1));
+        heap.remove_resolved(91);
+        heap.dirty.insert(91);
+        heap.invalidate_remaps(&[(63, 65)]);
+        let mut dirty = heap.dirty_entries();
+        dirty.sort_unstable();
+        assert_eq!(dirty, [(0, (0, 0)), (1, (1, 0)), (91, (91, 1))]);
+        for (i, _) in dirty {
+            heap.set_resolved(i, slot(i));
+        }
+        assert!(heap.dirty_entries().is_empty());
+        assert_eq!(heap.incremental.slot_count, 1024);
+        for i in 0..1024 {
+            assert_eq!(heap.resolved[&i].range(), slot(i).range());
+        }
+    }
+
+    #[test]
+    fn retained_plan_updates_only_dirty_pages_and_matches_a_full_rebuild() {
+        fn keys(pages: &RetainedPages<usize>) -> Vec<usize> {
+            let mut keys: Vec<_> = pages.iter().flat_map(|p| p.iter().flatten().copied()).collect();
+            keys.sort_unstable();
+            keys
+        }
+
+        let n = 32 * RETAINED_PAGE;
+        let mut slots: Vec<_> = (0..n).collect();
+        let mut retained = RetainedResources::default();
+        for &id in &slots {
+            retained.insert(id, &id);
+        }
+        let original = retained.pages.clone();
+        // Another view of the same resource, then removal of that view.
+        retained.insert(17, &17);
+        retained.remove(17);
+        assert!(Arc::ptr_eq(&original, &retained.pages));
+
+        // Replace one resolved descriptor, in the middle of a full plan.
+        retained.remove(slots[77]);
+        slots[77] = n;
+        retained.insert(n, &n);
+        let changed = original.iter().zip(retained.pages.iter())
+            .filter(|(a, b)| !Arc::ptr_eq(a, b)).count();
+        assert_eq!(changed, 1);
+        assert_eq!(keys(&original), (0..n).collect::<Vec<_>>());
+        let mut expected = slots.clone();
+        expected.sort_unstable();
+        assert_eq!(keys(&retained.pages), expected);
+
+        // Remaps can merge identities, unmap the final reference, and reuse
+        // holes. Compare membership after each publication to a fresh scan.
+        for (i, target) in [(3, 41), (4, 41), (41, n + 1), (3, n + 2), (4, n + 3)] {
+            retained.remove(slots[i]);
+            slots[i] = target;
+            retained.insert(target, &target);
+            let mut expected = slots.clone();
+            expected.sort_unstable();
+            expected.dedup();
+            assert_eq!(keys(&retained.pages), expected);
         }
     }
 
