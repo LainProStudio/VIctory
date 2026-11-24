@@ -134,6 +134,16 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     })
 }
 
+/// Block height in texels for a format whose horizontal block size from
+/// [`element`] is `block_w` (`68..=69` pack 2x1 texels; BCn formats are 4x4).
+fn block_height(format: u32, block_w: u64) -> u64 {
+    if matches!(format, 68..=69) {
+        1
+    } else {
+        block_w
+    }
+}
+
 /// A texture's layout in console memory, as the console's layout library
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
 /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
@@ -196,6 +206,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         desc.width
     } else {
         let (element, block) = element(desc.format)?;
+        let block_h = block_height(desc.format, block);
         let (depth, slices) = if desc.dimension == TEXTURE_3D {
             (u64::from(desc.depth_or_array_size), 1)
         } else {
@@ -206,7 +217,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         let mut chain = 0u64;
         for mip in 0..mips.min(64) {
             let w = (desc.width >> mip).max(1).div_ceil(block);
-            let h = (height >> mip).max(1).div_ceil(block);
+            let h = (height >> mip).max(1).div_ceil(block_h);
             let d = (depth >> mip).max(1);
             chain = chain.checked_add(w.checked_mul(h)?.checked_mul(d)?.checked_mul(element)?)?;
         }
@@ -603,7 +614,8 @@ impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
+        let block_h = block_height(self.format, block);
+        let lines = u64::from(self.height).div_ceil(block_h) * u64::from(self.depth);
         let last = u64::from(self.width).div_ceil(block) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
@@ -645,10 +657,11 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         return None;
     }
     let (element, block) = element(desc.format)?;
+    let block_h = block_height(desc.format, block);
     let width = (desc.width >> mip).max(1).next_multiple_of(block);
     let height = (u64::from(desc.height) >> mip)
         .max(1)
-        .next_multiple_of(block);
+        .next_multiple_of(block_h);
     let depth = if desc.dimension == TEXTURE_3D {
         (u32::from(desc.depth_or_array_size) >> mip).max(1)
     } else {
@@ -663,7 +676,7 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         depth,
         row_pitch: u32::try_from(row_size.next_multiple_of(PITCH)).ok()?,
     };
-    Some((footprint, u32::try_from(height / block).ok()?, row_size))
+    Some((footprint, u32::try_from(height / block_h).ok()?, row_size))
 }
 
 /// Device method: where each subresource goes in an upload buffer. Rows
@@ -1314,6 +1327,10 @@ impl Drop for Resource {
                 );
             }
         }
+        if let Some(h) = &self.host {
+            use windows::core::Interface;
+            crate::descriptor::host::drop_depth_scratch(h.texture.as_raw() as usize);
+        }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
@@ -1791,24 +1808,6 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
-
-#[cfg(all(test, windows))]
-pub(crate) fn test_buffer_at(address: u64, width: u64) -> This {
-    let mut buffer = std::ptr::null();
-    assert_eq!(
-        create_at_address(
-            std::ptr::null(),
-            address,
-            &tests::buffer(width),
-            0,
-            std::ptr::null(),
-            &RESOURCE_IIDS[0],
-            &mut buffer,
-        ),
-        S_OK,
-    );
-    buffer
-}
 
 #[cfg(test)]
 pub(crate) fn test_buffer(width: u64) -> This {

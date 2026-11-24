@@ -706,12 +706,14 @@ mod tests {
             // SAFETY: an open list with the draw state set.
             unsafe { list.list.DrawInstanced(3, 1, 0, 0) };
         };
-        // As `draw.rs` executes indirect draws: clamp, bind, execute.
+        // As `draw.rs` executes indirect draws: clamp, bind, execute, done.
         let indirect = |list: &HostList| {
             let bounded =
                 crate::indirect::bound(list, (&buffer, 256), None, (0, 16, 1)).unwrap();
             bind(list);
-            crate::indirect::execute(list, &signature, 1, (&bounded, 0), None);
+            // SAFETY: open list with draw state bound and scratch buffer in INDIRECT_ARGUMENT.
+            unsafe { list.list.ExecuteIndirect(&signature, 1, &bounded, 0, None, 0) };
+            crate::indirect::done(list, &bounded);
         };
         // A list that draws, draws indirectly, draws; then one that starts
         // with an indirect draw, submitted together.

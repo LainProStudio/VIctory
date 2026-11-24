@@ -1510,6 +1510,134 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+static DEPTH_UAV_SCRATCH: std::sync::OnceLock<Mutex<HashMap<usize, ID3D12Resource>>> =
+    std::sync::OnceLock::new();
+
+/// Retires any unordered-access scratch stand-in cached for host depth
+/// texture `raw` when the owning title resource is released.
+pub(crate) fn drop_depth_scratch(raw: usize) {
+    if let Some(map) = DEPTH_UAV_SCRATCH.get()
+        && let Some(res) = map.lock().unwrap_or_else(|e| e.into_inner()).remove(&raw)
+    {
+        crate::host::retire(res);
+    }
+}
+
+/// Returns a per-texture `ALLOW_UNORDERED_ACCESS` scratch stand-in when a
+/// shader binds a host depth-stencil texture as a UAV (D3D12 forbids
+/// `ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS` on one resource).
+fn depth_uav_scratch(
+    device: &ID3D12Device,
+    texture: &ID3D12Resource,
+    desc: Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    use windows::core::Interface;
+    // SAFETY: a live host resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0
+        || d.SampleDesc.Count > 1
+        || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+    {
+        return None;
+    }
+    let is_16bit = matches!(d.Format, DXGI_FORMAT_R16_TYPELESS | DXGI_FORMAT_D16_UNORM);
+    let (typeless_fmt, default_fmt) = if is_16bit {
+        (DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UINT)
+    } else {
+        (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT)
+    };
+    let uav_fmt = desc
+        .as_ref()
+        .map(|u| u.Format)
+        .filter(|&fmt| {
+            if is_16bit {
+                matches!(
+                    fmt,
+                    DXGI_FORMAT_R16_FLOAT
+                        | DXGI_FORMAT_R16_UNORM
+                        | DXGI_FORMAT_R16_UINT
+                        | DXGI_FORMAT_R16_SNORM
+                        | DXGI_FORMAT_R16_SINT
+                )
+            } else {
+                matches!(
+                    fmt,
+                    DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
+                )
+            }
+        })
+        .unwrap_or(default_fmt);
+
+    let key = texture.as_raw() as usize;
+    let map = DEPTH_UAV_SCRATCH.get_or_init(Mutex::default);
+    let cached = map.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+    let scratch = if let Some(res) = cached {
+        res
+    } else {
+        let scratch_desc = D3D12_RESOURCE_DESC {
+            Dimension: d.Dimension,
+            Alignment: 0,
+            Width: d.Width,
+            Height: d.Height,
+            DepthOrArraySize: d.DepthOrArraySize,
+            MipLevels: d.MipLevels,
+            Format: typeless_fmt,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        };
+        let mut created: Option<ID3D12Resource> = None;
+        // SAFETY: standard committed default-heap texture creation.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &scratch_desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut created,
+                )
+                .ok()?;
+        }
+        let created = created?;
+        crate::host::name(&created, || "depth uav scratch".into());
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        guard.entry(key).or_insert(created).clone()
+    };
+
+    let mut uav = match desc {
+        Some(mut u) => {
+            u.Format = uav_fmt;
+            if u.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D {
+                u.Anonymous.Texture2D.PlaneSlice = 0;
+            } else if u.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY {
+                u.Anonymous.Texture2DArray.PlaneSlice = 0;
+            }
+            u
+        }
+        None => default_uav_desc(&scratch, uav_fmt)?,
+    };
+    // SAFETY: `scratch` is a live `ALLOW_UNORDERED_ACCESS` texture and `at` is a host view slot.
+    unsafe {
+        device.CreateUnorderedAccessView(
+            &scratch,
+            None::<&ID3D12Resource>,
+            Some(&mut uav),
+            at,
+        )
+    };
+    once!("depth UAV: scratch stand-in");
+    Some(Some(scratch))
+}
+
 /// Builds a default SRV description for a typeless host texture using the
 /// title's concrete `format`.
 fn default_srv_desc(
@@ -1718,7 +1846,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
             }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
+                return depth_uav_scratch(device, texture, desc, at);
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
@@ -2905,5 +3033,61 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Clean up `addr_b` too.
         crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr_b, &desc));
+    }
+
+    #[test]
+    fn depth_uav_uses_scratch_stand_in() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return;
+        };
+        let (title_heap, _) = make_shader_heap(4);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let depth_res = crate::resource::test_committed_texture(
+            8,
+            8,
+            1,
+            1,
+            DXGI_FORMAT_R32_TYPELESS.0 as u32,
+            0x2, // ALLOW_DEPTH_STENCIL
+        );
+        let depth_tex = crate::resource::host_resource(depth_res).expect("depth texture");
+        let raw_key = depth_tex.as_raw() as usize;
+
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        // SAFETY: `uav` is a 40-byte POD structure (`[u32; 10]`).
+        let words: [u32; 10] = unsafe { std::ptr::from_ref(&uav).cast::<[u32; 10]>().read() };
+        let view = View::Unordered(depth_res as usize, 0, Some(words));
+        let scratch = make(&view, host_heap.cpu(0))
+            .flatten()
+            .expect("depth UAV should allocate scratch stand-in");
+        // SAFETY: `scratch` is a live D3D12 resource.
+        let sdesc = unsafe { scratch.GetDesc() };
+        assert_ne!(
+            sdesc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0,
+            0
+        );
+        assert_eq!(sdesc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0, 0);
+        assert!(
+            DEPTH_UAV_SCRATCH
+                .get()
+                .is_some_and(|m| m.lock().unwrap().contains_key(&raw_key))
+        );
+        // SAFETY: plain device health check.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(depth_res), 0);
+        assert!(
+            !DEPTH_UAV_SCRATCH
+                .get()
+                .is_some_and(|m| m.lock().unwrap().contains_key(&raw_key)),
+            "scratch entry must be retired when title texture is released"
+        );
+        assert_eq!(release(title_heap), 0);
     }
 }

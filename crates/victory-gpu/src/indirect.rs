@@ -385,34 +385,6 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     };
 }
 
-/// Runs `max` records of `signature` from `args` at `offset`, with their count
-/// at `counter` if there is one (used by buffer-state tests when `args` is a
-/// tracked buffer rather than a pre-bounded scratch buffer).
-#[cfg(test)]
-pub(crate) fn execute(
-    list: &HostList,
-    signature: &ID3D12CommandSignature,
-    max: u32,
-    (args, offset): (&ID3D12Resource, u64),
-    counter: Option<(&ID3D12Resource, u64)>,
-) {
-    list.buffer_state(args, crate::host::BUFFER_READ);
-    if let Some((c, _)) = counter {
-        list.buffer_state(c, crate::host::BUFFER_READ);
-    }
-    // SAFETY: an open list with everything set; live buffers and signature.
-    unsafe {
-        list.list.ExecuteIndirect(
-            signature,
-            max,
-            args,
-            offset,
-            counter.map(|(c, _)| c),
-            counter.map_or(0, |(_, at)| at),
-        )
-    };
-}
-
 /// Records, in `list`, the rewrite of `records` rectangle-list draw records
 /// `stride` bytes apart at host address `gpu` in `buffer` (bounded: read as
 /// arguments, and left so) into triangle-list records over the first
