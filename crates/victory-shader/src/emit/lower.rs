@@ -9253,11 +9253,16 @@ impl<'a> Lower<'a> {
             };
             let width = if wide { 2 } else { 1 };
             let vals = self.vgprs(inst, data, if compare { 2 * width } else { width })?;
-            let (ty, component) = if wide {
-                self.s.flags |= flags::INT64 | flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64;
-                (self.s.m.int(64), 0x107) // one uint64_t in an R32G32_UINT view
+            // 64-bit atomics operate on an R32G32_UINT view; DXC tags the
+            // handle U32 (0x105), matching `props` above.
+            let ty = if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED;
+                if matches!(src, Source::Loaded { .. }) {
+                    self.s.flags |= flags::ATOMIC_INT64_HEAP;
+                }
+                self.s.m.int(64)
             } else {
-                (self.s.t.i32, 0x105)
+                self.s.t.i32
             };
             let original = if wide {
                 self.join64(vals[0], vals[1])
@@ -9270,7 +9275,7 @@ impl<'a> Lower<'a> {
             } else {
                 original
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, component))?;
+            let h = self.handle(site, src, false, props)?;
             let mut args = vec![h];
             let (intrinsic, opcode) = if compare {
                 let comparand = if wide {
