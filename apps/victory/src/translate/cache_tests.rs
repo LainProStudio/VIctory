@@ -139,7 +139,7 @@ fn filters_shared_dxil_containers_by_runtime_hash_before_deduplication() {
         (t.containers, t.cs_emitted, t.duplicates)
     };
     assert_eq!(scan(Some(&[second_hash[..12].into()])), (2, 1, 1));
-    assert_eq!(scan(Some(&[first_hash, second_hash])), (3, 2, 1));
+    assert_eq!(scan(Some(&[first_hash, second_hash])), (3, 1, 2));
     assert_eq!(scan(Some(&["ffffffffffffffff".into()])), (0, 0, 0));
     assert_eq!(scan(Some(&[])), (0, 0, 0));
     assert_eq!(scan(None), (3, 1, 2));

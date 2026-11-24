@@ -534,9 +534,8 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
-    let full_hash = checks.hashes.map(|_| blake3::hash(&bytes));
-    if let (Some(prefixes), Some(hash)) = (checks.hashes, full_hash)
-        && !crate::shader::matches_hash(prefixes, &hash.to_hex()[..16])
+    if let Some(prefixes) = checks.hashes
+        && !crate::shader::matches_hash(prefixes, &blake3::hash(&bytes).to_hex()[..16])
     {
         return;
     }
@@ -554,7 +553,7 @@ fn translate(
     } else {
         dxil
     };
-    let hash = full_hash.unwrap_or_else(|| blake3::hash(input));
+    let hash = blake3::hash(input);
     if !lock(seen).insert(hash) {
         t.duplicates += 1;
         return;
