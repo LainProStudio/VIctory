@@ -116,6 +116,9 @@ pub(crate) struct Lowered {
     /// The emitted instructions, one line each; tests only.
     #[cfg(test)]
     pub insts: Vec<String>,
+    /// `(props0, props1)` of each live `dx.op.annotateHandle` on a heap handle; tests only.
+    #[cfg(test)]
+    pub handle_props: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -447,6 +450,8 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
+    /// Descriptor loads/fetches inferred as UAVs from stores, atomics, or coherent buffer reads.
+    uav_loads: HashSet<(Site, u8)>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
@@ -2033,6 +2038,21 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let mut uav_loads = HashSet::new();
+        for d in x.res.descriptors.iter().filter(|d| d.role == Role::Resource) {
+            let ui = &p.blocks[d.site.0].insts[d.site.1];
+            if ui.name().contains("store")
+                || ui.name().contains("atomic")
+                || matches!(ui.fields, Fields::Buffer { cache, .. } if cache.glc)
+            {
+                for leaf in d.source.leaves() {
+                    if let Source::Loaded { load, first } | Source::Fetched { load, first } = *leaf
+                    {
+                        uav_loads.insert((load, first));
+                    }
+                }
+            }
+        }
         Lower {
             s,
             x,
@@ -2061,6 +2081,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
+            uav_loads,
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
@@ -3363,6 +3384,8 @@ impl<'a> Lower<'a> {
         let op_names = self.s.m.func_names().map(str::to_owned).collect();
         #[cfg(test)]
         let insts = self.s.m.inst_lines();
+        #[cfg(test)]
+        let handle_props = self.s.m.heap_handle_props();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -3382,6 +3405,8 @@ impl<'a> Lower<'a> {
             op_names,
             #[cfg(test)]
             insts,
+            #[cfg(test)]
+            handle_props,
         })
     }
 
@@ -6373,10 +6398,15 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if let Some(u) = kind
-            && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        let is_uav = self.is_uav(src, false);
+        let glc = matches!(inst.fields, Fields::Smem { cache, .. } if cache.glc);
+        if kind.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) || is_uav
         {
-            let u_bit = if u.kind == ResourceType::Uav { 0x1000 } else { 0 };
+            let u_bit = if is_uav {
+                0x1000 | if glc { 0x4000 } else { 0 }
+            } else {
+                0
+            };
             // Scalar buffer loads address bytes, even when the descriptor carries a stride.
             let h = self.handle(site, src, false, (11 | u_bit, 0))?;
             let (in_bounds, safe_addr) = self.bound_raw_offset(addr);
@@ -6507,9 +6537,7 @@ impl<'a> Lower<'a> {
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let uav = self.is_uav(&src, un.contains("store") || un.contains("atomic"));
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
@@ -6878,6 +6906,21 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Whether `src` refers to a UAV (explicitly, by write/atomic use, or via `uav_loads`).
+    fn is_uav(&self, src: &Source, write_or_atomic: bool) -> bool {
+        write_or_atomic
+            || match self.used_kind(src) {
+                Some(u) => u.kind == ResourceType::Uav,
+                None => src.leaves().into_iter().any(|l| {
+                    matches!(
+                        l,
+                        Source::Loaded { load, first } | Source::Fetched { load, first }
+                            if self.uav_loads.contains(&(*load, *first))
+                    )
+                }),
+            }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -6942,7 +6985,7 @@ impl<'a> Lower<'a> {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, p)
-                        if p == 11 | 0x1000 =>
+                        if p & !0x4000 == 11 | 0x1000 =>
                     {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }
@@ -9679,16 +9722,19 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
-        let uav = store
-            || self
-                .used_kind(src)
-                .is_some_and(|u| u.kind == ResourceType::Uav);
         let atomic = name.starts_with("image_atomic_");
+        let uav = self.is_uav(src, store || atomic);
+        let glc = matches!(inst.fields, Fields::Image { cache, .. } if cache.glc);
+        let u_flags = if uav {
+            0x1000 | if glc { 0x4000 } else { 0 }
+        } else {
+            0
+        };
         // A typed view's element: four F32 (9) components, or for atomics one
         // U32 (5), which they need: a host that takes the element type from
         // the annotation (vkd3d-proton) otherwise makes float atomics.
         let element = if atomic { 0x105 } else { 0x409 };
-        let props = (kind | if uav || atomic { 0x1000 } else { 0 }, element);
+        let props = (kind | u_flags, element);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -10698,8 +10744,13 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let uav = self.is_uav(src, store || atomic.is_some());
+        let glc = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+        let u = if uav {
+            0x1000 | if glc { 0x4000 } else { 0 }
+        } else {
+            0
+        };
         let iu = self.s.m.undef(self.s.t.i32);
         if sub_load.is_some() || sub_store.is_some() {
             let data = data.as_ref().ok_or("buffer sub-dword data")?;

@@ -365,6 +365,47 @@ impl Module {
             .collect()
     }
 
+    /// `(props0, props1)` of each live `dx.op.annotateHandle` on a heap handle; tests only.
+    #[cfg(test)]
+    pub(crate) fn heap_handle_props(&self) -> Vec<(u32, u32)> {
+        let live = self.live();
+        self.insts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| live[*i])
+            .filter_map(|(_, inst)| {
+                let Op::Call(f, args) = &inst.op else {
+                    return None;
+                };
+                if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+                    return None;
+                }
+                let &V::Inst(hi) = args.get(1)? else {
+                    return None;
+                };
+                let Op::Call(hf, _) = &self.insts[hi as usize].op else {
+                    return None;
+                };
+                if self.funcs[*hf as usize].name != "dx.op.createHandleFromHeap" {
+                    return None;
+                }
+                let &V::Const(agg) = args.get(2)? else {
+                    return None;
+                };
+                let Const::Aggregate(fields) = &self.consts[agg as usize].1 else {
+                    return None;
+                };
+                let (Const::Int(p0), Const::Int(p1)) = (
+                    &self.consts[*fields.first()? as usize].1,
+                    &self.consts[*fields.get(1)? as usize].1,
+                ) else {
+                    return None;
+                };
+                Some((*p0 as u32, *p1 as u32))
+            })
+            .collect()
+    }
+
     /// An external global of type `ty` in address space `space` (DXIL
     /// declares thread-group shared memory this way).
     pub fn global(&mut self, name: &str, ty: Ty, space: u32) -> V {

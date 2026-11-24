@@ -1875,3 +1875,86 @@ fn only_host_wave32_reads_take_a_ballot_half() {
     let cs = lower_program(&words, HwStage::Cs, false, compute_io()).unwrap();
     assert!(!cs.op_names.iter().any(|n| n == "dx.op.waveGetLaneIndex"));
 }
+
+#[test]
+fn heap_uav_inference_marks_loads_and_scalar_buffer_loads_as_uav() {
+    let words = [
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0xF408_0200,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], null
+        0xE030_0000,
+        0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0
+        0xF420_0084,
+        0xFA00_0000, // s_buffer_load_dword s2, s[8:11], null
+        0x7E04_0202, // v_mov_b32 v2, s2
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xE070_0004,
+        0x8002_0200, // buffer_store_dword v2, off, s[8:11], 0 offset:4
+        S_ENDPGM,
+    ];
+    let layout = vec![root(RootType::ResourceHeap, 0, 0)];
+    let l = lower_with(&words, layout, Vec::new()).unwrap();
+    validate(&l.dxil);
+    assert!(
+        !l.handle_props.is_empty() && l.handle_props.iter().all(|&p| p == (0x100B, 0)),
+        "expected all heap handles to be raw UAV 0x100B, got {:?}",
+        l.handle_props
+    );
+    let raw_load = l
+        .op_names
+        .iter()
+        .position(|n| n == "dx.op.rawBufferLoad.f32")
+        .expect("expected rawBufferLoad.f32");
+    assert_eq!(
+        l.insts
+            .iter()
+            .filter(|i| i.starts_with(&format!("call f{raw_load} ")))
+            .count(),
+        2,
+        "expected both buffer_load_dword and s_buffer_load_dword to emit rawBufferLoad.f32: {:?}",
+        l.insts
+    );
+    assert!(l.op_names.iter().any(|n| n == "dx.op.rawBufferStore.i32"));
+}
+
+#[test]
+fn heap_buffer_load_glc_emits_globally_coherent_uav_and_validates() {
+    let words = [
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0xF408_0200,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], null (read-only glc heap view)
+        0xF408_0300,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 0x20 (store sink heap view)
+        0xF408_0400,
+        0xFA00_0040, // s_load_dwordx4 s[16:19], s[0:1], 0x40 (s_buffer_load glc heap view)
+        0xE030_4000,
+        0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0 glc
+        0xF421_00C8,
+        0xFA00_0000, // s_buffer_load_dword s3, s[16:19], null glc
+        0x7E04_0203, // v_mov_b32 v2, s3
+        0xE070_0000,
+        0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0
+        0xE070_0004,
+        0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0 offset:4
+        S_ENDPGM,
+    ];
+    let layout = vec![root(RootType::ResourceHeap, 0, 0)];
+    let l = lower_with(&words, layout, Vec::new()).unwrap();
+    validate(&l.dxil);
+    assert!(
+        l.handle_props.contains(&(0x500B, 0)),
+        "expected buffer_load_dword glc to emit 0x500B, got {:?}",
+        l.handle_props
+    );
+    assert!(
+        l.handle_props.contains(&(0x100B, 0)),
+        "expected buffer_store_dword to emit 0x100B, got {:?}",
+        l.handle_props
+    );
+    assert!(
+        l.handle_props.contains(&(13, 0x1_0000)),
+        "expected s_buffer_load_dword glc without store/atomic to remain CBV (13, 0x10000), got {:?}",
+        l.handle_props
+    );
+}
