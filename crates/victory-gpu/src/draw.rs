@@ -1093,31 +1093,28 @@ impl State {
             return false;
         };
         // Rectangles: the draws of their expanded vertices, from records of
-        // our own (the bounded scratch returns to common at once).
+        // our own; the bounded scratch returns to common after rewriting.
         let rects = kind == DRAW && self.topology == RECTANGLES;
-        let mut read = (bounded.clone(), 0u64, signature);
+        let (mut from, mut at, mut signature) = (bounded.clone(), 0u64, signature);
         let mut expanded = 0;
         if rects {
-            crate::indirect::done(list, &bounded);
             // SAFETY: `bounded` is a live buffer returned by `bound`.
             let bounded_gpu = unsafe { bounded.GetGPUVirtualAddress() };
             let made = self
                 .rectangle_vertices()
                 .zip(host_signature(DRAW, 16))
                 .and_then(|(vertices, triangles)| {
-                    expanded = vertices;
                     let records = (stride, max, vertices);
-                    let (buffer, at) =
-                        crate::indirect::rectangles(list, bounded_gpu, records)?;
-                    Some((buffer, at, triangles))
+                    let (buffer, offset) =
+                        crate::indirect::rectangles(list, &bounded, bounded_gpu, records)?;
+                    Some((buffer, offset, triangles, vertices))
                 });
-            match made {
-                Some(made) => read = made,
-                None => {
-                    why("rectangles not expanded");
-                    return false;
-                }
-            }
+            let Some(made) = made else {
+                crate::indirect::done(list, &bounded);
+                why("rectangles not expanded");
+                return false;
+            };
+            (from, at, signature, expanded) = made;
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1132,7 +1129,10 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &read.0);
+            crate::indirect::done(list, &from);
+            if rects {
+                crate::indirect::done(list, &bounded);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1154,15 +1154,18 @@ impl State {
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
-                &read.2,
+                &signature,
                 max,
-                &read.0,
-                read.1,
+                &from,
+                at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &read.0);
+        crate::indirect::done(list, &from);
+        if rects {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
