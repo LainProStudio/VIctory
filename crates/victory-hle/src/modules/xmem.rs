@@ -935,12 +935,14 @@ fn mapped_ranges_for_write(write: &SectionWrite) -> Vec<(usize, usize)> {
 fn notify_mapped_writes(runs: &[(Slice, usize)], within: usize, total_len: usize) {
     for (va, len) in mapped_ranges_for(runs, within, total_len) {
         victory_gpu::kernel_will_write(va, len);
+        victory_gpu::kernel_wrote(va, len);
     }
 }
 
 fn notify_mapped_page_window(write: &SectionWrite) {
     for (va, len) in mapped_ranges_for_write(write) {
         victory_gpu::kernel_will_write(va, len);
+        victory_gpu::kernel_wrote(va, len);
     }
 }
 

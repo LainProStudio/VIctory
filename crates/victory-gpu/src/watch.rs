@@ -268,6 +268,9 @@ struct Guards {
     /// Disjoint mapped-view block ranges `[start_block, end_block)` discovered
     /// via `VirtualQuery`, until `title_memory_remapped` splits/clears them.
     view_ranges: BTreeMap<usize, usize>,
+    /// Blocks with an announced kernel read/write currently in flight (refcount
+    /// per block): kept writable and reported written while `> 0`.
+    in_flight: BTreeMap<usize, u32>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -277,6 +280,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     placeholder_absent: BTreeSet::new(),
     views: BTreeSet::new(),
     view_ranges: BTreeMap::new(),
+    in_flight: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -352,6 +356,13 @@ fn guard_locked(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     let mut run: Option<usize> = None;
     let mut uncommitted_until = first;
     for block in first..=last {
+        if block < last && g.in_flight.contains_key(&block) {
+            if let Some(from) = run.take() {
+                protect(g, from, block);
+            }
+            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            continue;
+        }
         let mut open = block < last
             && !g.clean.contains(&block)
             && !g.placeholder_absent.contains(&block);
@@ -490,16 +501,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
-pub fn writing(at: usize, len: usize) {
-    if len == 0 {
-        return;
-    }
-    let end = at.saturating_add(len);
-    let mut g = guards();
+fn open_for_write(g: &mut Guards, at: usize, end: usize) {
     let range = at / BLOCK..end.div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -509,7 +511,51 @@ pub fn writing(at: usize, len: usize) {
     for block in placeholder {
         g.placeholder_absent.remove(&block);
     }
-    open(&mut g, at, end);
+    open(g, at, end);
+}
+
+/// Before our own synchronous write into title memory `[at, at + len)`
+/// through the kernel (which does not fault into our handler): opens its
+/// guarded blocks.
+pub(crate) fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut g = guards();
+    open_for_write(&mut g, at, end);
+}
+
+/// Announces that a kernel read/write into title memory `[at, at + len)` is
+/// about to run: opens guarded blocks, clears unmapped caches, and pins them
+/// writable until [`kernel_wrote`] is called.
+pub fn kernel_will_write(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut g = guards();
+    open_for_write(&mut g, at, end);
+    for block in at / BLOCK..end.div_ceil(BLOCK) {
+        *g.in_flight.entry(block).or_insert(0) += 1;
+    }
+}
+
+/// Releases an announcement made by [`kernel_will_write`] for `[at, at + len)`.
+pub fn kernel_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut g = guards();
+    for block in at / BLOCK..end.div_ceil(BLOCK) {
+        if let Some(count) = g.in_flight.get_mut(&block) {
+            *count -= 1;
+            if *count == 0 {
+                g.in_flight.remove(&block);
+            }
+        }
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1361,6 +1407,57 @@ mod tests {
             assert!(!g.protected.contains(&first), "protection opened");
             assert!(!g.absent.contains(&(first + 1)), "absent cleared");
         }
+        forget_journal(v, 2 * BLOCK);
+        title_memory_remapped(v, 2 * BLOCK);
+    }
+
+    #[test]
+    fn an_announced_kernel_read_survives_a_refresh_before_it() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
+        let v = view(2);
+        assert!(guard(v, v + 2 * BLOCK).is_some());
+        assert!(!writable(v + 100));
+        assert!(!writable(v + BLOCK + 100));
+
+        // Overlapping kernel write announcements keep block 0 pinned writable.
+        kernel_will_write(v + 100, 13);
+        kernel_will_write(v + 200, 8);
+
+        // A refresh before the kernel read lands must report block 0 written
+        // and leave it writable, while still protecting adjacent block 1.
+        let pages = guard(v, v + 2 * BLOCK).expect("a view");
+        assert!(pages.contains(&(v / PAGE)));
+        assert!(writable(v + 100));
+        assert!(!writable(v + BLOCK + 100));
+
+        // Releasing one overlapping announcement still keeps refcount > 0.
+        kernel_wrote(v + 200, 8);
+        let pages = guard(v, v + 2 * BLOCK).expect("a view");
+        assert!(pages.contains(&(v / PAGE)));
+        assert!(writable(v + 100));
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        file.rewind().unwrap();
+        // SAFETY: 13 bytes inside our mapped view; block 0 is pinned writable.
+        let into = unsafe { std::slice::from_raw_parts_mut((v + 100) as *mut u8, 13) };
+        assert_eq!(file.read(into).unwrap(), 13);
+        // SAFETY: the 13 bytes just read.
+        let landed = unsafe { std::slice::from_raw_parts((v + 100) as *const u8, 13) };
+        assert_eq!(landed, b"from the disk");
+
+        // Releasing the final announcement lets the next refresh report block 0
+        // one more time and re-arm its read-only guard.
+        kernel_wrote(v + 100, 13);
+        assert!(!guards().in_flight.contains_key(&(v / BLOCK)));
+        assert_eq!(guard(v, v + 2 * BLOCK), Some(vec![v / PAGE]));
+        assert!(!writable(v + 100));
+        assert_eq!(guard(v, v + 2 * BLOCK), Some(Vec::new()));
+
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
         forget_journal(v, 2 * BLOCK);
         title_memory_remapped(v, 2 * BLOCK);
     }
