@@ -10530,6 +10530,7 @@ mod tests {
             outputs: vec![target],
             prims: vec![],
             mesh_stride: 0,
+            options: super::TranslateOptions::default(),
         })
         .map(|_| ())
     }
