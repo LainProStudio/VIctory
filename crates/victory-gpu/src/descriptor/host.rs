@@ -59,6 +59,9 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The host's limit for shader-visible sampler heaps, on every tier.
+const PORTABLE_SAMPLERS: u32 = 2_048;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -87,6 +90,20 @@ impl HostHeap {
         let extra = if sampler { 0 } else { DYNAMIC };
         let (heap, count) = match make(count + extra) {
             Ok(heap) => (heap, count),
+            Err(e) if sampler && count > PORTABLE_SAMPLERS => {
+                // A sampler heap over the portable limit may be refused
+                // (D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE is 2,048 on
+                // every tier). Keep the first slots rather than losing the
+                // heap: that would also shift the bound heap indices.
+                tracing::warn!(
+                    error = %e,
+                    wanted = count,
+                    made = PORTABLE_SAMPLERS,
+                    lost = count - PORTABLE_SAMPLERS,
+                    "host sampler heap capped at {PORTABLE_SAMPLERS}"
+                );
+                (make(PORTABLE_SAMPLERS).ok()?, PORTABLE_SAMPLERS)
+            }
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // a title that reaches them needs remapping.
@@ -855,6 +872,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sampler heap the host refuses keeps the first portable slots instead
+    /// of being lost, which would also shift the bound heap indices.
+    #[test]
+    fn a_refused_sampler_heap_is_capped_not_lost() {
+        // u32::MAX is refused on every host; the portable-sized retry is not.
+        // A 2,049-slot heap is accepted on some drivers, so it cannot test
+        // this path everywhere.
+        let Some(heap) = HostHeap::new(true, u32::MAX) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.count(), PORTABLE_SAMPLERS);
+    }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
