@@ -450,6 +450,8 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Each f16 interpolation's first half preserves its old high half.
+    first_halves: HashMap<Value, Value>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
@@ -2062,6 +2064,23 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            first_halves: p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|inst| {
+                    if inst.name() != "v_interp_p1ll_f16" {
+                        return None;
+                    }
+                    let Fields::Valu(v) = &inst.fields else {
+                        return None;
+                    };
+                    let Operand::Vector { reg, .. } = v.dst? else {
+                        return None;
+                    };
+                    Some((inst.write(Reg::V(reg))?, inst.read(Reg::V(reg))?))
+                })
+                .collect(),
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -4165,14 +4184,23 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 × anything = 0`, as in D3D9. As on RDNA2, a denormal operand counts
+    /// as zero, so the test is on the exponent bits rather than a float
+    /// compare (whose result would depend on the host's denormal mode).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
-        let zero = self.s.m.f32(0);
-        let az = self.s.m.cmp(c, pred::OEQ, a, zero);
-        let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+        let exp = self.s.m.i32(0x7F80_0000);
+        let izero = self.s.m.i32(0);
+        let is_zero = |l: &mut Self, v: V| {
+            let bits = l.as_int(v);
+            let e = l.s.m.bin(c, Bin::And, bits, exp);
+            l.s.m.cmp(c, pred::EQ, e, izero)
+        };
+        let az = is_zero(self, a);
+        let bz = is_zero(self, b);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
+        let zero = self.s.m.f32(0);
         self.s.m.select(c, z, zero, m)
     }
 
@@ -7828,9 +7856,13 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                let old = if name == "v_fma_mixlo_f16" {
+                    self.preserved_high(inst, reg)?
+                } else {
+                    match inst.read(Reg::V(reg)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.i32(0),
+                    }
                 };
                 let h = self
                     .s
@@ -8338,8 +8370,13 @@ impl<'a> Lower<'a> {
             return self.write_f(inst, f, guard);
         }
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
-            if v.omod != 0 {
-                return Err("an output modifier on a 16-bit operation");
+            match v.omod {
+                0 => {}
+                k => {
+                    let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
+                    let k = l.s.m.f32(factor.to_bits());
+                    f = l.s.m.bin(l.cur, Bin::Mul, f, k);
+                }
             }
             if v.clamp {
                 f = l.unary(7, f);
@@ -8445,64 +8482,72 @@ impl<'a> Lower<'a> {
             };
             return float_result(self, r);
         }
+        if matches!(name, "v_cvt_u16_f16" | "v_cvt_i16_f16") {
+            if v.clamp || v.omod != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            let a = self.half_fsrc(inst, 0)?;
+            let r = if name == "v_cvt_u16_f16" {
+                let raw = self.s.m.cast(c, Cast::FpToUi, a, i32t);
+                let hi = self.s.m.i32(0xFFFF);
+                let over = self.s.m.cmp(c, pred::IUGT, raw, hi);
+                self.s.m.select(c, over, hi, raw)
+            } else {
+                let raw = self.s.m.cast(c, Cast::FpToSi, a, i32t);
+                let lo = self.s.m.i32(-32768i32 as u32);
+                let hi = self.s.m.i32(32767);
+                let below = self.s.m.cmp(c, pred::SLT, raw, lo);
+                let clamped = self.s.m.select(c, below, lo, raw);
+                let above = self.s.m.cmp(c, pred::SGT, clamped, hi);
+                self.s.m.select(c, above, hi, clamped)
+            };
+            return self.write_half(inst, r, guard);
+        }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
         if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
-        let r = match name {
-            "v_cvt_u16_f16" | "v_cvt_i16_f16" => {
-                // shortcut: converted through 32 bits, so out-of-range values
-                // wrap instead of saturating at 16 bits.
-                let a = self.half_fsrc(inst, 0)?;
-                let op = if name == "v_cvt_u16_f16" {
-                    Cast::FpToUi
-                } else {
-                    Cast::FpToSi
-                };
-                self.s.m.cast(c, op, a, i32t)
+        let r = {
+            let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+            let k16 = self.s.m.i32(16);
+            let sext = |l: &mut Self, x: V| {
+                let t = l.s.m.bin(c, Bin::Shl, x, k16);
+                l.s.m.bin(c, Bin::AShr, t, k16)
+            };
+            if name.ends_with("_i16") {
+                a = sext(self, a);
+                b = sext(self, b);
             }
-            _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
-                let k16 = self.s.m.i32(16);
-                let sext = |l: &mut Self, x: V| {
-                    let t = l.s.m.bin(c, Bin::Shl, x, k16);
-                    l.s.m.bin(c, Bin::AShr, t, k16)
-                };
-                if name.ends_with("_i16") {
-                    a = sext(self, a);
-                    b = sext(self, b);
+            let k15 = self.s.m.i32(15);
+            match name {
+                "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
+                "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
+                "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+                "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
+                    // src0 is the shift (4 bits), src1 the value.
+                    let sh = self.s.m.bin(c, Bin::And, a, k15);
+                    let x = if name == "v_ashrrev_i16" {
+                        sext(self, b)
+                    } else {
+                        b
+                    };
+                    let op = match name {
+                        "v_lshlrev_b16" => Bin::Shl,
+                        "v_lshrrev_b16" => Bin::LShr,
+                        _ => Bin::AShr,
+                    };
+                    self.s.m.bin(c, op, x, sh)
                 }
-                let k15 = self.s.m.i32(15);
-                match name {
-                    "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                    "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
-                    "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
-                    "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
-                    "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
-                        // src0 is the shift (4 bits), src1 the value.
-                        let sh = self.s.m.bin(c, Bin::And, a, k15);
-                        let x = if name == "v_ashrrev_i16" {
-                            sext(self, b)
-                        } else {
-                            b
-                        };
-                        let op = match name {
-                            "v_lshlrev_b16" => Bin::Shl,
-                            "v_lshrrev_b16" => Bin::LShr,
-                            _ => Bin::AShr,
-                        };
-                        self.s.m.bin(c, op, x, sh)
-                    }
-                    _ => {
-                        let p = match name {
-                            "v_max_u16" => pred::IUGT,
-                            "v_min_u16" => pred::IULT,
-                            "v_max_i16" => pred::SGT,
-                            _ => pred::SLT,
-                        };
-                        let t = self.s.m.cmp(c, p, a, b);
-                        self.s.m.select(c, t, a, b)
-                    }
+                _ => {
+                    let p = match name {
+                        "v_max_u16" => pred::IUGT,
+                        "v_min_u16" => pred::IULT,
+                        "v_max_i16" => pred::SGT,
+                        _ => pred::SLT,
+                    };
+                    let t = self.s.m.cmp(c, p, a, b);
+                    self.s.m.select(c, t, a, b)
                 }
             }
         };
@@ -9523,14 +9568,30 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The old value whose high half a low-half write preserves. Any number
+    /// of f16 interpolation first halves may be in between: they replace the
+    /// low half but leave the high half untouched.
+    fn preserved_high(&mut self, inst: &Inst, reg: u8) -> Result<V, Why> {
+        let mut old = inst.read(Reg::V(reg));
+        while let Some(v) = old {
+            let Some(&before) = self.first_halves.get(&v) else {
+                break;
+            };
+            old = Some(before);
+        }
+        match old {
+            Some(v) => self.i32_of(v),
+            None => Ok(self.s.m.i32(0)),
+        }
+    }
+
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
     /// results keep the register's high half (GFX10).
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) => o,
-            _ => self.s.m.i32(0),
-        };
+        let old = self
+            .preserved_high(inst, reg)
+            .unwrap_or_else(|_| self.s.m.i32(0));
         let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
         let old = self.s.m.bin(c, Bin::And, old, high);
         let x = self.s.m.bin(c, Bin::And, x, low);
