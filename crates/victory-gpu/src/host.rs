@@ -2739,7 +2739,8 @@ impl Batch {
 
         #[cfg(feature = "diagnostics")]
         let t_snap = std::time::Instant::now();
-        let mut bounds: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            Vec::new();
         for (plan, writes) in &pending_plans {
             if !*writes {
                 continue;
@@ -2748,28 +2749,21 @@ impl Batch {
                 if len == 0 {
                     continue;
                 }
-                let end = address.saturating_add(len);
-                match bounds
-                    .iter_mut()
-                    .find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow))
-                {
-                    Some((_, min_from, max_to)) => {
-                        *min_from = (*min_from).min(address);
-                        *max_to = (*max_to).max(end);
+                let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+                if self.write_ranges.insert(key) {
+                    self.copy_back.push((shadow.clone(), address, len));
+                    match grouped
+                        .iter_mut()
+                        .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+                    {
+                        Some((_, ranges)) => ranges.push((address, len)),
+                        None => grouped.push((shadow.clone(), vec![(address, len)])),
                     }
-                    None => bounds.push((shadow.clone(), address, end)),
                 }
             }
         }
-        for (shadow, min_from, max_to) in bounds {
-            shadow.reserve_snapshot(min_from, max_to - min_from);
-        }
-        for (plan, writes) in &pending_plans {
-            if *writes {
-                for (shadow, address, len) in &plan.writes {
-                    self.record_write(shadow, *address, *len);
-                }
-            }
+        for (shadow, ranges) in grouped {
+            shadow.writing_batch(&ranges);
         }
         #[cfg(feature = "diagnostics")]
         {

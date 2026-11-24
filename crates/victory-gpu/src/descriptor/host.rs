@@ -160,7 +160,7 @@ struct Bindless {
 #[cfg(test)]
 type PlacedSlots = Arc<Vec<(u32, (u32, u32))>>;
 
-const REMAP_LOG_CAP: usize = 8192;
+const REMAP_LOG_CAP: usize = 32768;
 
 /// Bounded history of recent `(epoch, at, end)` remaps so `bindless_plan`
 /// can invalidate only cached slots whose title range overlaps.
@@ -964,6 +964,7 @@ impl HostHeap {
         }
         if !self.sampler {
             if is_buf {
+                crate::descriptor::mark_bindless(i, generation);
                 self.track_bindless(index, (i, generation), is_placed_tex);
             } else {
                 self.untrack_bindless(index);
@@ -1309,6 +1310,7 @@ impl HostHeap {
             let key = self.revision();
             let global = (key.1, key.2, key.3);
             let mut remap_invalidated = false;
+            let mut remap_checked_eviction = false;
             let (check_forget, entries_or_dirty): (bool, Vec<(u32, (u32, u32))>) = {
                 let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((cached_key, plan)) = &b.plan
@@ -1331,6 +1333,7 @@ impl HostHeap {
                     let before = b.resolved.len();
                     if let Some(remaps) = remaps_since(prev.1, global.1) {
                         b.resolved.retain(|_, v| !v.overlaps(&remaps));
+                        remap_checked_eviction = true;
                     } else {
                         b.resolved.clear();
                     }
@@ -1349,7 +1352,7 @@ impl HostHeap {
                     && dirty.is_empty()
                     && let Some((cached_key, plan)) = &mut b.plan
                     && cached_key.0 == key.0
-                    && cached_key.1 == global.0
+                    && (cached_key.1 == global.0 || remap_checked_eviction)
                 {
                     *cached_key = key;
                     return Some(plan.clone());
@@ -1406,12 +1409,12 @@ impl HostHeap {
                         VIEWED_FORGET.load(Ordering::Acquire),
                     );
                     let rev = self.revision.load(Ordering::Acquire);
-                    let can_reuse = current_global.0 == global.0
+                    let can_reuse = (current_global.0 == global.0 || remap_checked_eviction)
                         && current_global.1 == global.1
                         && rev == key.0
-                        && b.plan
-                            .as_ref()
-                            .is_some_and(|(ck, _)| ck.0 == rev && ck.1 == current_global.0);
+                        && b.plan.as_ref().is_some_and(|(ck, _)| {
+                            ck.0 == rev && (ck.1 == current_global.0 || remap_checked_eviction)
+                        });
                     if can_reuse {
                         b.resolved_global = current_global;
                         let (cached_key, plan) = b.plan.as_mut().expect("checked cached plan");
@@ -1443,25 +1446,6 @@ impl HostHeap {
             }
 
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            let current_global = (
-                crate::resource::placed_epoch(),
-                VIEWED_REMAP.load(Ordering::Acquire),
-                VIEWED_FORGET.load(Ordering::Acquire),
-            );
-            if b.resolved_global != current_global {
-                if b.resolved_global.1 != current_global.1 {
-                    if let Some(remaps) = remaps_since(b.resolved_global.1, current_global.1) {
-                        b.resolved.retain(|_, v| !v.overlaps(&remaps));
-                    } else {
-                        b.resolved.clear();
-                    }
-                    b.resolved_global.1 = current_global.1;
-                }
-                b.resolved_global.0 = current_global.0;
-                // If only `VIEWED_FORGET` bumped during resolve, leave
-                // `b.resolved_global.2` as-is so the next iteration prunes incrementally.
-                continue;
-            }
             let mut placed_changed = false;
             for idx in stale {
                 b.resolved.remove(&idx);
@@ -1477,10 +1461,35 @@ impl HostHeap {
             if placed_changed {
                 self.bump_placed(&b);
             }
-            for (index, entry, resolved) in newly_resolved {
-                if b.slots.get(&index) == Some(&entry) {
-                    b.resolved.insert(index, resolved);
+            let current_global = (
+                crate::resource::placed_epoch(),
+                VIEWED_REMAP.load(Ordering::Acquire),
+                VIEWED_FORGET.load(Ordering::Acquire),
+            );
+            let rev_now = self.revision.load(Ordering::Acquire);
+            let remap_changed = b.resolved_global.1 != current_global.1;
+            if remap_changed {
+                if let Some(remaps) = remaps_since(b.resolved_global.1, current_global.1) {
+                    b.resolved.retain(|_, v| !v.overlaps(&remaps));
+                    for (index, entry, resolved) in newly_resolved {
+                        if b.slots.get(&index) == Some(&entry) && !resolved.overlaps(&remaps) {
+                            b.resolved.insert(index, resolved);
+                        }
+                    }
+                } else {
+                    b.resolved.clear();
                 }
+                b.resolved_global.1 = current_global.1;
+            } else {
+                for (index, entry, resolved) in newly_resolved {
+                    if b.slots.get(&index) == Some(&entry) {
+                        b.resolved.insert(index, resolved);
+                    }
+                }
+            }
+            b.resolved_global.0 = current_global.0;
+            if remap_changed || b.resolved_global.2 != current_global.2 || rev_now != key.0 {
+                continue;
             }
             if b.slots.is_empty() {
                 if !b.placed_tex.is_empty() {
@@ -4274,6 +4283,80 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(uav_res), 0);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    #[test]
+    fn non_buffer_forget_does_not_bump_bindless_forget_epoch() {
+        if host().is_none() {
+            return;
+        }
+        let (_title_heap, base) = make_shader_heap(4);
+        let tex = crate::resource::test_committed_texture(
+            4,
+            4,
+            1,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            0,
+        );
+        create_srv(std::ptr::null(), tex, std::ptr::null(), base);
+        let before = VIEWED_FORGET.load(Ordering::Acquire);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(tex), 0);
+        let after = VIEWED_FORGET.load(Ordering::Acquire);
+        assert_eq!(before, after);
+        assert_eq!(release(_title_heap), 0);
+    }
+
+    #[test]
+    fn non_overlapping_placed_eviction_reuses_bindless_plan() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(4);
+        let mem_a = crate::resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
+        let mem_b = crate::resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
+
+        let placed_res_words: [u32; 14] = [
+            3, 0, 0, 0, 4, 0, 4, 0x0001_0001, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1, 0, 0x100, 0,
+            0,
+        ];
+        let tex_srv_host = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        let mut view_words = [0u32; 16];
+        // SAFETY: POD descriptor is 40 bytes (`[u32; 10]`).
+        view_words[..10].copy_from_slice(&unsafe {
+            std::ptr::from_ref(&tex_srv_host)
+                .cast::<[u32; 10]>()
+                .read()
+        });
+        view_words[10] = mem_a.address() as u32;
+        view_words[11] = (mem_a.address() >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &placed_res_words, &view_words, base);
+
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let plan1 = host_heap.bindless_plan().unwrap();
+
+        // Populate a placed texture on `mem_b`, then evict `mem_b` via `title_memory_remapped`.
+        let _tex_b = crate::resource::texture_at(mem_b.address(), &placed_res_words).unwrap();
+        crate::watch::title_memory_remapped(mem_b.address() as usize, 4096);
+
+        let plan2 = host_heap.bindless_plan().unwrap();
+        assert!(Arc::ptr_eq(&plan1, &plan2));
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
     }
 }

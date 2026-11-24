@@ -439,6 +439,8 @@ impl View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// Generation last recorded in any host bindless heap for each `list` index.
+    bindless_gen: Vec<u32>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -447,6 +449,7 @@ struct Views {
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     list: Vec::new(),
+    bindless_gen: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -497,14 +500,24 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Notes that `(i, generation)` is tracked in at least one host bindless heap.
+#[cfg(windows)]
+pub(crate) fn mark_bindless(i: u32, generation: u32) {
+    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let idx = i as usize;
+    if views.bindless_gen.len() <= idx {
+        views.bindless_gen.resize(idx + 1, 0);
+    }
+    views.bindless_gen[idx] = generation;
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
-    #[cfg(windows)]
-    host::bindless_viewed_changed();
+    let mut any_bindless = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -512,11 +525,18 @@ pub(crate) fn forget(resource: usize) {
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
+        if views.bindless_gen.get(i as usize).copied() == Some(generation) {
+            any_bindless = true;
+        }
         views.index.remove(&view);
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+    }
+    #[cfg(windows)]
+    if any_bindless {
+        host::bindless_viewed_changed();
     }
 }
 
