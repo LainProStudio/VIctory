@@ -430,9 +430,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    /// Default-heap UAV memory for clamped indirect arguments (`indirect`),
-    /// always in `UNORDERED_ACCESS` between calls and reused after a reset.
-    indirect_scratch: Mutex<UavScratch>,
+    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
+    /// grown to the largest indirect execution recorded on the list.
+    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -502,18 +502,6 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// Default-heap UAV chunks for clamped indirect arguments, always in
 /// `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` between indirect executions and
 /// reused after a reset.
-#[derive(Default)]
-struct UavScratch {
-    chunks: Vec<(ID3D12Resource, u64)>,
-    current: usize,
-    used: u64,
-}
-
-// SAFETY: D3D12 resources are free-threaded.
-unsafe impl Send for UavScratch {}
-
-const UAV_SCRATCH_CHUNK: u64 = 1 << 20;
-
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -634,7 +622,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
-                indirect_scratch: Mutex::default(),
+                indirect_args: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1046,13 +1034,6 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
-        {
-            let mut scratch = self
-                .indirect_scratch
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1340,39 +1321,31 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    /// `len` bytes of default-heap UAV memory (16-byte aligned) in
-    /// `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` until the list is reset: the
-    /// buffer, its byte offset and its host GPU address.
-    pub(crate) fn indirect_scratch(&self, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
-        let host = host()?;
-        let len = len.max(16).next_multiple_of(16);
-        if len > UAV_SCRATCH_CHUNK {
-            let buffer = host.uav_buffer(len)?;
-            name(&buffer, || format!("list indirect scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.keep(&buffer);
-            return Some((buffer, 0, gpu));
+    /// A device-local unordered-access buffer of at least `size` bytes for
+    /// clamped indirect arguments, reused across executions and resets of the
+    /// list. Smaller buffers replaced mid-list stay alive until
+    /// [`HostList::reset`].
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+        let needed = size.max(64 << 10);
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap)) = &*slot
+            && *cap >= needed
+        {
+            return Some(buffer.clone());
         }
-        let mut s = self
-            .indirect_scratch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if s.used + len > UAV_SCRATCH_CHUNK && s.current < s.chunks.len() {
-            (s.current, s.used) = (s.current + 1, 0);
+        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let alloc = prev
+            .saturating_mul(2)
+            .max(needed)
+            .next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(alloc)?;
+        name(&buffer, || format!("indirect arguments {alloc:#x}"));
+        let old = slot.replace((buffer.clone(), alloc));
+        drop(slot);
+        if let Some((old_buf, _)) = old {
+            self.keep(&old_buf);
         }
-        if s.current == s.chunks.len() {
-            let buffer = host.uav_buffer(UAV_SCRATCH_CHUNK)?;
-            name(&buffer, || "list indirect scratch".into());
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, gpu));
-            s.used = 0;
-        }
-        let (buffer, gpu) = (s.chunks[s.current].0.clone(), s.chunks[s.current].1);
-        let at = s.used;
-        s.used += len;
-        Some((buffer, at, gpu + at))
+        Some(buffer)
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -2198,8 +2171,8 @@ impl Host {
         }
     }
 
-    /// A buffer in default GPU memory, created in
-    /// `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` for clamped indirect arguments.
+    /// A device-local buffer shaders may write (unordered access) and indirect
+    /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -2207,7 +2180,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(16),
+            Width: size.max(1),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -2220,13 +2193,13 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a default-heap UAV buffer.
+        // SAFETY: plain creation of a device-local buffer.
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
                 None,
                 &mut buffer,
             )
@@ -2234,7 +2207,7 @@ impl Host {
         match made {
             Ok(()) => buffer,
             Err(e) => {
-                tracing::warn!(error = %e, size, "no uav buffer");
+                tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None
             }
         }
