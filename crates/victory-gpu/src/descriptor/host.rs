@@ -8,8 +8,8 @@
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -71,6 +71,96 @@ struct Bindless {
     cbv_bounce: HashMap<u32, BounceSlot>,
     /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
     bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
+    /// What submissions do for the slots, until they or what they view change.
+    plan: Option<Arc<BindlessPlan>>,
+    /// The placed-texture slots draws prepare at recording, likewise.
+    placed: Option<((u64, u64, u64), PlacedSlots)>,
+}
+
+/// Bindless slots viewing placed textures: slot, view index and generation.
+type PlacedSlots = Arc<Vec<(u32, (u32, u32))>>;
+
+/// Bumped when views go stale or title memory is mapped or unmapped: what
+/// bindless slots view may have changed though no slot was written.
+static VIEWED: AtomicU64 = AtomicU64::new(0);
+
+/// Bindless slots must be checked again: a resource their views name was
+/// released, or title memory was mapped or unmapped.
+pub(crate) fn bindless_viewed_changed() {
+    VIEWED.fetch_add(1, Ordering::Release);
+}
+
+/// Bindless unordered access ranges larger than this are not copied back.
+///
+/// shortcut: copy-back finds what shaders wrote by keeping a range's bytes
+/// before each submission; a bindless slot viewing a title's big shared heap
+/// would cost a copy and a compare of all of it per submission whether or
+/// not a shader writes there. Such ranges stay on the GPU's side.
+const WRITE_CAP: usize = 8 << 20;
+
+/// Gap below which two ranges of one host copy are refreshed as one: the
+/// write-watch answers by 64 KiB page, and fewer, larger askings cost less.
+const READ_GAP: usize = 1 << 20;
+
+/// What a submission does for a heap's bindless slots, made again only when
+/// the slots or what they view change ([`HostHeap::bindless_plan`]).
+pub(crate) struct BindlessPlan {
+    key: (u64, u64, u64),
+    /// Title memory the slots read, merged per host copy (address, bytes):
+    /// refreshed at each submission using the heap.
+    pub(crate) reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The unordered access slots' ranges (up to [`WRITE_CAP`] each), merged:
+    /// copied back after a submission whose shaders may write memory.
+    pub(crate) writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Misaligned constant buffers: bounce slice, title address, bytes.
+    bounces: Vec<(usize, u64, u32)>,
+    /// The host resources the slots view, held while a submission runs.
+    _retained: Vec<ID3D12Resource>,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the rest is plain data.
+unsafe impl Send for BindlessPlan {}
+// SAFETY: as above.
+unsafe impl Sync for BindlessPlan {}
+
+impl BindlessPlan {
+    /// Copies the misaligned constant buffers into their bounce slices.
+    pub(crate) fn copy_constants(&self) {
+        for &(cpu, address, len) in &self.bounces {
+            let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Copies, 1);
+                add(C::CopyBytes, u64::from(len));
+            }
+            crate::host::copy_mapped(cpu as *mut u8, address as *const u8, len as usize, false);
+            let us = started.elapsed().as_micros() as u64;
+            crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            crate::host::PREPARING[1].fetch_add(u64::from(len), Ordering::Relaxed);
+        }
+    }
+}
+
+/// `ranges` (host copy, address, bytes) sorted and merged per host copy
+/// where they overlap or lie within `gap` of each other.
+fn merged(
+    mut ranges: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    gap: usize,
+) -> Vec<(Arc<crate::shadow::Shadow>, usize, usize)> {
+    ranges.sort_unstable_by_key(|(s, a, _)| (Arc::as_ptr(s) as usize, *a));
+    let mut out: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    for (shadow, address, len) in ranges {
+        if let Some((s, a, l)) = out.last_mut()
+            && Arc::ptr_eq(s, &shadow)
+            && address <= *a + *l + gap
+        {
+            *l = (*l).max(address + len - *a);
+            continue;
+        }
+        out.push((shadow, address, len));
+    }
+    out
 }
 
 struct StrideTable {
@@ -390,11 +480,13 @@ impl HostHeap {
         self.count
     }
 
-    /// Current bindless slot and placed-texture epoch for per-list caching.
-    pub(crate) fn revision(&self) -> (u64, u64) {
+    /// Current bindless slot, placed-texture, and viewed-memory epochs, for
+    /// caching what the slots need.
+    pub(crate) fn revision(&self) -> (u64, u64, u64) {
         (
             self.revision.load(Ordering::Acquire),
             crate::resource::placed_epoch(),
+            VIEWED.load(Ordering::Acquire),
         )
     }
 
@@ -738,7 +830,8 @@ impl HostHeap {
         key: u64,
         address: u64,
         capped: u32,
-        add_refresh: &mut impl FnMut(&std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+        reads: &mut Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+        bounces: &mut Vec<(usize, u64, u32)>,
     ) -> Option<ID3D12Resource> {
         let host = host()?;
         let aligned = capped.next_multiple_of(256);
@@ -782,7 +875,7 @@ impl HostHeap {
             }
             let len = u64::from(capped).min(shadow.left(address)) as usize;
             if len > 0 {
-                add_refresh(&shadow, address as usize, len);
+                reads.push((shadow.clone(), address as usize, len));
             }
             return Some(shadow.buffer.clone());
         }
@@ -805,38 +898,22 @@ impl HostHeap {
                 self.set_stride(index, 0);
             }
         }
-        let started = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{C, add};
-            add(C::Copies, 1);
-            add(C::CopyBytes, u64::from(capped));
-        }
-        crate::host::copy_mapped(cpu as *mut u8, address as *const u8, capped as usize, false);
-        let us = started.elapsed().as_micros() as u64;
-        crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
-        crate::host::PREPARING[1].fetch_add(u64::from(capped), Ordering::Relaxed);
+        bounces.push((cpu, address, capped));
         Some(res)
     }
 
     /// At draw/dispatch recording time: materializes any placed streamed
     /// textures in the heap and records their upload and state transition on
     /// `list`. Buffer and constant-buffer views are materialized and refreshed
-    /// at submission in [`HostHeap::prepare_bindless_submit`].
+    /// at submission from [`HostHeap::bindless_plan`].
     pub(crate) fn prepare_bindless_record(&self, list: &crate::host::HostList) {
         use windows::core::Interface;
         if self.sampler {
             return;
         }
-        let entries: Vec<(u32, (u32, u32))> = {
-            let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            if b.slots.is_empty() {
-                return;
-            }
-            b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
-        };
+        let entries = self.placed_slots();
         let mut stale = Vec::new();
-        for (index, (vi, generation)) in entries {
+        for &(index, (vi, generation)) in entries.iter() {
             let Some(view) = view_at(vi, generation) else {
                 self.clear_stale_slot(index);
                 stale.push(index);
@@ -883,26 +960,68 @@ impl HostHeap {
         }
     }
 
-    /// At submission time: materializes any pending buffer, constant-buffer, or
-    /// late placed-texture slots in the heap, queues dirty-page refreshes and
-    /// UAV write tracking, and returns strong references to all viewed host
-    /// resources so they stay alive until GPU execution finishes.
-    pub(crate) fn prepare_bindless_submit(
-        &self,
-        mut add_refresh: impl FnMut(&std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-        mut add_uav: impl FnMut(&std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    ) -> Vec<ID3D12Resource> {
-        use windows::core::Interface;
-        if self.sampler {
-            return Vec::new();
-        }
+    /// The slots viewing placed textures (not buffers), which draws prepare
+    /// as they are recorded; found again only when the slots change.
+    fn placed_slots(&self) -> PlacedSlots {
+        let key = self.revision();
         let entries: Vec<(u32, (u32, u32))> = {
             let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            if b.slots.is_empty() {
-                return Vec::new();
+            if let Some((k, placed)) = &b.placed
+                && *k == key
+            {
+                return placed.clone();
             }
             b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
         };
+        let placed: Arc<Vec<_>> = Arc::new(
+            entries
+                .into_iter()
+                .filter(|&(_, (vi, generation))| {
+                    // Stale slots are kept so that the caller prunes them.
+                    view_at(vi, generation)
+                        .is_none_or(|v| matches!(v, View::Placed(false, r, _) if r[0] != 1))
+                })
+                .collect(),
+        );
+        self.bindless
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .placed = Some((key, placed.clone()));
+        placed
+    }
+
+    /// At submission: what the heap's bindless slots need. Made again (slots
+    /// materialized, stale ones pruned, ranges found and merged) only when a
+    /// slot was written or what slots view changed; otherwise the last plan,
+    /// whose reads the caller refreshes, which costs little when the title
+    /// changed nothing.
+    pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
+        if self.sampler {
+            return None;
+        }
+        let key = self.revision();
+        let entries: Vec<(u32, (u32, u32))> = {
+            let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(plan) = &b.plan
+                && plan.key == key
+            {
+                return Some(plan.clone());
+            }
+            if b.slots.is_empty() {
+                return None;
+            }
+            b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
+        };
+        let plan = Arc::new(self.make_plan(key, entries));
+        self.bindless.lock().unwrap_or_else(|e| e.into_inner()).plan = Some(plan.clone());
+        Some(plan)
+    }
+
+    /// Materializes the bindless slots `entries` and finds what they read
+    /// and write.
+    fn make_plan(&self, key: (u64, u64, u64), entries: Vec<(u32, (u32, u32))>) -> BindlessPlan {
+        use windows::core::Interface;
+        let (mut reads, mut writes, mut bounces) = (Vec::new(), Vec::new(), Vec::new());
         let mut retained = Vec::new();
         let mut stale = Vec::new();
         for (index, (vi, generation)) in entries {
@@ -923,12 +1042,16 @@ impl HostHeap {
                         self.set_unmapped_null(index, &view);
                         continue;
                     }
-                    if let Some(res) =
-                        self.materialize_bindless_cbv(index, key, address, capped, &mut add_refresh)
-                    {
-                        retained.push(res);
-                    } else {
-                        self.set_unmapped_null(index, &view);
+                    match self.materialize_bindless_cbv(
+                        index,
+                        key,
+                        address,
+                        capped,
+                        &mut reads,
+                        &mut bounces,
+                    ) {
+                        Some(res) => retained.push(res),
+                        None => self.set_unmapped_null(index, &view),
                     }
                 }
                 View::Placed(false, resource, desc) if resource[0] != 1 => {
@@ -962,9 +1085,19 @@ impl HostHeap {
                     if let Some(shadow) = crate::shadow::find(address, len) {
                         let clamped = len.min(shadow.left(address)) as usize;
                         if clamped > 0 {
-                            add_refresh(&shadow, address as usize, clamped);
+                            reads.push((shadow.clone(), address as usize, clamped));
                             if matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
-                                add_uav(&shadow, address as usize, clamped);
+                                if clamped <= WRITE_CAP {
+                                    writes.push((shadow, address as usize, clamped));
+                                } else {
+                                    static ONCE: std::sync::Once = std::sync::Once::new();
+                                    ONCE.call_once(|| {
+                                        tracing::warn!(
+                                            bytes = clamped,
+                                            "a bindless unordered access view too big to copy back"
+                                        );
+                                    });
+                                }
                             }
                         }
                     }
@@ -981,7 +1114,13 @@ impl HostHeap {
                 }
             }
         }
-        retained
+        BindlessPlan {
+            key,
+            reads: merged(reads, READ_GAP),
+            writes: merged(writes, 0),
+            bounces,
+            _retained: retained,
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -2567,7 +2706,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let record_probe = |list: &crate::host::HostList| {
             host_heap.prepare_bindless_record(list);
-            list.defer_bindless(&host_heap);
+            list.defer_bindless(&host_heap, true);
             // SAFETY: open command list, shader-visible heap, and matching root/PSO.
             unsafe {
                 let gpu_start = host_heap.heap.GetGPUDescriptorHandleForHeapStart().ptr;
@@ -2651,47 +2790,67 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(release(title_heap), 0);
     }
 
-    /// Verifies per-list and per-submission deduplication of bindless heap
-    /// refreshes, and re-arming when a title buffer copy intervenes.
+    /// Submissions with nothing changed reuse a heap's bindless plan (no
+    /// slot is made or range found again); writing a slot makes a new one,
+    /// whose reads of one host copy are merged into one range.
     #[test]
-    fn bindless_deduplicates_across_draws_and_lists_until_title_copy() {
+    fn bindless_plan_is_remade_only_when_slots_change() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(8);
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let cbv = |at: u64, slot: u64| {
+            create_cbv(
+                std::ptr::null(),
+                &[at as u32, (at >> 32) as u32, 256, 0],
+                base + slot * 32,
+            );
+        };
+        cbv(mem.address(), 0);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let first = host_heap.bindless_plan().unwrap();
+        assert_eq!(first.reads.len(), 1);
+        assert_eq!(first.reads[0].2, 256);
+        assert!(first.writes.is_empty(), "constant buffers are not written");
+        // Other tests may release resources meanwhile, which remakes plans.
+        let reused = (0..100).any(|_| {
+            let a = host_heap.bindless_plan().unwrap();
+            Arc::ptr_eq(&a, &host_heap.bindless_plan().unwrap())
+        });
+        assert!(reused, "unchanged slots reuse the plan");
+
+        cbv(mem.address() + 0x1000, 1);
+        let second = host_heap.bindless_plan().unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a written slot remakes the plan"
+        );
+        assert_eq!(second.reads.len(), 1, "nearby reads merge");
+        assert_eq!(second.reads[0].1, mem.address() as usize);
+        assert_eq!(second.reads[0].2, 0x1100);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// A list queues each heap once, keeping whether any draw may write.
+    #[test]
+    fn bindless_heaps_queue_once_per_list() {
         let Some(host) = host() else {
             return;
         };
-        let (title_heap, base) = make_shader_heap(8);
-        let mem = crate::resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
-        let cbv_addr = mem.address() + 0x20;
-        create_cbv(
-            std::ptr::null(),
-            &[cbv_addr as u32, (cbv_addr >> 32) as u32, 64, 0],
-            base,
-        );
+        let (title_heap, _) = make_shader_heap(8);
         let host_heap = heap(title_heap).host_arc().unwrap();
-        let list1 = host.new_list().unwrap();
-        let list2 = host.new_list().unwrap();
-
-        // Repeated bindless draws on `list1` without a title copy only queue one
-        // deferred bindless step.
-        assert_eq!(list1.title_write_epoch(), 0);
-        list1.defer_bindless(&host_heap);
-        list1.defer_bindless(&host_heap);
-        list1.defer_bindless(&host_heap);
-
-        // A title buffer copy increments `title_write_epoch` and allows
-        // queuing a post-copy refresh.
-        let mut scratch = [0u8; 16];
-        list1.defer_copy(scratch.as_mut_ptr(), scratch.as_ptr(), 0);
-        assert_eq!(list1.title_write_epoch(), 1);
-        list1.defer_bindless(&host_heap);
-
-        // `list2` also queues the same heap in the same submission (`Batch::bindless_due`
-        // deduplicates across `list1` after the copy and `list2`).
-        list2.defer_bindless(&host_heap);
-        list1.close();
-        list2.close();
-        host.execute(&[&list1, &list2]);
-        list1.reset();
-        list2.reset();
+        let list = host.new_list().unwrap();
+        list.defer_bindless(&host_heap, false);
+        list.defer_bindless(&host_heap, true);
+        list.defer_bindless(&host_heap, false);
+        assert_eq!(list.bindless_queued(), vec![true]);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.bindless_queued().is_empty());
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);

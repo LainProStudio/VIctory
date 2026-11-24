@@ -80,7 +80,7 @@ pub(crate) struct State {
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
     /// Last bindless view heap prepared on this list: `(heap, revision, copy_epoch)`.
-    bindless_prepared: Option<(usize, (u64, u64), u64)>,
+    bindless_prepared: Option<(usize, (u64, u64, u64), u64)>,
 }
 
 impl Drop for State {
@@ -569,9 +569,10 @@ impl State {
             let key = (self.heaps[0], host_heap.revision(), epoch);
             if self.bindless_prepared != Some(key) {
                 host_heap.prepare_bindless_record(list);
-                list.defer_bindless(&host_heap);
                 self.bindless_prepared = Some((self.heaps[0], host_heap.revision(), epoch));
             }
+            let writes = p.stages.iter().any(|s| s.translated().writes_memory);
+            list.defer_bindless(&host_heap, writes);
         }
         for stage in &p.stages {
             let t = stage.translated();
