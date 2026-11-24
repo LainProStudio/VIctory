@@ -560,7 +560,8 @@ pub fn kernel_wrote(at: usize, len: usize) {
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
-/// unmapped), and any placed textures backed by that range are evicted.
+/// unmapped), and any placed textures or host DXR acceleration structures
+/// backed by that range are evicted.
 pub fn title_memory_remapped(at: usize, len: usize) {
     if len == 0 {
         return;
@@ -587,6 +588,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     crate::resource::evict_placed_textures(at as u64, end as u64);
     crate::descriptor::host::bindless_memory_remapped(at as u64, end as u64);
+    crate::raytracing::evict_as_range(at as u64, end as u64);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

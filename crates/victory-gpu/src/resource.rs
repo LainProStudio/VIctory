@@ -1214,6 +1214,19 @@ fn host_texture(
     } else {
         pc_format(d.format)
     };
+    // Formats without host UAV or render-target capability (the console
+    // allows both; host D3D12 removes the device on invalid flag combinations, #735).
+    // B5G5R5A1 (86) and B5G6R5 (85) have no typed UAV support; B4G4R4A4 (115)
+    // has no render-target support; block-compressed formats have neither.
+    if matches!(d.format, 85 | 86) {
+        d.flags &= !UNORDERED;
+    }
+    if d.format == 115 {
+        d.flags &= !RENDER_TARGET;
+    }
+    if element(d.format).is_some_and(|(_, w)| w > 1) {
+        d.flags &= !(RENDER_TARGET | DEPTH | UNORDERED);
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -3346,5 +3359,29 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(view_format(out), None, "flags {flags}");
             assert_eq!(slot::<Release>(out, 0x10)(out), 0);
         }
+    }
+
+    /// Formats without host UAV or RTV support clear those flags (#735).
+    #[test]
+    fn incompatible_host_texture_flags_are_cleared() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        // B5G5R5A1 with UAV
+        let b5g5r5a1 = texture(64, 64, 86, 1);
+        let mut desc = b5g5r5a1;
+        desc.flags = 4; // UNORDERED
+        let res = host_texture(&desc, 0, std::ptr::null());
+        assert!(res.is_some(), "B5G5R5A1 texture creation succeeded without UAV");
+
+        // B4G4R4A4 with RenderTarget
+        let b4g4r4a4 = texture(64, 64, 115, 1);
+        let mut desc2 = b4g4r4a4;
+        desc2.flags = 1; // RENDER_TARGET
+        let res2 = host_texture(&desc2, 0, std::ptr::null());
+        assert!(
+            res2.is_some(),
+            "B4G4R4A4 texture creation succeeded without RenderTarget"
+        );
     }
 }
