@@ -3038,6 +3038,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.s.pixel {
+            super::harmonize_row_interp(&mut self.s.inputs);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -8074,13 +8077,17 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
-        let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let r = *regs
-                .get(if *a16 { k / 2 } else { k })
-                .ok_or("an image address")?;
+        // Full 32-bit address VGPR (offsets, bias, comparison reference stay
+        // 32-bit even when `a16` packs the remaining coordinates/gradients/LOD).
+        let addr_dword = |l: &mut Self, idx: usize| -> Result<V, Why> {
+            let r = *regs.get(idx).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
-            let x = l.i32_of(v)?;
+            l.i32_of(v)
+        };
+        // Component `k` starting at VGPR `start`: with `a16`, two 16-bit
+        // components per VGPR, low half first.
+        let addr_val = |l: &mut Self, start: usize, k: usize| -> Result<V, Why> {
+            let x = addr_dword(l, start + if *a16 { k / 2 } else { k })?;
             if !*a16 {
                 return Ok(x);
             }
@@ -8132,7 +8139,7 @@ impl<'a> Lower<'a> {
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                *slot = addr_val(self, k)?;
+                *slot = addr_val(self, 0, k)?;
             }
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
@@ -8214,7 +8221,7 @@ impl<'a> Lower<'a> {
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                *slot = addr_val(self, k)?;
+                *slot = addr_val(self, 0, k)?;
             }
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
@@ -8278,7 +8285,7 @@ impl<'a> Lower<'a> {
             let mip = if uav {
                 self.s.m.undef(self.s.t.i32)
             } else {
-                addr_val(self, 0)?
+                addr_val(self, 0, 0)?
             };
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -8556,6 +8563,10 @@ impl<'a> Lower<'a> {
             };
             let mut args = vec![h, sh];
             args.extend(&cs);
+            if self.s.threads.is_some() && self.s.mesh.is_none() && matches!(op, 60 | 61 | 64 | 81)
+            {
+                self.s.cs_derivatives = true;
+            }
             match op {
                 60 => {
                     args.extend(&os);
@@ -8645,10 +8656,10 @@ impl<'a> Lower<'a> {
         } else {
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                *slot = addr_val(self, k)?;
+                *slot = addr_val(self, 0, k)?;
             }
             let mip = if name == "image_load_mip" {
-                addr_val(self, coords)?
+                addr_val(self, 0, coords)?
             } else if uav {
                 // Our declarations have four channels.
                 self.s.flags |= flags::TYPED_UAV_LOADS;
