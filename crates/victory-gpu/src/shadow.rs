@@ -64,6 +64,29 @@ fn log_copyback() -> bool {
 thread_local! {
     static COPY_BACK_SCRATCH: std::cell::RefCell<Vec<u8>> =
         std::cell::RefCell::new(vec![0u8; PAGE]);
+    #[cfg(test)]
+    static BEFORE_COPY_BACK_REARM: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether `[start, start + len)` lies inside a single committed writable
+/// region (`PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`).
+fn is_writable_commit(start: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
+    };
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    // SAFETY: plain data filled in by `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `VirtualQuery` inspects the address range without dereferencing `start`.
+    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    n == size_of_val(&info)
+        && info.State == MEM_COMMIT
+        && matches!(info.Protect, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
+        && (info.BaseAddress as usize) <= start
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= end
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -258,25 +281,6 @@ impl Shadow {
     /// belonging to the same shadow in one submission, scanning overlapping
     /// bytes at most once and re-arming write-watch only on synced pages.
     pub(crate) fn copy_back_ranges(&self, ranges: &[(usize, usize)]) -> usize {
-        fn flush_run(
-            chunk_start: usize,
-            chunk_len: usize,
-            s: usize,
-            end_i: usize,
-            title: &[u8],
-            opened_chunk: &mut bool,
-            written: &mut usize,
-        ) {
-            if !*opened_chunk {
-                crate::watch::writing(chunk_start, chunk_len);
-                *opened_chunk = true;
-            }
-            let dst = chunk_start + s;
-            let run_len = end_i - s;
-            crate::host::write_mapped(dst as *mut u8, title[s..].as_ptr(), run_len);
-            *written += run_len;
-        }
-
         let mut clamped: Vec<(usize, usize)> = ranges
             .iter()
             .map(|&(address, len)| self.inside(address, len))
@@ -305,6 +309,7 @@ impl Shadow {
                 if title_buf.len() < PIECE {
                     title_buf.resize(PIECE, 0);
                 }
+                let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
                 let mut synced = Vec::new();
                 for &(from, to) in &merged {
                     let mut seg_i = snap.segments.partition_point(|&(_, se, _)| se <= from);
@@ -323,21 +328,13 @@ impl Shadow {
                             if host != old
                                 && crate::host::read_into((start + at) as *const u8, title)
                             {
-                                let mut opened_chunk = false;
+                                dirty_runs.clear();
                                 let mut dirty_start: Option<usize> = None;
                                 let mut i = 0usize;
                                 while i < n {
                                     if i + 8 <= n && host[i..i + 8] == old[i..i + 8] {
                                         if let Some(s) = dirty_start.take() {
-                                            flush_run(
-                                                start + at,
-                                                n,
-                                                s,
-                                                i,
-                                                title,
-                                                &mut opened_chunk,
-                                                &mut written,
-                                            );
+                                            dirty_runs.push((s, i));
                                         }
                                         if host[i..i + 8] != title[i..i + 8] {
                                             host[i..i + 8].copy_from_slice(&title[i..i + 8]);
@@ -356,15 +353,7 @@ impl Shadow {
                                             old[j] = h;
                                         } else {
                                             if let Some(s) = dirty_start.take() {
-                                                flush_run(
-                                                    start + at,
-                                                    n,
-                                                    s,
-                                                    j,
-                                                    title,
-                                                    &mut opened_chunk,
-                                                    &mut written,
-                                                );
+                                                dirty_runs.push((s, j));
                                             }
                                             if h != t_byte {
                                                 host[j] = t_byte;
@@ -377,15 +366,35 @@ impl Shadow {
                                     i = end_j;
                                 }
                                 if let Some(s) = dirty_start {
-                                    flush_run(
-                                        start + at,
-                                        n,
-                                        s,
-                                        n,
-                                        title,
-                                        &mut opened_chunk,
-                                        &mut written,
-                                    );
+                                    dirty_runs.push((s, n));
+                                }
+                                if !dirty_runs.is_empty() {
+                                    let chunk_start = start + at;
+                                    crate::watch::writing(chunk_start, n);
+                                    let direct = dirty_runs.len() > 16
+                                        && is_writable_commit(chunk_start, n);
+                                    for &(s, e) in &dirty_runs {
+                                        let run_len = e - s;
+                                        if direct {
+                                            // SAFETY: `watch::writing` opened guarded blocks and
+                                            // `is_writable_commit` verified `[chunk_start, chunk_start + n)`
+                                            // is committed and writable.
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    title[s..].as_ptr(),
+                                                    (chunk_start + s) as *mut u8,
+                                                    run_len,
+                                                );
+                                            }
+                                        } else {
+                                            crate::host::write_mapped(
+                                                (chunk_start + s) as *mut u8,
+                                                title[s..].as_ptr(),
+                                                run_len,
+                                            );
+                                        }
+                                        written += run_len;
+                                    }
                                 }
                                 synced.push((start + at) / PAGE);
                             }
@@ -416,12 +425,31 @@ impl Shadow {
                             idx += 1;
                             run_end += 1;
                         }
+                        #[cfg(test)]
+                        BEFORE_COPY_BACK_REARM.with(|hook| {
+                            if let Some(f) = hook.borrow_mut().as_mut() {
+                                f();
+                            }
+                        });
                         if let Some((now, _)) =
                             crate::watch::writes(run_start * PAGE, run_end * PAGE, true)
                         {
                             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                             for page in run_start..run_end {
-                                copied[page - base] = now;
+                                let title_page = &mut title_buf[..PAGE];
+                                // SAFETY: `covers_full_page` guarantees `page * PAGE..page * PAGE + PAGE`
+                                // lies within `[start, start + shadow_len)`.
+                                let host_page = unsafe {
+                                    std::slice::from_raw_parts(
+                                        self.data.add(page * PAGE - start),
+                                        PAGE,
+                                    )
+                                };
+                                if crate::host::read_into((page * PAGE) as *const u8, title_page)
+                                    && title_page == host_page
+                                {
+                                    copied[page - base] = now;
+                                }
                             }
                         }
                         idx += 1;
@@ -1217,5 +1245,108 @@ mod tests {
         assert_eq!(peek(base + last_off + 30), 0xbb);
         assert_eq!(peek(base + 4 * PAGE + 20), 0x44);
         assert!(s.before.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn copy_back_strided_writes_preserve_interleaved_cpu_bytes() {
+        let Some((_memory, base, s)) = title() else {
+            return;
+        };
+        let copy = |at: usize| s.data as usize + (at - base);
+        for off in 0..PAGE {
+            poke(base + off, 0x11);
+        }
+        s.update(base, PAGE);
+        s.writing(base, PAGE);
+
+        // 1,000 interleaved 4-byte GPU and 4-byte CPU writes inside one 64 KiB
+        // page: triggers the `dirty_runs.len() > 16` direct strided copy-back.
+        for k in 0..1000usize {
+            let gpu_off = k * 8;
+            let cpu_off = gpu_off + 4;
+            for b in 0..4 {
+                poke(copy(base + gpu_off + b), 0xaa ^ (k as u8));
+                poke(base + cpu_off + b, 0x55 ^ (k as u8));
+            }
+        }
+
+        let written = s.copy_back(base, PAGE);
+        assert_eq!(written, 1000 * 4);
+        for k in 0..1000usize {
+            let gpu_off = k * 8;
+            let cpu_off = gpu_off + 4;
+            for b in 0..4 {
+                assert_eq!(peek(base + gpu_off + b), 0xaa ^ (k as u8));
+                assert_eq!(peek(base + cpu_off + b), 0x55 ^ (k as u8));
+                assert_eq!(peek(copy(base + cpu_off + b)), 0x55 ^ (k as u8));
+            }
+        }
+        assert_eq!(peek(base + 1000 * 8), 0x11);
+        assert!(s.before.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn copy_back_keeps_page_stale_on_concurrent_title_write() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let Some((buffer, data)) = host().and_then(|h| h.shared_buffer(PAGE as u64)) else {
+            return;
+        };
+        // SAFETY: a fresh write-watched page, freed at the end of the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        crate::watch::forget_journal(base, PAGE);
+        // SAFETY: `buffer` is a live host buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let s = Shadow::new(buffer, data, gpu, base as u64, PAGE as u64);
+        let copy = |at: usize| s.data as usize + (at - base);
+
+        poke(base + 16, 0x11);
+        s.update(base, PAGE);
+        let before_copy_back = s.copied.lock().unwrap()[0];
+        assert_ne!(before_copy_back, 0);
+
+        s.writing(base, PAGE);
+        poke(copy(base + 32), 0xaa);
+
+        // Simulate a title CPU write landing after copy-back scanned the page
+        // but before `watch::writes` clears the kernel write-watch bit.
+        BEFORE_COPY_BACK_REARM.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                poke(base + 64, 0x77);
+            }));
+        });
+        let written = s.copy_back(base, PAGE);
+        BEFORE_COPY_BACK_REARM.with(|hook| {
+            *hook.borrow_mut() = None;
+        });
+
+        assert_eq!(written, 1);
+        assert_eq!(peek(base + 32), 0xaa);
+        assert_eq!(peek(base + 64), 0x77);
+        assert_eq!(peek(copy(base + 64)), 0);
+        assert_eq!(
+            s.copied.lock().unwrap()[0],
+            before_copy_back,
+            "page watermark stays stale when title memory changed before re-arm"
+        );
+
+        // Next update must still pick up the concurrent title write.
+        s.update(base, PAGE);
+        assert_eq!(peek(copy(base + 64)), 0x77);
+
+        crate::watch::forget_journal(base, PAGE);
+        // SAFETY: our write-watched allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }

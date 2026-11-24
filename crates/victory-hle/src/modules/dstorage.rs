@@ -1248,6 +1248,17 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
+struct KernelWriteGuard {
+    at: usize,
+    len: usize,
+}
+
+impl Drop for KernelWriteGuard {
+    fn drop(&mut self) {
+        victory_gpu::kernel_wrote(self.at, self.len);
+    }
+}
+
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -1261,8 +1272,11 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        // GPU side's guard on title buffers; open them first and keep them
+        // writable until the read finishes.
+        let at = request.destination as usize;
+        victory_gpu::kernel_will_write(at, len);
+        let _guard = KernelWriteGuard { at, len };
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
