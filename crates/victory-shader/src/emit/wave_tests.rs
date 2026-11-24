@@ -123,6 +123,7 @@ fn lower_and_validate(
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -274,6 +275,7 @@ fn passthrough_vs() -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        stride_table: false,
     }
 }
 
