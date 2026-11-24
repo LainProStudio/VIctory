@@ -3,7 +3,8 @@
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
-//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
+//! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and denormal
+//! operands of `v_mul_legacy_f32`.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
@@ -43,9 +44,33 @@ const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
 
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
 const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    vop3_mod(op, vdst, src0, src1, src2, 0, 0, 0, false)
+}
+
+/// VOP3 `op vdst, src0, src1, src2` with explicit `abs`, `neg`, `omod`, `clamp`.
+#[allow(clippy::too_many_arguments)]
+const fn vop3_mod(
+    op: u16,
+    vdst: u8,
+    src0: u16,
+    src1: u16,
+    src2: u16,
+    abs: u8,
+    neg: u8,
+    omod: u8,
+    clamp: bool,
+) -> [u32; 2] {
     [
-        0x35 << 26 | (op as u32 & 0x3FF) << 16 | vdst as u32,
-        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+        0x35 << 26
+            | (op as u32 & 0x3FF) << 16
+            | (clamp as u32) << 15
+            | (abs as u32 & 7) << 8
+            | vdst as u32,
+        (neg as u32 & 7) << 29
+            | (omod as u32 & 3) << 27
+            | (src0 as u32 & 0x1FF)
+            | (src1 as u32 & 0x1FF) << 9
+            | (src2 as u32 & 0x1FF) << 18,
     ]
 }
 
@@ -3642,5 +3667,151 @@ fn v_cvt_flr_and_rpi_i32_f32_saturate_nan_by_sign() {
         "v_cvt_i32_f32",
         0x008,
         &[(0x7FC0_0000, 0), (0xFFC0_0000, 0), (0x7F80_0001, 0)],
+    );
+}
+
+#[test]
+fn v_mul_legacy_f32_treats_denormals_as_zero() {
+    // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
+    let shader = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(2), vgpr(0)));
+    let f = f32::to_bits;
+    let (denorm, neg_denorm, min_normal) = (0x0000_0001u32, 0x8040_0000u32, 0x0080_0000u32);
+
+    let cases: &[(u32, u32, u32)] = &[
+        // Zero or denormal times anything, non-finite included, is +0.
+        (f(0.0), f(f32::INFINITY), f(0.0)),
+        (f(-0.0), f(f32::NAN), f(0.0)),
+        (f(f32::NAN), f(0.0), f(0.0)),
+        (denorm, f(f32::INFINITY), f(0.0)),
+        (f(f32::NAN), neg_denorm, f(0.0)),
+        (denorm, f(2.0f32.powi(100)), f(0.0)),
+        // The smallest normal is not zero.
+        (min_normal, f(2.0), f(f32::MIN_POSITIVE * 2.0)),
+        // Ordinary products.
+        (f(1.5), f(-4.0), f(-6.0)),
+        (f(3.0), f(0.5), f(1.5)),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+#[test]
+fn f16_omod_applies_before_clamp() {
+    // VOP3 v_add_f16 (0x132 = 0x100 + VOP2 0x32): v0 = (v1 + v2) * omod [clamp]
+    let mul2 = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 1, false));
+    let mul4 = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 2, false));
+    let div2 = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 3, false));
+    let div2_clamp = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 3, true));
+
+    // f16 constants: 0.25=0x3400, 0.5=0x3800, 0.75=0x3A00, 1.0=0x3C00, 1.5=0x3E00, 2.0=0x4000, -0.5=0xB800
+    run_cases(
+        &mul2,
+        &[[0x3400, 0x3800, 0, 0]], // (0.25 + 0.5) * 2 = 1.5 (0x3E00)
+        |backend, _, _, got| {
+            assert_eq!(got as u16, 0x3E00, "{backend}: v_add_f16 mul:2");
+        },
+    );
+    run_cases(
+        &mul4,
+        &[[0x3400, 0x3400, 0, 0]], // (0.25 + 0.25) * 4 = 2.0 (0x4000)
+        |backend, _, _, got| {
+            assert_eq!(got as u16, 0x4000, "{backend}: v_add_f16 mul:4");
+        },
+    );
+    run_cases(
+        &div2,
+        &[[0x3E00, 0x3E00, 0, 0]], // (1.5 + 1.5) / 2 = 1.5 (0x3E00)
+        |backend, _, _, got| {
+            assert_eq!(got as u16, 0x3E00, "{backend}: v_add_f16 div:2");
+        },
+    );
+    // Ordering check: (0.75 + 0.75) = 1.5; div:2 before clamp gives 0.75 (0x3A00),
+    // whereas clamp before div:2 would give 0.5 (0x3800).
+    let clamp_cases: &[(u16, u16, u16)] = &[
+        (0x3A00, 0x3A00, 0x3A00), // (0.75 + 0.75) / 2 = 0.75 -> 0.75
+        (0x3E00, 0x3E00, 0x3C00), // (1.5 + 1.5) / 2 = 1.5 -> clamped to 1.0
+        (0xB800, 0xB800, 0x0000), // (-0.5 + -0.5) / 2 = -0.5 -> clamped to 0.0
+    ];
+    let inputs: Vec<[u32; 4]> = clamp_cases
+        .iter()
+        .map(|&(a, b, _)| [u32::from(a), u32::from(b), 0, 0])
+        .collect();
+    run_cases(&div2_clamp, &inputs, |backend, i, _, got| {
+        let want = clamp_cases[i].2;
+        assert_eq!(
+            got as u16, want,
+            "{backend}: v_add_f16 div:2 clamp case {i}: got {:#06x}, want {want:#06x}",
+            got as u16,
+        );
+    });
+}
+
+#[test]
+fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
+    // VOP3 v_cvt_u16_f16 = 0x1D2 (0x180 + VOP1 0x52)
+    // VOP3 v_cvt_i16_f16 = 0x1D3 (0x180 + VOP1 0x53)
+    let cvt_u16 = build_valu_cs(&vop3_mod(0x1D2, 0, vgpr(1), 0, 0, 0, 0, 0, false));
+    let cvt_u16_abs = build_valu_cs(&vop3_mod(0x1D2, 0, vgpr(1), 0, 0, 1, 0, 0, false));
+    let cvt_i16 = build_valu_cs(&vop3_mod(0x1D3, 0, vgpr(1), 0, 0, 0, 0, 0, false));
+    let cvt_i16_neg = build_valu_cs(&vop3_mod(0x1D3, 0, vgpr(1), 0, 0, 0, 1, 0, false));
+
+    let u16_cases: &[(u16, u16)] = &[
+        (0xBC00, 0),      // -1.0 -> 0
+        (0xFC00, 0),      // -inf -> 0
+        (0x7E00, 0),      // NaN -> 0
+        (0x57BC, 123),    // 123.75 -> 123
+        (0x7BFF, 65504),  // 65504.0 (max finite f16) -> 65504
+        (0x7C00, 0xFFFF), // +inf -> 65535 (saturated)
+    ];
+    let u16_in: Vec<[u32; 4]> = u16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
+    run_cases(&cvt_u16, &u16_in, |backend, i, inp, got| {
+        let want = u16_cases[i].1;
+        assert_eq!(
+            got as u16, want,
+            "{backend}: v_cvt_u16_f16({:#06x}) = {:#06x}, want {want:#06x}",
+            inp[0], got as u16,
+        );
+    });
+    run_cases(
+        &cvt_u16_abs,
+        &[[0xD7BC, 0, 0, 0]], // |-123.75| -> 123
+        |backend, _, _, got| {
+            assert_eq!(got as u16, 123, "{backend}: v_cvt_u16_f16 |src0|");
+        },
+    );
+
+    let i16_cases: &[(u16, u16)] = &[
+        (0xFC00, 0x8000),          // -inf -> -32768
+        (0xF8E2, 0x8000),          // -40000.0 -> -32768 (saturated, not wrapped)
+        (0xD7BC, (-123i16) as u16), // -123.75 -> -123
+        (0x7E00, 0),               // NaN -> 0
+        (0x57BC, 123),             // 123.75 -> 123
+        (0x78E2, 0x7FFF),          // +40000.0 -> 32767 (saturated, not wrapped)
+        (0x7C00, 0x7FFF),          // +inf -> 32767
+    ];
+    let i16_in: Vec<[u32; 4]> = i16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
+    run_cases(&cvt_i16, &i16_in, |backend, i, inp, got| {
+        let want = i16_cases[i].1;
+        assert_eq!(
+            got as u16, want,
+            "{backend}: v_cvt_i16_f16({:#06x}) = {:#06x}, want {want:#06x}",
+            inp[0], got as u16,
+        );
+    });
+    run_cases(
+        &cvt_i16_neg,
+        &[[0x57BC, 0, 0, 0], [0x78E2, 0, 0, 0]], // -(123.75) -> -123; -(40000.0) -> -32768
+        |backend, i, _, got| {
+            let want = [(-123i16) as u16, 0x8000][i];
+            assert_eq!(got as u16, want, "{backend}: v_cvt_i16_f16 -src0 case {i}");
+        },
     );
 }
