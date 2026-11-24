@@ -9189,6 +9189,15 @@ impl<'a> Lower<'a> {
                         self.s.m.bin(c, Bin::Xor, n, yes)
                     }
                     "neq" | "nge" | "nle" if same_src => is_nan(self, a),
+                    "lg" => {
+                        // Ordered and not equal, false for a NaN, as `olt | ogt`.
+                        // `fcmp one` means the same, but the AMD D3D12 driver
+                        // runs it as unordered (true for a NaN) where NVIDIA
+                        // and WARP do not; olt and ogt agree on all three.
+                        let lt = self.s.m.cmp(c, pred::OLT, a, b);
+                        let gt = self.s.m.cmp(c, pred::OGT, a, b);
+                        self.s.m.bin(c, Bin::Or, lt, gt)
+                    }
                     _ => {
                         let p = match op {
                             "f" => pred::FALSE,
@@ -9196,7 +9205,6 @@ impl<'a> Lower<'a> {
                             "eq" => pred::OEQ,
                             "le" => pred::OLE,
                             "gt" => pred::OGT,
-                            "lg" => pred::ONE,
                             "ge" => pred::OGE,
                             "nge" => pred::ULT,
                             "nlg" => pred::UEQ,

@@ -629,10 +629,12 @@ impl Shader {
             self.flags |= flags::STENCIL_REF;
         }
         // Entry properties: shader flags (tag 0), thread-group size (4),
-        // wave size (11).
+        // wave size (11). Prune instruction-driven flags to those surviving
+        // dead-code elimination so declared flags match live usage.
         if self.cs_derivatives && self.sample_clamp {
             self.flags |= flags::TILED_RESOURCES;
         }
+        self.flags = self.m.active_flags(self.flags);
         let mut props = Vec::new();
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
