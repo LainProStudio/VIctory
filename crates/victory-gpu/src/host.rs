@@ -645,7 +645,7 @@ mod tests {
         }
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        let rtv = host.rtv(&target, None);
+        let rtv = host.rtv(Some(&target), None);
         // SAFETY: one draw argument, no root arguments.
         let signature: ID3D12CommandSignature = unsafe {
             let argument = D3D12_INDIRECT_ARGUMENT_DESC {
@@ -1086,16 +1086,19 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
-        for list in runs {
-            let uploads = list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
-                lists.push(Some(prelude));
+        let (_plans, back) = {
+            let mut batch = Batch::default();
+            for list in runs {
+                let uploads = list.run_deferred(&mut batch);
+                firsts.push(lists.len());
+                if let Some(prelude) = list.prelude(&uploads) {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
             }
-            lists.push(list.list.cast().ok());
-        }
-        batch.prepare_bindless();
+            batch.prepare_bindless();
+            (batch.plans, batch.copy_back)
+        };
         let retired = take_retired();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -1163,31 +1166,8 @@ impl Host {
         }
         drop(retired);
         // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // which tell the title the GPU is done.
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
-                }
-            }
-        }
-        for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            if !back
-                .iter()
-                .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len))
-            {
-                back.push((shadow, address, len));
-            }
-        }
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
             let written = shadow.copy_back(address, len);
@@ -2003,9 +1983,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                    batch.gpu_write(shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging, copy) => {
@@ -2053,8 +2031,10 @@ struct Batch {
     /// Their plans, which hold the host resources the slots view until the
     /// submission has run.
     plans: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
-    /// Bindless unordered access ranges, copied back after the submission.
-    bindless_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Write ranges already declared in this submission (shadow identity, address, bytes).
+    write_ranges: std::collections::HashSet<(usize, usize, usize)>,
+    /// The same ranges, holding the shadows in first-declaration order for copy-back.
+    copy_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 /// `[from, to)` ranges of title memory.
@@ -2109,6 +2089,30 @@ impl Batch {
         }
     }
 
+    fn record_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if self.write_ranges.insert(key) {
+            shadow.writing(address, len);
+            self.copy_back.push((shadow.clone(), address, len));
+        }
+    }
+
+    fn gpu_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        // Even a repeated declaration comes after the preceding refreshes.
+        self.flush();
+        self.record_write(shadow, address, len);
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
@@ -2154,12 +2158,7 @@ impl Batch {
             }
             if writes {
                 for (shadow, address, len) in &plan.writes {
-                    if !self.bindless_writes.iter().any(|(s, a, l)| {
-                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                    }) {
-                        shadow.writing(*address, *len);
-                        self.bindless_writes.push((shadow.clone(), *address, *len));
-                    }
+                    self.record_write(shadow, *address, *len);
                 }
             }
             self.plans.push(plan);

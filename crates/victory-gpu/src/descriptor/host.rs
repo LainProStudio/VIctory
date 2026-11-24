@@ -2607,7 +2607,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(rtv_desc.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
         assert_eq!(rtv_desc.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2D);
         let host = host().unwrap();
-        let _ = host.rtv(tex, Some(&rtv_desc));
+        let _ = host.rtv(Some(tex), Some(&rtv_desc));
 
         // Null-desc RTV on 2D-array and MSAA sRGB-castable textures must
         // synthesize the matching RTV dimension (not hardcoded TEXTURE2D).
@@ -2632,7 +2632,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(array_rtv.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DARRAY);
         // SAFETY: reading `Texture2DArray` union arm just asserted above.
         assert_eq!(unsafe { array_rtv.Anonymous.Texture2DArray.ArraySize }, 2);
-        let _ = host.rtv(array_tex, Some(&array_rtv));
+        let _ = host.rtv(Some(array_tex), Some(&array_rtv));
 
         let msaa_res = crate::resource::test_committed_texture(
             4,
@@ -2653,7 +2653,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let msaa_rtv = msaa_rec.desc().unwrap();
         assert_eq!(msaa_rtv.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
         assert_eq!(msaa_rtv.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DMS);
-        let _ = host.rtv(msaa_tex, Some(&msaa_rtv));
+        let _ = host.rtv(Some(msaa_tex), Some(&msaa_rtv));
 
         // SAFETY: plain device health check after creating all views.
         let removed = unsafe { host.device.GetDeviceRemovedReason() };
