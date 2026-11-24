@@ -1379,7 +1379,7 @@ impl Host {
                 runs.iter().position(|r| r.is_node(p))
             };
             let list_label = |p: &D3D12_AUTO_BREADCRUMB_NODE| -> String {
-                let ptr = p.pCommandList.as_ref().and_then(|l| com_identity(l));
+                let ptr = p.pCommandList.as_ref().and_then(&com_identity);
                 runs.iter()
                     .enumerate()
                     .find_map(|(i, r)| {
@@ -2336,6 +2336,7 @@ impl Batch {
 
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed for test helpers / unbounded callers).
+    #[cfg(test)]
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
         self.texture_due_range(staging, (0, usize::MAX))
     }
