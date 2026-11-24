@@ -542,11 +542,27 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
-    unsafe {
+    let mut desc = unsafe {
         std::ptr::from_ref(&words)
             .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
             .read_unaligned()
+    };
+    // Console stencil SRVs may leave `PlaneSlice` at 0; PC D3D12 requires plane 1.
+    if matches!(
+        desc.Format,
+        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT | DXGI_FORMAT_X24_TYPELESS_G8_UINT
+    ) {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                desc.Anonymous.Texture2D.PlaneSlice = 1;
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                desc.Anonymous.Texture2DArray.PlaneSlice = 1;
+            }
+            _ => {}
+        }
     }
+    desc
 }
 
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -1406,5 +1422,33 @@ void main(uint3 id : SV_DispatchThreadID) {
             (&title[..68], &title[100..]),
             (&before[..68], &before[100..])
         );
+    }
+
+    #[test]
+    fn stencil_srvs_select_plane_slice_1() {
+        let mut words = [0u32; 10];
+        // Format 120 -> X24_TYPELESS_G8_UINT (47) on Texture2D (dim 4)
+        words[0] = 120;
+        words[1] = 4;
+        let d = srv_desc(&words);
+        assert_eq!(d.Format, DXGI_FORMAT_X24_TYPELESS_G8_UINT);
+        // SAFETY: Texture2D union matches ViewDimension 4.
+        assert_eq!(unsafe { d.Anonymous.Texture2D.PlaneSlice }, 1);
+
+        // Format 22 -> X32_TYPELESS_G8X24_UINT on Texture2DArray (dim 5)
+        words[0] = 22;
+        words[1] = 5;
+        let d = srv_desc(&words);
+        assert_eq!(d.Format, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT);
+        // SAFETY: Texture2DArray union matches ViewDimension 5.
+        assert_eq!(unsafe { d.Anonymous.Texture2DArray.PlaneSlice }, 1);
+
+        // Depth format 119 -> R24_UNORM_X8_TYPELESS (46) stays at plane 0.
+        words[0] = 119;
+        words[1] = 4;
+        let d = srv_desc(&words);
+        assert_eq!(d.Format, DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
+        // SAFETY: Texture2D union matches ViewDimension 4.
+        assert_eq!(unsafe { d.Anonymous.Texture2D.PlaneSlice }, 0);
     }
 }

@@ -226,10 +226,12 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     })
 }
 
-/// A format as the host has it. The console's 16-bit depth with stencil
-/// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// A format as the host has it. The console's 10-bit float color formats
+/// (116/117) promote to `R16G16B16A16_FLOAT` (10), and its 16-bit depth with
+/// stencil (118..=120) maps to the 24-bit depth/stencil equivalents.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
+        116 | 117 => 10,
         118 => 45,
         119 => 46,
         120 => 47,
@@ -2278,6 +2280,8 @@ mod tests {
                     [format, RGBA8_UNORM].contains(&target_format(format)),
                     "unexpected target format for {format}"
                 );
+            } else if matches!(format, 116 | 117) {
+                assert_eq!(target_format(format), 10);
             } else if (118..=120).contains(&format) {
                 assert_eq!(target_format(format), format - 118 + 45);
             } else {
@@ -2571,5 +2575,15 @@ mod tests {
         for o in [list, allocator, queue] {
             assert_eq!(slot::<Release>(o, 0x10)(o), 0);
         }
+    }
+
+    #[test]
+    fn pc_format_maps_console_depth_and_float10() {
+        assert_eq!(pc_format(116), 10);
+        assert_eq!(pc_format(117), 10);
+        assert_eq!(pc_format(118), 45);
+        assert_eq!(pc_format(119), 46);
+        assert_eq!(pc_format(120), 47);
+        assert_eq!(pc_format(28), 28);
     }
 }
