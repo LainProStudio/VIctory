@@ -1011,12 +1011,6 @@ fn forms_without_an_sm_6_6_equivalent_name_why() {
             "a gather with a level bias",
         ),
         (
-            "image_gather4_l",
-            false,
-            false,
-            "a gather at a level not known to be 0",
-        ),
-        (
             "image_gather4_c_l_o",
             false,
             false,

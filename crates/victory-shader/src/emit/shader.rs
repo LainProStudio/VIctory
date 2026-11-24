@@ -19,6 +19,8 @@ pub const STRIDE_SPACE: u32 = 2;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// `LowPrecisionPresent` in DXIL `ShaderFlags` (required whenever 16-bit types appear).
+    pub const LOW_PRECISION_PRESENT: u64 = 1 << 5;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TILED_RESOURCES: u64 = 1 << 12;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;

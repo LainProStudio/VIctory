@@ -9976,13 +9976,14 @@ impl<'a> Lower<'a> {
                 let bounds = self.buffer_bounds(h, index, off, stride, width / 8);
                 let active = self.buffer_store_guard(bounds, guard);
                 let at = self.begin_guarded(Some(active));
-                if width == 16 {
+                if width == 16 && self.s.m.known(off).is_some_and(|v| v & 1 == 0) {
                     // GFX10 buffer_store_short writes one native 16-bit value. DXIL
-                    // RawBufferStore.i16 preserves the write width; widening it to an
-                    // i32 store would overwrite the adjacent halfword.
+                    // RawBufferStore.i16 preserves the write width for 2-byte-aligned
+                    // offsets; odd or dynamic offsets use the subword CAS loop below
+                    // because RawBufferStore.i16 masks bit 0 of the byte offset.
                     // RawBufferStore.i16 is a DXIL 1.2 native low-precision
-                    // operation; advertise the SM 6.2 capability in the module.
-                    self.s.flags |= flags::NATIVE_LOW_PRECISION;
+                    // operation; advertise the 16-bit presence and SM 6.2 capability.
+                    self.s.flags |= flags::LOW_PRECISION_PRESENT | flags::NATIVE_LOW_PRECISION;
                     let i16 = self.s.m.int(16);
                     let value = self.s.m.cast(self.cur, Cast::Trunc, x, i16);
                     let undef = self.s.m.undef(i16);
