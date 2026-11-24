@@ -4169,10 +4169,24 @@ impl<'a> Lower<'a> {
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
         let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        let na = self.is_nan_bits(a);
+        let nb = self.is_nan_bits(b);
+        let n3 = self.is_nan_bits(third);
+        let ab = self.s.m.bin(c, Bin::Or, na, nb);
+        let nan = self.s.m.bin(c, Bin::Or, ab, n3);
         self.s.m.select(c, nan, least, median)
+    }
+
+    /// Whether `f` is a NaN, tested on its bits (`|f| > +inf` as integers).
+    /// A float `fcmp uno` is not used: drivers (observed on NVIDIA) assume
+    /// no NaNs there and fold it to false, so the NaN case was lost.
+    fn is_nan_bits(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let abs = self.s.m.i32(0x7FFF_FFFF);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let mag = self.s.m.bin(c, Bin::And, bits, abs);
+        self.s.m.cmp(c, pred::IUGT, mag, inf)
     }
 
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
@@ -4553,6 +4567,45 @@ impl<'a> Lower<'a> {
             _ => x,
         };
         self.vals.insert(new, Val::I32(x));
+    }
+
+    /// The two register offsets of `v_movrelsd_2_b32` and `v_swaprel_b32`:
+    /// M0[9:0] for the source, M0[25:16] for the destination.
+    fn m0_halves(&mut self, m0: V) -> (V, V) {
+        let c = self.cur;
+        let low = self.s.m.i32(0x3FF);
+        let sixteen = self.s.m.i32(16);
+        let si = self.s.m.bin(c, Bin::And, m0, low);
+        let high = self.s.m.bin(c, Bin::LShr, m0, sixteen);
+        let di = self.s.m.bin(c, Bin::And, high, low);
+        (si, di)
+    }
+
+    /// `v[base + index]`, from the M0-relative range `inst` reads from
+    /// `base` on ([`crate::ir`] names it up to the program's VGPR count);
+    /// 0 past it.
+    fn rel_read(&mut self, inst: &Inst, base: u8, index: V) -> Result<V, Why> {
+        let c = self.cur;
+        let mut r = self.s.m.i32(0);
+        for k in 0..=255u8.saturating_sub(base) {
+            let Some(x) = inst.read(Reg::V(base + k)) else {
+                break;
+            };
+            let x = self.i32_of(x)?;
+            let kk = self.s.m.i32(u32::from(k));
+            let is = self.s.m.cmp(c, pred::EQ, index, kk);
+            r = self.s.m.select(c, is, x, r);
+        }
+        Ok(r)
+    }
+
+    /// The value a VGPR an M0-relative write may land on held before it
+    /// (0 when the program never set it).
+    fn old_vgpr(&mut self, inst: &Inst, reg: u8) -> Result<V, Why> {
+        match inst.read(Reg::V(reg)) {
+            Some(o) => self.i32_of(o),
+            None => Ok(self.s.m.i32(0)),
+        }
     }
 
     /// The SDWA destination selection: a byte or word, and what the other
@@ -6875,6 +6928,42 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// The dwords a `tbuffer_store_format_*` writes: its `channels` data
+    /// channels in buffer format `format`, as RDNA2 lays them out (see
+    /// [`buffer_format`]). Formats of 32-bit channels store the data's bits;
+    /// the `_d16_` forms of the 16-bit float formats store their halves as
+    /// they are.
+    // shortcut: only stores that need no conversion, with every channel of
+    // the format supplied, are lowered. Others need conversions (norm,
+    // scaled, narrow integers; f32 to f16, whose DXIL op rounds toward zero
+    // where the console rounds to nearest even, see #422) or elements under
+    // a dword (a read-modify-write lanes would race on); refused until a
+    // program needs them.
+    fn format_store_words(
+        &mut self,
+        inst: &Inst,
+        data: Option<&Operand>,
+        format: u8,
+        channels: u32,
+    ) -> Result<Vec<V>, Why> {
+        let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        if bits.len() != channels as usize {
+            return Err("a typed-format store of some of its format's channels");
+        }
+        if !bits.iter().sum::<u32>().is_multiple_of(32) {
+            return Err("a typed-format store of an element under a dword");
+        }
+        let d16 = inst.name().contains("_d16_");
+        let data = data.ok_or("buffer store data")?;
+        match (bits[0], numeric, d16) {
+            (32, Numeric::Uint | Numeric::Sint | Numeric::Float, false) => {
+                self.vgprs(inst, data, channels as u8)
+            }
+            (16, Numeric::Float, true) => self.vgprs(inst, data, channels.div_ceil(2) as u8),
+            _ => Err("a typed-format store of a converted or narrow format"),
+        }
+    }
+
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
@@ -7570,10 +7659,12 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
-            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
+            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)
                 // or both, from the encoded register up to the program's
                 // VGPR count (the registers the instruction reads or writes).
+                // movrelsd_2 indexes them apart: the source by M0[9:0], the
+                // destination by M0[25:16].
                 let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
@@ -7582,19 +7673,13 @@ impl<'a> Lower<'a> {
                 else {
                     return Err("an M0-relative move");
                 };
-                let indexed_src = name != "v_movreld_b32";
-                let value = if indexed_src {
-                    let mut r = self.s.m.i32(0);
-                    for k in 0..=255u8.saturating_sub(sreg) {
-                        let Some(x) = inst.read(Reg::V(sreg + k)) else {
-                            break;
-                        };
-                        let x = self.i32_of(x)?;
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, m0, kk);
-                        r = self.s.m.select(c, is, x, r);
-                    }
-                    r
+                let (si, di) = if name == "v_movrelsd_2_b32" {
+                    self.m0_halves(m0)
+                } else {
+                    (m0, m0)
+                };
+                let value = if name != "v_movreld_b32" {
+                    self.rel_read(inst, sreg, si)?
                 } else {
                     s(self, 0)?
                 };
@@ -7605,14 +7690,48 @@ impl<'a> Lower<'a> {
                     let Some(_) = inst.write(Reg::V(dreg + k)) else {
                         break;
                     };
-                    let old = match inst.read(Reg::V(dreg + k)) {
-                        Some(o) => self.i32_of(o)?,
-                        None => self.s.m.i32(0),
-                    };
+                    let old = self.old_vgpr(inst, dreg + k)?;
                     let kk = self.s.m.i32(u32::from(k));
-                    let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                    let is = self.s.m.cmp(c, pred::EQ, di, kk);
                     let x = self.s.m.select(c, is, value, old);
                     self.write_placed(inst, Reg::V(dreg + k), x, guard);
+                }
+                Ok(())
+            }
+            "v_swaprel_b32" => {
+                // v[dst + M0[25:16]] and v[src + M0[9:0]] trade values. The
+                // console writes the destination first and the source last,
+                // so a register both name keeps its value.
+                let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let (
+                    Some(&Operand::Vector { reg: sreg, .. }),
+                    Some(Operand::Vector { reg: dreg, .. }),
+                ) = (v.src.first(), v.dst)
+                else {
+                    return Err("an M0-relative swap");
+                };
+                let (si, di) = self.m0_halves(m0);
+                let to_dst = self.rel_read(inst, sreg, si)?;
+                let to_src = self.rel_read(inst, dreg, di)?;
+                let sbase = self.s.m.i32(u32::from(sreg));
+                let dbase = self.s.m.i32(u32::from(dreg));
+                let at_src = self.s.m.bin(c, Bin::Add, sbase, si);
+                let at_dst = self.s.m.bin(c, Bin::Add, dbase, di);
+                // Both ranges run to the program's last VGPR: their union
+                // starts at the lower base.
+                let first = sreg.min(dreg);
+                for k in 0..=255u8.saturating_sub(first) {
+                    let r = first + k;
+                    let Some(_) = inst.write(Reg::V(r)) else {
+                        break;
+                    };
+                    let old = self.old_vgpr(inst, r)?;
+                    let rr = self.s.m.i32(u32::from(r));
+                    let is_dst = self.s.m.cmp(c, pred::EQ, at_dst, rr);
+                    let x = self.s.m.select(c, is_dst, to_dst, old);
+                    let is_src = self.s.m.cmp(c, pred::EQ, at_src, rr);
+                    let x = self.s.m.select(c, is_src, to_src, x);
+                    self.write_placed(inst, Reg::V(r), x, guard);
                 }
                 Ok(())
             }
@@ -10633,7 +10752,10 @@ impl<'a> Lower<'a> {
         if *lds || *tfe {
             return Err("a buffer access to LDS or with tfe");
         }
-        if format.is_some() && !name.starts_with("tbuffer_load_format_") {
+        if format.is_some()
+            && !name.starts_with("tbuffer_load_format_")
+            && !name.starts_with("tbuffer_store_format_")
+        {
             return Err("an MTBUF store requiring a packed-format write");
         }
         if name.contains("_format_d16_hi_") {
@@ -10642,7 +10764,7 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
-        let store = name.starts_with("buffer_store_");
+        let store = name.starts_with("buffer_store_") || name.starts_with("tbuffer_store_");
         let atomic = name.strip_prefix("buffer_atomic_");
         let wide = atomic.is_some_and(|n| n.ends_with("_x2"));
         let atomic = atomic.map(|n| n.strip_suffix("_x2").unwrap_or(n));
@@ -10679,6 +10801,7 @@ impl<'a> Lower<'a> {
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
+            .or(plain.strip_prefix("tbuffer_store_"))
         {
             _ if atomic.is_some() || sub_load.is_some() || sub_store.is_some() => (false, 1),
             Some("dword") => (false, 1),
@@ -10940,6 +11063,32 @@ impl<'a> Lower<'a> {
             } else {
                 self.end_guarded(at, &[]);
             }
+            return Ok(());
+        }
+        if let (true, Some(f)) = (store, *format) {
+            if index.is_some() {
+                return Err("a typed-format store by index");
+            }
+            let words = self.format_store_words(inst, data.as_ref(), f, count)?;
+            let (in_bounds, safe_off) = self.bound_raw_offset(off);
+            let mut args = vec![self.handle(site, src, false, (11 | u, 0))?, safe_off, iu];
+            let n = words.len();
+            args.extend(words);
+            args.resize(3 + 4, iu);
+            args.push(self.s.m.i8((1u8 << n) - 1));
+            args.push(self.s.m.i32(4));
+            let store_guard = self.and_guard(guard, in_bounds);
+            let at = self.begin_guarded(store_guard);
+            let void = self.s.t.void;
+            self.s.op(
+                self.cur,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &args,
+            );
+            self.end_guarded(at, &[]);
             return Ok(());
         }
         if store {

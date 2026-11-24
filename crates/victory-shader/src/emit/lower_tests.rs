@@ -2100,3 +2100,58 @@ fn transitive_lane_mask_phi_does_not_block_live_data_join() {
     let l = lowers_cs(&words, false, 2).unwrap();
     validate(&l.dxil);
 }
+
+#[test]
+fn m0_relative_moves_with_two_indices_translate() {
+    // v1 = 5, v2 = 7, M0 = source offset 0, destination offset 1, then
+    // the M0-relative instruction and an LDS store of its v1 (an effect,
+    // so a value the emitter cannot produce fails the translation).
+    let program = |rel: u32| {
+        [
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7E04_0287, // v_mov_b32 v2, 7
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xBEFC_03FF, // s_mov_b32 m0, literal
+            0x0001_0000,
+            rel,
+            0xD834_0000, // ds_write_b32 v3, v1
+            0x0000_0103,
+            S_ENDPGM,
+        ]
+    };
+    for rel in [
+        0x7E02_D101, // v_swaprel_b32 v1, v1
+        0x7E02_9101, // v_movrelsd_2_b32 v1, v1
+    ] {
+        lowers_lds(&program(rel)).unwrap_or_else(|e| panic!("{rel:08x}: {e}"));
+    }
+}
+
+#[test]
+fn tbuffer_store_format_lowers_and_validates() {
+    let op = 13u32; // tbuffer_store_format_d16_xy
+    let fmt = 29u32; // 16_16 float
+    let words = [
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0xF408_0100, // s_load_dwordx4 s[4:7], s[0:1], 0
+        0xFA00_0000,
+        0x7E00_0281, // v_mov_b32 v0, 1
+        0x7E02_0282, // v_mov_b32 v1, 2
+        0x3A << 26 | fmt << 19 | (op & 7) << 16 | 16,
+        0x80 << 24 | (op >> 3 & 1) << 21 | (4 >> 2) << 16 | 1,
+        S_ENDPGM,
+    ];
+    let layout = vec![root(RootType::Table, 0, 0)];
+    let used = vec![UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    let l = lower_with(&words, layout, used).unwrap();
+    validate(&l.dxil);
+}

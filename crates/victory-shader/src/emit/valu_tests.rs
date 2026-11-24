@@ -105,6 +105,11 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     build_cs(body, 0)
 }
 
+/// [`build_valu_cs`], with the lowering's refusal as an error.
+fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
+    lower_valu_cs(body, 5 << 1, [1, 1, 1])
+}
+
 /// As [`build_valu_cs`], with `lds_blocks` × 512 bytes of LDS allocated.
 fn build_cs(body: &[u32], lds_blocks: u32) -> HostShader {
     build_cs_with_store(body, lds_blocks, buffer_store_dword(0, 8, 0))
@@ -239,6 +244,12 @@ fn try_lower_compute(native: &NativeProgram) -> Result<HostShader, String> {
     Ok(shader)
 }
 
+/// One GPU test at a time. With these tests on the hardware adapter and WARP
+/// from several test threads at once, now and then none of their dispatches
+/// ever completes and the test binary hangs; and two GPU tests at once on
+/// WARP can end the test process with an access violation.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
@@ -257,6 +268,7 @@ fn run_cases_on(
     backends: &[(&str, bool)],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for &(label, warp) in backends {
         let Ok(host) = Host::new(warp) else {
@@ -3866,4 +3878,228 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
             assert_eq!(got as u16, want, "{backend}: v_cvt_i16_f16 -src0 case {i}");
         },
     );
+}
+
+/// MTBUF `op vdata, v5, s[8:11], 0 format:fmt offset:16` (no offen/idxen;
+/// `op` 4..7 stores x..xyzw, 12..15 their d16 forms).
+const fn mtbuf_store(op: u8, fmt: u8, vdata: u8) -> [u32; 2] {
+    [
+        0x3A << 26 | (fmt as u32) << 19 | (op as u32 & 7) << 16 | 16,
+        0x80 << 24 | (op as u32 >> 3 & 1) << 21 | (8 >> 2) << 16 | (vdata as u32) << 8 | 5,
+    ]
+}
+
+/// Runs `shader` once with root constants `inputs` on every available
+/// SM 6.6 host and returns the first `dwords` of its raw UAV, per device.
+fn run_dwords(shader: &HostShader, inputs: [u32; 4], dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => inputs[u.dword as usize],
+                (RootType::Table, 1) => 0,
+                (root, _) => super::host::guard(root, 1, 0)
+                    .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, u.slot))),
+            };
+        }
+        let r = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(dwords)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        out.push((label, r[0].clone()));
+    }
+    assert!(
+        !out.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    out
+}
+
+#[test]
+fn tbuffer_store_format_writes_the_formats_layout() {
+    let f = |x: f32| x.to_bits();
+    // (what, op, format, data in v1..v4, dwords 4..8 afterwards)
+    type Case = (&'static str, u8, u8, [u32; 4], [u32; 4]);
+    let cases: &[Case] = &[
+        (
+            "32_32_32_32 float xyzw",
+            7,
+            77,
+            [f(1.5), f(-0.0), 0x7FC0_1234, 0x0000_0001],
+            [f(1.5), f(-0.0), 0x7FC0_1234, 0x0000_0001],
+        ),
+        (
+            "32_32_32_32 sint xyzw",
+            7,
+            76,
+            [u32::MAX, 0x8000_0000, 7, 0x1234_5678],
+            [u32::MAX, 0x8000_0000, 7, 0x1234_5678],
+        ),
+        (
+            "32_32_32 float xyz",
+            6,
+            74,
+            [f(2.0), f(3.0), f(4.0), 0xDEAD_BEEF],
+            [f(2.0), f(3.0), f(4.0), 0],
+        ),
+        (
+            "32_32 uint xy",
+            5,
+            63,
+            [0xAABB_CCDD, 9, 0xDEAD_BEEF, 0xDEAD_BEEF],
+            [0xAABB_CCDD, 9, 0, 0],
+        ),
+        (
+            "32 float x",
+            4,
+            22,
+            [f(-7.25), 1, 2, 3],
+            [f(-7.25), 0, 0, 0],
+        ),
+        (
+            // d16: the halves are stored as they are.
+            "16_16 float d16_xy",
+            13,
+            29,
+            [0xBC00_3555, 0xDEAD_BEEF, 0, 0],
+            [0xBC00_3555, 0, 0, 0],
+        ),
+        (
+            "16_16_16_16 float d16_xyzw",
+            15,
+            71,
+            [0x1234_5678, 0x7C00_FC00, 0, 0],
+            [0x1234_5678, 0x7C00_FC00, 0, 0],
+        ),
+    ];
+    for &(what, op, fmt, inputs, want) in cases {
+        let mut body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0
+        body.extend(mtbuf_store(op, fmt, 1));
+        let shader = build_valu_cs(&body);
+        for (backend, out) in run_dwords(&shader, inputs, 8) {
+            assert_eq!(
+                out[4..8],
+                want,
+                "{backend}: tbuffer_store {what}: wrote {:#010x?}, want {want:#010x?}",
+                &out[4..8],
+            );
+        }
+    }
+}
+
+#[test]
+fn tbuffer_store_format_refuses_what_it_does_not_convert() {
+    for (what, op, fmt, reason) in [
+        ("8_8_8_8 unorm", 7, 56, "a converted or narrow format"),
+        ("16_16 uint", 5, 27, "a converted or narrow format"),
+        ("16 float", 4, 13, "an element under a dword"),
+        (
+            "32_32_32_32 float, xy only",
+            5,
+            77,
+            "some of its format's channels",
+        ),
+        ("32 float d16_x", 12, 22, "a converted or narrow format"),
+        // f32 to f16 waits for nearest-even narrowing (#422).
+        ("16_16 float xy", 5, 29, "a converted or narrow format"),
+        (
+            "16_16_16_16 float xyzw",
+            7,
+            71,
+            "a converted or narrow format",
+        ),
+    ] {
+        let mut body = vec![vop1(0x001, 5, 0x80)];
+        body.extend(mtbuf_store(op, fmt, 1));
+        match try_build_valu_cs(&body) {
+            Ok(_) => panic!("tbuffer_store {what} lowered; it should be refused"),
+            Err(e) => assert!(e.contains(reason), "tbuffer_store {what}: refused with {e}"),
+        }
+    }
+}
+
+/// Contributed by @aziaconsal2026 on the pull request: the vector (`offen`)
+/// and scalar (`soffset`) byte offsets add to the immediate one, and the
+/// neighbouring dwords stay as they were.
+#[test]
+fn tbuffer_store_adds_scalar_and_vector_byte_offsets() {
+    // v1 = payload, v2 = vector byte offset, s2 = scalar byte offset,
+    // v4 = sentinel. Fill the window first so stray writes are observable.
+    let mut body = Vec::new();
+    for offset in (16..44).step_by(4) {
+        body.extend(buffer_store_dword(4, 8, offset));
+    }
+    body.push(vop1(0x001, 5, vgpr(2))); // v_mov_b32 v5, v2
+    let [opcode, operands] = mtbuf_store(4, 20, 1); // 32_UINT, immediate byte offset 16
+    body.extend([opcode | (1 << 12), (operands & 0x00ff_ffff) | (2 << 24)]); // offen, soffset = s2
+    let shader = build_valu_cs(&body);
+
+    let payload = 0x1357_9bdf;
+    let sentinel = 0xa5a5_a5a5;
+    for (vector, scalar) in [(0, 0), (4, 0), (0, 8), (4, 8), (12, 8)] {
+        let mut expected = [sentinel; 7];
+        expected[((vector + scalar) / 4) as usize] = payload;
+        for (backend, words) in run_dwords(&shader, [payload, vector, scalar, sentinel], 11) {
+            assert_eq!(
+                &words[4..],
+                &expected,
+                "{backend}: vector={vector} scalar={scalar}"
+            );
+        }
+    }
+}
+
+#[test]
+fn m0_relative_swaps_and_moves_index_source_and_destination_apart() {
+    // v1..v4 = 10, 20, 30, 40. v_movrelsd_2_b32 and v_swaprel_b32 offset
+    // their source by M0[9:0] and their destination by M0[25:16]; other M0
+    // bits are ignored. Each case reads one VGPR back into v0.
+    const SWAPREL: u16 = 0x068;
+    const MOVRELSD_2: u16 = 0x048;
+    let cases: &[(u16, u8, u32, u8, u32)] = &[
+        // (opcode, vdst, M0, register read back, expected)
+        // v[1 + 2] <-> v[1 + 0]
+        (SWAPREL, 1, 2 << 16, 1, 30),
+        (SWAPREL, 1, 2 << 16, 3, 10),
+        // v[1 + 0] <-> v[1 + 3]
+        (SWAPREL, 1, 3, 4, 10),
+        (SWAPREL, 1, 3, 1, 40),
+        // Both name v2: it keeps its value.
+        (SWAPREL, 1, 1 << 16 | 1, 2, 20),
+        // v[5 + 1] = v[1 + 2]
+        (MOVRELSD_2, 5, 1 << 16 | 2, 6, 30),
+        // The same with every ignored M0 bit set.
+        (MOVRELSD_2, 5, 0xFC00_FC00 | 1 << 16 | 2, 6, 30),
+    ];
+    for &(op, vdst, m0, back, want) in cases {
+        let shader = build_valu_cs(&[
+            s_mov_b32(124, 0xFF), // s_mov_b32 m0, literal
+            m0,
+            vop1(op, vdst, vgpr(1)),
+            vop1(0x001, 0, vgpr(back)), // v_mov_b32 v0, v[back]
+        ]);
+        run_cases(&shader, &[[10, 20, 30, 40]], |backend, _, _, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: op {op:#05x} v{vdst}, v1 with M0 {m0:#010x}, v{back} = {got}, want {want}",
+            );
+        });
+    }
 }

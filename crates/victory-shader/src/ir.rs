@@ -1214,12 +1214,19 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
-        new
-    });
+    // One value per register: a swap (v_swap_b32, v_swaprel_b32) names its
+    // registers as both source and destination, and v_swaprel_b32's two
+    // M0-relative ranges overlap up to the program's last VGPR.
+    let once = |regs: &mut Vec<Reg>| {
+        let mut seen = Vec::with_capacity(regs.len());
+        regs.retain(|reg| {
+            let new = !seen.contains(reg);
+            seen.push(*reg);
+            new
+        });
+    };
+    once(&mut r);
+    once(&mut w);
     Ok(Some((r, w)))
 }
 
