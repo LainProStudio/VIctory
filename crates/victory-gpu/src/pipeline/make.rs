@@ -81,6 +81,11 @@ impl Pending {
         let _held = self.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.wait_done.notify_all();
     }
+
+    #[cfg(test)]
+    pub(crate) fn make_now(&self) {
+        self.make();
+    }
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do

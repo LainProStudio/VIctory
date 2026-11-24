@@ -47,6 +47,12 @@ pub(crate) struct Shadow {
     before: Mutex<Option<(usize, Vec<u8>)>>,
 }
 
+#[cfg(feature = "diagnostics")]
+fn log_copyback() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_LOG_COPYBACK").is_some())
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -262,23 +268,37 @@ impl Shadow {
                 let old = &mut before[at - from..at - from + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn, and so does the
-                    // snapshot: to a later range that overlaps this one,
-                    // they are not a shader's write to put back.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                        *o = *t;
+                    // Only write contiguous byte runs the GPU actually modified
+                    // (avoiding a 64 KiB RMW overwrite of concurrent CPU writes
+                    // elsewhere in the same chunk). Sync both `host` and `old` to
+                    // the merged title bytes.
+                    let mut dirty_start: Option<usize> = None;
+                    for i in 0..n {
+                        let h = host[i];
+                        let t = title[i];
+                        let merged = if h != old[i] && t != h {
+                            title[i] = h;
+                            dirty_start.get_or_insert(i);
+                            h
+                        } else {
+                            if let Some(s) = dirty_start.take() {
+                                let dst = start + at + s;
+                                let run_len = i - s;
+                                crate::watch::writing(dst, run_len);
+                                crate::host::write_mapped(dst as *mut u8, title[s..].as_ptr(), run_len);
+                                written += run_len;
+                            }
+                            t
+                        };
+                        host[i] = merged;
+                        old[i] = merged;
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    if let Some(s) = dirty_start {
+                        let dst = start + at + s;
+                        let run_len = n - s;
+                        crate::watch::writing(dst, run_len);
+                        crate::host::write_mapped(dst as *mut u8, title[s..].as_ptr(), run_len);
+                        written += run_len;
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -299,6 +319,16 @@ impl Shadow {
                     copied[page - base] = now;
                 }
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if written > 0 && log_copyback() {
+            tracing::info!(
+                shadow_start = format_args!("{:#x}", self.start),
+                address = format_args!("{address:#x}"),
+                len,
+                written,
+                "shadow copy_back"
+            );
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
@@ -464,9 +494,13 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     );
 }
 
-/// The title released it; lists that still hold its copy keep it alive.
+/// The title released it; any live host copy is retired behind the queue.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if let Some(entry) = buffers().remove(&(start, resource))
+        && let Some(shadow) = entry.shadow
+    {
+        crate::host::retire(shadow);
+    }
 }
 
 /// The innermost entry holding `[address, end)`: the one starting closest
@@ -819,5 +853,38 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         // Too close to the top to round up to a window.
         assert!(loose(u64::MAX - 8, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn copy_back_only_writes_gpu_modified_bytes() {
+        let Some((_memory, base, s)) = title() else {
+            return; // no host GPU here
+        };
+        let copy = |at: usize| s.data as usize + (at - base);
+        for off in 0..PAGE {
+            poke(base + off, 0x11);
+        }
+        s.update(base, PAGE);
+        s.writing(base, PAGE);
+        // Simulate GPU writing only two disjoint 4-byte runs inside the page.
+        for off in 16..20 {
+            poke(copy(base + off), 0xaa);
+        }
+        for off in 1024..1028 {
+            poke(copy(base + off), 0xbb);
+        }
+        // Protect unrelated prefix/middle/suffix bytes outside the GPU runs as
+        // an indirect check via title mutation right before copy_back, and
+        // assert exact byte count returned (`written == 8`).
+        poke(base + 500, 0x77);
+        let written = s.copy_back(base, PAGE);
+        assert_eq!(written, 8);
+        assert_eq!(peek(base + 15), 0x11);
+        assert_eq!(peek(base + 16), 0xaa);
+        assert_eq!(peek(base + 20), 0x11);
+        assert_eq!(peek(base + 500), 0x77);
+        assert_eq!(peek(base + 1023), 0x11);
+        assert_eq!(peek(base + 1024), 0xbb);
+        assert_eq!(peek(base + 1028), 0x11);
     }
 }

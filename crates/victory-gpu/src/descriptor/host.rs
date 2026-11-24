@@ -1151,7 +1151,11 @@ impl HostHeap {
                 self.set_unmapped_null(index, &view);
                 continue;
             }
-            let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view) else {
+            let Some(placed) = placed_texture(&view) else {
+                self.set_unmapped_null(index, &view);
+                continue;
+            };
+            let View::Shader(tex_res, _) = placed.view else {
                 self.set_unmapped_null(index, &view);
                 continue;
             };
@@ -1161,7 +1165,7 @@ impl HostHeap {
                 continue;
             };
             let key = u64::from(generation) << 32 | u64::from(vi);
-            self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
+            self.ensure_placed_slot(index, key, &placed.view, host_tex.as_raw());
             if crate::texture::title_written(host_tex) {
                 crate::texture::upload(list, tex_this, host_tex);
             }
@@ -1454,11 +1458,12 @@ impl HostHeap {
                     self.set_unmapped_null(index, &view);
                     return Some(ResolvedSlot::Null { range });
                 }
-                if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
+                if let Some(placed) = placed_texture(&view)
+                    && let View::Shader(tex_res, _) = placed.view
                     && let Some(host_tex) =
                         crate::resource::host_resource(tex_res as crate::object::This)
                 {
-                    self.ensure_placed_slot(index, slot_key, &shader_view, host_tex.as_raw());
+                    self.ensure_placed_slot(index, slot_key, &placed.view, host_tex.as_raw());
                     Some(ResolvedSlot::PlacedTex {
                         res: host_tex.clone(),
                         address,
@@ -2203,8 +2208,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+            if let Some(placed) = placed_texture(view) {
+                return make(&placed.view, at);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -2230,9 +2235,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// A resolved placed-texture view paired with the [`PlacedTexture`] guard
+/// keeping its backing `Resource` alive until the caller finishes using it.
+pub(crate) struct PlacedView {
+    pub(crate) view: View,
+    _hold: crate::resource::PlacedTexture,
+}
+
+impl std::ops::Deref for PlacedView {
+    type Target = View;
+
+    fn deref(&self) -> &View {
+        &self.view
+    }
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+pub(crate) fn placed_texture(view: &View) -> Option<PlacedView> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
         return None;
@@ -2242,7 +2262,11 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let view = View::Shader(texture.this() as usize, desc[..10].try_into().ok());
+    Some(PlacedView {
+        view,
+        _hold: texture,
+    })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -3550,5 +3574,48 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Clean up `addr_b` too.
         crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr_b, &desc));
+    }
+
+    #[test]
+    fn concurrent_placed_texture_lookup_and_eviction_never_use_after_free() {
+        if host().is_none() {
+            return;
+        }
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let addr = mem.address();
+        let desc: [u32; 14] = [
+            3, // TEXTURE2D
+            0,
+            0,
+            0,
+            16,
+            0,
+            16,
+            0x0001_0001,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            1,
+            0,
+            0x100, // LINEAR
+            0,
+            0,
+        ];
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..500 {
+                        if let Some(tex) = crate::resource::texture_at(addr, &desc) {
+                            assert!(crate::resource::host_resource(tex.this()).is_some());
+                        }
+                    }
+                });
+            }
+            s.spawn(|| {
+                for _ in 0..500 {
+                    crate::watch::title_memory_remapped(addr as usize, 64 << 10);
+                }
+            });
+        });
+        crate::watch::title_memory_remapped(addr as usize, 64 << 10);
+        assert!(!crate::resource::has_placed_texture(addr, &desc));
     }
 }

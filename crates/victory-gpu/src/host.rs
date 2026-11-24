@@ -2528,6 +2528,7 @@ mod title_copies {
     }
 
     fn release(base: *mut u8) {
+        super::forget_unreadable(base as usize, 3 * BLOCK);
         // SAFETY: a reservation of `holed`.
         assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
     }
@@ -3408,6 +3409,7 @@ mod unreadable_pages {
                 && filled(&out, 2, 0)
                 && filled(&out, 3, 4)
         );
+        forget_unreadable(base as usize, 4 * PAGE);
         // SAFETY: the reservation above, no longer used.
         unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }

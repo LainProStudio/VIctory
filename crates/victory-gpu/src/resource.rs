@@ -1701,16 +1701,44 @@ pub(crate) fn placed_epoch() -> u64 {
     PLACED_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Strong reference to a cached placed texture entry so concurrent
+/// [`evict_placed_textures`] calls cannot free the underlying [`Resource`]
+/// while a reader uses it.
+#[cfg(windows)]
+pub(crate) struct PlacedTexture(This);
+
+// SAFETY: `Resource` uses atomic refcounting (`object::add_ref` / `release_boxed`)
+// and thread-safe interior synchronization.
+#[cfg(windows)]
+unsafe impl Send for PlacedTexture {}
+#[cfg(windows)]
+unsafe impl Sync for PlacedTexture {}
+
+#[cfg(windows)]
+impl PlacedTexture {
+    pub(crate) fn this(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PlacedTexture {
+    fn drop(&mut self) {
+        resource_release(self.0);
+    }
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<PlacedTexture> {
     if address == 0 {
         return None;
     }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(r, _)) = map.get(&(address, *desc)) {
-        return Some(r as This);
+        object::add_ref(r as This);
+        return Some(PlacedTexture(r as This));
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
@@ -1738,7 +1766,8 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), (out as usize, end));
-    Some(out)
+    object::add_ref(out);
+    Some(PlacedTexture(out))
 }
 
 /// Releases placed textures whose backing range overlaps `[start, end)`.
