@@ -1683,6 +1683,7 @@ mod tests {
         let c = Container {
             digest: [0; 16],
             version: (1, 0),
+            total_size: 0,
             parts: Vec::new(),
         };
         let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
