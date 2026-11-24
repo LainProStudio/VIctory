@@ -1254,7 +1254,7 @@ mod tests {
         };
         let copy = |at: usize| s.data as usize + (at - base);
         for off in 0..PAGE {
-            poke(base + off, 0x11);
+            poke(base + off, 0x00);
         }
         s.update(base, PAGE);
         s.writing(base, PAGE);
@@ -1265,8 +1265,8 @@ mod tests {
             let gpu_off = k * 8;
             let cpu_off = gpu_off + 4;
             for b in 0..4 {
-                poke(copy(base + gpu_off + b), 0xaa ^ (k as u8));
-                poke(base + cpu_off + b, 0x55 ^ (k as u8));
+                poke(copy(base + gpu_off + b), 0x80 | (((k + b) as u8) & 0x7f));
+                poke(base + cpu_off + b, 0x40 | ((k as u8) & 0x3f));
             }
         }
 
@@ -1276,12 +1276,12 @@ mod tests {
             let gpu_off = k * 8;
             let cpu_off = gpu_off + 4;
             for b in 0..4 {
-                assert_eq!(peek(base + gpu_off + b), 0xaa ^ (k as u8));
-                assert_eq!(peek(base + cpu_off + b), 0x55 ^ (k as u8));
-                assert_eq!(peek(copy(base + cpu_off + b)), 0x55 ^ (k as u8));
+                assert_eq!(peek(base + gpu_off + b), 0x80 | (((k + b) as u8) & 0x7f));
+                assert_eq!(peek(base + cpu_off + b), 0x40 | ((k as u8) & 0x3f));
+                assert_eq!(peek(copy(base + cpu_off + b)), 0x40 | ((k as u8) & 0x3f));
             }
         }
-        assert_eq!(peek(base + 1000 * 8), 0x11);
+        assert_eq!(peek(base + 1000 * 8), 0x00);
         assert!(s.before.lock().unwrap().is_none());
     }
 
