@@ -24,9 +24,10 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
@@ -40,31 +41,39 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint at = id.x * stride;
     uint cost;
     if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        // Draws: vertex or index count, then instances, plus remaining fields.
+        uint count = min(src.Load(at), 1u << 24);
+        uint instances = min(src.Load(at + 4), (1u << 26) / max(count, 1u));
         cost = count * instances;
-        args.Store2(at, uint2(count, instances));
-    } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
+        dst.Store2(at, uint2(count, instances));
+        for (uint o = 8; o < stride; o += 4) {
+            dst.Store(at + o, src.Load(at + o));
         }
-        cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
+        uint3 g;
+        if (kind == 2) {
+            g = min(src.Load3(at), uint3(65535, 65535, 65535));
+            // x * y fits 32 bits; the whole count may not.
+            if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                g = uint3(0, 0, 0);
+            }
+            cost = g.x * g.y * g.z * 64;
+        } else {
+            // Mesh dispatches: the console's are one-dimensional.
+            g = src.Load3(at);
+            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+            cost = g.x * g.y * g.z * 128;
+        }
+        dst.Store3(at, g);
+        for (uint o = 12; o < stride; o += 4) {
+            dst.Store(at + o, src.Load(at + o));
+        }
     }
     uint before;
     budget.InterlockedAdd(0, cost, before);
     if (before >= BUDGET || before + cost > BUDGET) {
         // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+        dst.Store(at, 0);
     }
 }
 "#;
@@ -139,50 +148,54 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
-/// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+/// Records, in `list`, the copy-and-clamp of `records` records of `kind`
+/// (PC argument numbering) `stride` bytes apart from `src_gpu` into a
+/// dedicated scratch UAV buffer, leaving that scratch buffer ready to be
+/// read as indirect arguments (`dst_buf`, `dst_offset`). Replaces the
+/// list's compute root signature and pipeline (callers bind theirs after).
+/// Returns `None` if the clamp or scratch allocation is not available.
 pub(crate) fn bound(
     list: &HostList,
-    buffer: &ID3D12Resource,
-    gpu: u64,
+    src_gpu: u64,
     (kind, stride, records): (u32, u32, u32),
-) -> bool {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return false;
-    };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return false;
+) -> Option<(ID3D12Resource, u64)> {
+    if !src_gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+        return None;
     }
+    let len = u64::from(stride) * u64::from(records.max(1));
+    let (Some(c), Some(budget), Some((dst_buf, dst_offset, dst_gpu))) =
+        (clamp(), list.budget(), list.indirect_scratch(len))
+    else {
+        return None;
+    };
     let l = &list.list;
     let constants = [kind, stride, records, 0];
-    // SAFETY: an open list; our root signature, pipeline and a live buffer
-    // the caller's list holds.
+    // SAFETY: an open list; our root signature, pipeline and live scratch
+    // and source buffers the caller's list holds.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootUnorderedAccessView(1, gpu);
-        l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootUnorderedAccessView(2, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(3, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
-                buffer,
+                &dst_buf,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             ),
         ]);
     }
-    true
+    Some((dst_buf, dst_offset))
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
+/// After the execution: the scratch buffer back to unordered access for
+/// subsequent clamps on the list.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {

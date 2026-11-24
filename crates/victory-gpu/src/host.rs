@@ -317,6 +317,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Default-heap UAV memory for clamped indirect arguments (`indirect`),
+    /// always in `UNORDERED_ACCESS` between calls and reused after a reset.
+    indirect_scratch: Mutex<UavScratch>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -382,6 +385,21 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Default-heap UAV chunks for clamped indirect arguments, always in
+/// `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` between indirect executions and
+/// reused after a reset.
+#[derive(Default)]
+struct UavScratch {
+    chunks: Vec<(ID3D12Resource, u64)>,
+    current: usize,
+    used: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for UavScratch {}
+
+const UAV_SCRATCH_CHUNK: u64 = 1 << 20;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -497,6 +515,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                indirect_scratch: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -905,6 +924,13 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        {
+            let mut scratch = self
+                .indirect_scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (scratch.current, scratch.used) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1144,6 +1170,41 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// `len` bytes of default-heap UAV memory (16-byte aligned) in
+    /// `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` until the list is reset: the
+    /// buffer, its byte offset and its host GPU address.
+    pub(crate) fn indirect_scratch(&self, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        let host = host()?;
+        let len = len.max(16).next_multiple_of(16);
+        if len > UAV_SCRATCH_CHUNK {
+            let buffer = host.uav_buffer(len)?;
+            name(&buffer, || format!("list indirect scratch {len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.keep(&buffer);
+            return Some((buffer, 0, gpu));
+        }
+        let mut s = self
+            .indirect_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if s.used + len > UAV_SCRATCH_CHUNK && s.current < s.chunks.len() {
+            (s.current, s.used) = (s.current + 1, 0);
+        }
+        if s.current == s.chunks.len() {
+            let buffer = host.uav_buffer(UAV_SCRATCH_CHUNK)?;
+            name(&buffer, || "list indirect scratch".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            s.chunks.push((buffer, gpu));
+            s.used = 0;
+        }
+        let (buffer, gpu) = (s.chunks[s.current].0.clone(), s.chunks[s.current].1);
+        let at = s.used;
+        s.used += len;
+        Some((buffer, at, gpu + at))
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -1753,6 +1814,14 @@ pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
 }
 
+/// Whether `texture` was created with `ALLOW_RENDER_TARGET` (some formats
+/// lose it when the host refuses that use).
+pub(crate) fn allows_rtv(texture: &ID3D12Resource) -> bool {
+    // SAFETY: a plain query.
+    (unsafe { texture.GetDesc() }.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        != D3D12_RESOURCE_FLAG_NONE
+}
+
 /// [`legal_state`] for a texture with resource flags `flags`.
 pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
     // (flag, set or clear forbids, state bits): render target, unordered
@@ -1817,6 +1886,48 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer in default GPU memory, created in
+    /// `D3D12_RESOURCE_STATE_UNORDERED_ACCESS` for clamped indirect arguments.
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(16),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a default-heap UAV buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no uav buffer");
                 None
             }
         }
