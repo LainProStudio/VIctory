@@ -1127,22 +1127,48 @@ enum StagingKind {
     Readback,
 }
 
+struct OversizedStaging {
+    res: ID3D12Resource,
+    ptr: usize,
+    cap: u64,
+    in_use: bool,
+    idle_subs: u32,
+}
+
 #[derive(Default)]
 struct StagingArena {
     chunks: Vec<(ID3D12Resource, usize, u64)>,
     current: usize,
     used: u64,
-    transient: Vec<(ID3D12Resource, usize, u64)>,
+    oversized: Vec<OversizedStaging>,
 }
 
 // SAFETY: pointers are persistent mappings of D3D12 upload/readback buffers
 // accessed only while holding the arena's mutex under `Host::submitted`.
 unsafe impl Send for StagingArena {}
 
-const STAGING_CHUNK: u64 = 8 << 20;
-const MAX_POOLED_STAGING_CHUNKS: usize = 16;
+const UPLOAD_STAGING_CHUNK: u64 = 8 << 20;
+const READBACK_STAGING_CHUNK: u64 = 32 << 20;
+const MAX_POOLED_UPLOAD_CHUNKS: usize = 16;
+const MAX_POOLED_READBACK_CHUNKS: usize = 32;
+const MAX_OVERSIZED_IDLE_SUBS: u32 = 180;
+const MAX_POOLED_OVERSIZED: usize = 16;
 
 impl StagingArena {
+    fn chunk_size(kind: StagingKind) -> u64 {
+        match kind {
+            StagingKind::Upload => UPLOAD_STAGING_CHUNK,
+            StagingKind::Readback => READBACK_STAGING_CHUNK,
+        }
+    }
+
+    fn max_pooled_chunks(kind: StagingKind) -> usize {
+        match kind {
+            StagingKind::Upload => MAX_POOLED_UPLOAD_CHUNKS,
+            StagingKind::Readback => MAX_POOLED_READBACK_CHUNKS,
+        }
+    }
+
     fn alloc(
         &mut self,
         host: &Host,
@@ -1150,6 +1176,7 @@ impl StagingArena {
         len: usize,
     ) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let alloc_len = (len as u64).max(1).next_multiple_of(16);
+        let chunk_size = Self::chunk_size(kind);
         let make = |size: u64| match kind {
             StagingKind::Upload => {
                 let (buf, ptr) = host.upload_buffer(size)?;
@@ -1162,17 +1189,39 @@ impl StagingArena {
                 Some((buf, ptr))
             }
         };
-        if alloc_len > STAGING_CHUNK {
+        if alloc_len > chunk_size {
+            if let Some((idx, _)) = self
+                .oversized
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    !e.in_use && e.cap >= alloc_len && e.cap <= alloc_len.saturating_mul(2)
+                })
+                .min_by_key(|(_, e)| e.cap)
+            {
+                let entry = &mut self.oversized[idx];
+                entry.in_use = true;
+                entry.idle_subs = 0;
+                return Some((entry.res.clone(), 0, entry.ptr as *mut u8));
+            }
             let (buf, ptr) = make(alloc_len)?;
-            self.transient.push((buf.clone(), ptr as usize, alloc_len));
+            self.oversized.push(OversizedStaging {
+                res: buf.clone(),
+                ptr: ptr as usize,
+                cap: alloc_len,
+                in_use: true,
+                idle_subs: 0,
+            });
             return Some((buf, 0, ptr));
         }
-        if self.used + alloc_len > STAGING_CHUNK && self.current < self.chunks.len() {
+        if self.current < self.chunks.len()
+            && self.used + alloc_len > self.chunks[self.current].2
+        {
             (self.current, self.used) = (self.current + 1, 0);
         }
         if self.current == self.chunks.len() {
-            let (buf, ptr) = make(STAGING_CHUNK)?;
-            self.chunks.push((buf, ptr as usize, STAGING_CHUNK));
+            let (buf, ptr) = make(chunk_size)?;
+            self.chunks.push((buf, ptr as usize, chunk_size));
             self.used = 0;
         }
         let (buf, data, _) = &self.chunks[self.current];
@@ -1181,11 +1230,24 @@ impl StagingArena {
         Some((buf.clone(), at, (*data + at as usize) as *mut u8))
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, kind: StagingKind) {
         self.current = 0;
         self.used = 0;
-        self.transient.clear();
-        self.chunks.truncate(MAX_POOLED_STAGING_CHUNKS);
+        self.chunks.truncate(Self::max_pooled_chunks(kind));
+        for entry in &mut self.oversized {
+            if entry.in_use {
+                entry.in_use = false;
+                entry.idle_subs = 0;
+            } else {
+                entry.idle_subs = entry.idle_subs.saturating_add(1);
+            }
+        }
+        self.oversized
+            .retain(|entry| entry.idle_subs <= MAX_OVERSIZED_IDLE_SUBS);
+        if self.oversized.len() > MAX_POOLED_OVERSIZED {
+            self.oversized.sort_by_key(|entry| entry.idle_subs);
+            self.oversized.truncate(MAX_POOLED_OVERSIZED);
+        }
     }
 }
 
@@ -1524,6 +1586,8 @@ impl Host {
                 None => grouped.push((shadow, vec![(from, to)])),
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let rb_alloc_started = std::time::Instant::now();
         for (shadow, mut ranges) in grouped {
             crate::shadow::merge_ranges(&mut ranges);
             for (from, to) in ranges {
@@ -1549,6 +1613,8 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let rb_alloc_us = rb_alloc_started.elapsed().as_micros() as u64;
         let upload_list: Option<ID3D12CommandList> =
             if !batch_uploads.is_empty() || !readback_plans.is_empty() {
                 let (alloc, list) = &self.shadow_upload_list;
@@ -1871,8 +1937,8 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         drop(readback_plans);
         drop(batch_uploads);
-        upload_arena.reset();
-        readback_arena.reset();
+        upload_arena.reset(StagingKind::Upload);
+        readback_arena.reset(StagingKind::Readback);
         #[cfg(feature = "diagnostics")]
         {
             let prep_ms = (prepared - started).as_millis() as u64;
@@ -1898,6 +1964,7 @@ impl Host {
                     bindless_uploads = bindless_timings.uploads,
                     gpu_ms,
                     copyback_ms,
+                    rb_alloc_ms = rb_alloc_us / 1000,
                     cb_mb = total_cb_bytes / (1 << 20),
                     cb_written_kb = total_cb_written / 1024,
                     tex_uploads,
@@ -3552,6 +3619,129 @@ fn update_with_prefetched(
 /// destination (`title_dst`) that is not all mapped takes nothing from its
 /// first unmapped page on.
 ///
+mod fast_copy {
+    pub(super) fn can_fast_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let d = dst as usize;
+        let s = src as usize;
+        d.saturating_add(len) <= s || s.saturating_add(len) <= d
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    mod imp {
+        use std::sync::Once;
+
+        use windows_sys::Win32::Foundation::{
+            EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, STATUS_GUARD_PAGE_VIOLATION,
+        };
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+            EXCEPTION_POINTERS,
+        };
+
+        core::arch::global_asm!(
+            ".text",
+            ".globl victory_try_copy",
+            ".globl victory_try_copy_start",
+            ".globl victory_try_copy_end",
+            ".globl victory_try_copy_fault",
+            "victory_try_copy:",
+            "    push rdi",
+            "    push rsi",
+            "    mov rdi, rcx",
+            "    mov rsi, rdx",
+            "    mov rcx, r8",
+            "    cld",
+            "victory_try_copy_start:",
+            "    rep movsb",
+            "victory_try_copy_end:",
+            "    mov eax, 1",
+            "    pop rsi",
+            "    pop rdi",
+            "    ret",
+            "victory_try_copy_fault:",
+            "    xor eax, eax",
+            "    pop rsi",
+            "    pop rdi",
+            "    ret",
+        );
+
+        // SAFETY: Symbols defined in `global_asm!` above using the Win64 ABI.
+        unsafe extern "C" {
+            fn victory_try_copy(dst: *mut u8, src: *const u8, len: usize) -> u8;
+            static victory_try_copy_start: u8;
+            static victory_try_copy_end: u8;
+            static victory_try_copy_fault: u8;
+        }
+
+        static INSTALL_VEH: Once = Once::new();
+
+        /// Vectored exception handler installed first (`first = 1`) so faults inside
+        /// `victory_try_copy_start..victory_try_copy_end` bounce to `victory_try_copy_fault`
+        /// before reaching title or crash-reporting handlers.
+        // SAFETY: Invoked by Windows exception dispatch with valid pointers when non-null.
+        unsafe extern "system" fn on_copy_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+            if info.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            // SAFETY: Non-null `EXCEPTION_POINTERS` passed by the OS dispatcher.
+            let (record, context) = unsafe { ((*info).ExceptionRecord, (*info).ContextRecord) };
+            if record.is_null() || context.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            // SAFETY: Non-null `EXCEPTION_RECORD` passed by the OS dispatcher.
+            let code = unsafe { (*record).ExceptionCode };
+            if code != EXCEPTION_ACCESS_VIOLATION
+                && code != EXCEPTION_IN_PAGE_ERROR
+                && code != STATUS_GUARD_PAGE_VIOLATION
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            // SAFETY: Non-null `CONTEXT` passed by the OS dispatcher.
+            let rip = unsafe { (*context).Rip as usize };
+            let start = &raw const victory_try_copy_start as usize;
+            let end = &raw const victory_try_copy_end as usize;
+            if rip >= start && rip < end {
+                let fault = &raw const victory_try_copy_fault as u64;
+                // SAFETY: Redirecting `Rip` to `victory_try_copy_fault` keeps the saved `rdi`/`rsi`
+                // stack frame intact and returns `0` cleanly.
+                unsafe { (*context).Rip = fault };
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            EXCEPTION_CONTINUE_SEARCH
+        }
+
+        pub fn try_fast_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+            if len == 0 {
+                return true;
+            }
+            if !super::can_fast_copy(dst, src, len) {
+                return false;
+            }
+            INSTALL_VEH.call_once(|| {
+                // SAFETY: Registers a first-chance handler that only intercepts faults inside `victory_try_copy`.
+                unsafe {
+                    AddVectoredExceptionHandler(1, Some(on_copy_fault));
+                }
+            });
+            // SAFETY: Faults on unmapped/guarded pages inside `[victory_try_copy_start..end)`
+            // are redirected to `victory_try_copy_fault` and return `0`.
+            unsafe { victory_try_copy(dst, src, len) != 0 }
+        }
+    }
+
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    mod imp {
+        pub fn try_fast_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+            super::super::read(src, dst, len)
+        }
+    }
+
+    pub(super) use imp::try_fast_copy;
+}
+
 /// The copy runs in the kernel (`ReadProcessMemory`), which reports an
 /// unmapped page of the source, or of the destination it writes, instead of
 /// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
@@ -3579,7 +3769,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = if fast_copy::can_fast_copy(dst, src, len) {
+        fast_copy::try_fast_copy(dst, src, len)
+    } else {
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -3625,9 +3819,13 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
-            // A mapping may change between query and read.
-            read_pieces(at, to, n);
+        } else if info.Protect & windows_sys::Win32::System::Memory::PAGE_GUARD != 0
+            || !fast_copy::try_fast_copy(to, at, n)
+        {
+            // A mapping may change between query and read, or the range may be guarded.
+            if !read(at, to, n) {
+                read_pieces(at, to, n);
+            }
         }
         offset += n;
     }
@@ -3699,7 +3897,14 @@ pub(crate) fn forget_unreadable(at: usize, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    if dst.is_empty() {
+        return true;
+    }
+    if fast_copy::can_fast_copy(dst.as_mut_ptr(), src, dst.len()) {
+        fast_copy::try_fast_copy(dst.as_mut_ptr(), src, dst.len())
+    } else {
+        read(src, dst.as_mut_ptr(), dst.len())
+    }
 }
 
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
@@ -4707,6 +4912,90 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         crate::shadow::unregister(0x7001_0002, (base + p) as u64);
         // SAFETY: freeing our own allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn fast_copy_copies_mapped_memory_and_recovers_on_unmapped_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let p = crate::watch::PAGE;
+        // SAFETY: Reserves a fresh 2-page region freed at the end of the test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * p, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: Commits only the first page inside the reserved 2-page region.
+        let page0 = unsafe { VirtualAlloc(base, p, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(page0, base);
+        // SAFETY: Page 0 is committed read-write for `p` bytes.
+        unsafe {
+            let src = base.cast::<u8>();
+            src.write_bytes(0x5A, p);
+            *src = 0x12;
+            *src.add(p - 1) = 0x9E;
+        }
+
+        let mut dst = vec![0u8; p];
+        assert!(super::fast_copy::try_fast_copy(
+            dst.as_mut_ptr(),
+            base.cast::<u8>().cast_const(),
+            p,
+        ));
+        assert_eq!(dst[0], 0x12);
+        assert!(dst[1..p - 1].iter().all(|&b| b == 0x5A));
+        assert_eq!(dst[p - 1], 0x9E);
+
+        let mut two_pages = vec![0xFFu8; 2 * p];
+        assert!(!super::fast_copy::try_fast_copy(
+            two_pages.as_mut_ptr(),
+            base.cast::<u8>().cast_const(),
+            2 * p,
+        ));
+        super::copy_mapped(two_pages.as_mut_ptr(), base.cast::<u8>().cast_const(), 2 * p, false);
+        assert_eq!(two_pages[0], 0x12);
+        assert!(two_pages[1..p - 1].iter().all(|&b| b == 0x5A));
+        assert_eq!(two_pages[p - 1], 0x9E);
+        assert!(two_pages[p..2 * p].iter().all(|&b| b == 0));
+
+        let mut overlap: Vec<u8> = (0u8..64).collect();
+        // SAFETY: Both pointers stay well inside `overlap`'s 64-byte allocation.
+        let overlap_dst = unsafe { overlap.as_mut_ptr().add(8) };
+        let overlap_src = overlap.as_ptr();
+        assert!(!super::fast_copy::can_fast_copy(overlap_dst, overlap_src, 32));
+        super::copy_mapped(overlap_dst, overlap_src, 32, false);
+        let expected: Vec<u8> = (0u8..32).collect();
+        assert_eq!(&overlap[8..40], expected.as_slice());
+
+        // SAFETY: Frees the 2-page reserved region allocated above.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn staging_arena_reuses_oversized_readback_buffers_and_evicts_after_idle() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut arena = super::StagingArena::default();
+        let (res1, off1, ptr1) = arena
+            .alloc(host, super::StagingKind::Readback, 36 << 20)
+            .expect("36 MiB oversized readback allocation should succeed");
+        assert_eq!(off1, 0);
+        let ptr1_addr = ptr1 as usize;
+        drop(res1);
+
+        arena.reset(super::StagingKind::Readback);
+        let (res2, off2, ptr2) = arena
+            .alloc(host, super::StagingKind::Readback, 34 << 20)
+            .expect("34 MiB oversized readback allocation should reuse pooled 36 MiB buffer");
+        assert_eq!(off2, 0);
+        assert_eq!(ptr2 as usize, ptr1_addr);
+        assert_eq!(arena.oversized.len(), 1);
+        drop(res2);
+
+        for _ in 0..(super::MAX_OVERSIZED_IDLE_SUBS + 2) {
+            arena.reset(super::StagingKind::Readback);
+        }
+        assert!(arena.oversized.is_empty());
     }
 
     /// The hashing a submission does for textures in physical-page memory,
