@@ -94,10 +94,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } != 0;
     let guarded = if failed {
         count = 0;
-        if !guarded {
-            return None;
+        match by_allocation(first * PAGE, last * PAGE, &mut j.found) {
+            Some(pages) => pages,
+            None if !guarded => return None,
+            None => guard(first * PAGE, last * PAGE)?,
         }
-        guard(first * PAGE, last * PAGE)?
     } else {
         Vec::new()
     };
@@ -120,6 +121,66 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// The pages of `[start, end)` written, asked allocation by allocation:
+/// the kernel refuses a range over several (a title buffer spans as many
+/// allocations as the runtime made for it). Parts never committed cannot
+/// have been written, so a range none of which is committed (a reserved
+/// allocation the title has not committed yet) has no writes. `None` if a
+/// committed part is not write-watched (or the range is one committed
+/// allocation, already refused).
+fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let query = |at: usize| {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query about an address; nothing is dereferenced.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        (n != 0).then_some(info)
+    };
+    let (mut pages, mut at, mut allocations, mut any) = (Vec::new(), start, 0, false);
+    while at < end {
+        let info = query(at)?;
+        let base = info.AllocationBase as usize;
+        let mut committed = info.State == MEM_COMMIT;
+        let mut to = (info.BaseAddress as usize + info.RegionSize).min(end);
+        // The rest of the allocation's regions in the range.
+        while info.State != MEM_FREE && to < end {
+            let next = query(to)?;
+            if next.State == MEM_FREE || next.AllocationBase as usize != base {
+                break;
+            }
+            committed |= next.State == MEM_COMMIT;
+            to = (next.BaseAddress as usize + next.RegionSize).min(end);
+        }
+        allocations += 1;
+        any |= committed;
+        if committed {
+            let mut count = (to - at) / KERNEL_PAGE;
+            found.resize(count.max(found.len()), 0);
+            let mut granularity = 0;
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    at as *const _,
+                    to - at,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            if failed {
+                return None;
+            }
+            pages.extend(found[..count].iter().map(|&a| a / PAGE));
+        }
+        at = to;
+    }
+    (allocations > 1 || !any).then_some(pages)
 }
 
 /// Guarded blocks of view memory.
@@ -172,8 +233,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
+    let mut uncommitted_until = first;
     for block in first..=last {
-        let open = block < last && !g.clean.contains(&block) && !g.absent.contains(&block);
+        let mut open = block < last && !g.clean.contains(&block);
+        if open && g.absent.contains(&block) {
+            // Ordinary commits need no runtime mapping notification. Reuse
+            // this asking's query for the following blocks in the same region.
+            if block >= uncommitted_until {
+                uncommitted_until = uncommitted_end(block);
+            }
+            open = block >= uncommitted_until;
+            if open {
+                g.absent.remove(&block);
+            }
+        }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -219,9 +292,25 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
-        } else if unmapped(block * BLOCK) {
+        } else if block < uncommitted_end(block) {
             g.absent.insert(block);
         }
+    }
+}
+
+/// The end (exclusive) of the whole uncommitted blocks starting at `block`.
+fn uncommitted_end(block: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
+        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+    } else {
+        block
     }
 }
 
@@ -235,16 +324,6 @@ fn view(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.Type == MEM_MAPPED
-}
-
-/// Whether nothing is committed at `at` (a placeholder between views).
-fn unmapped(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State != MEM_COMMIT
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
@@ -305,7 +384,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         open(&mut g, at, end);
     }
     crate::resource::evict_placed_textures(at as u64, end as u64);
-    crate::descriptor::host::bindless_memory_remapped();
+    crate::descriptor::host::bindless_memory_remapped(at as u64, end as u64);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -406,16 +485,20 @@ mod tests {
         view
     }
 
-    /// Unmaps a view from [`view`], first forgetting its pages' journal
-    /// entries: the next allocation there is not written.
-    fn unmap(view: usize, blocks: usize) {
-        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
-        let pages = view / PAGE..(view + blocks * BLOCK) / PAGE;
+    fn forget_journal(start: usize, len: usize) {
+        let pages = start / PAGE..(start + len).div_ceil(PAGE);
         JOURNAL
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .written
             .retain(|p, _| !pages.contains(p));
+    }
+
+    /// Unmaps a view from [`view`], first forgetting its pages' journal
+    /// entries: the next allocation there is not written.
+    fn unmap(view: usize, blocks: usize) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        forget_journal(view, blocks * BLOCK);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, blocks * BLOCK);
@@ -549,6 +632,64 @@ mod tests {
     }
 
     #[test]
+    fn writes_in_partly_committed_view_blocks_are_reported() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            SEC_RESERVE, UnmapViewOfFile,
+        };
+
+        const SIZE: usize = 3 * BLOCK;
+        struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+        impl Drop for View {
+            fn drop(&mut self) {
+                title_memory_remapped(self.0.Value as usize, SIZE);
+                // SAFETY: our view is still mapped.
+                unsafe { UnmapViewOfFile(self.0) };
+            }
+        }
+        // SAFETY: a new reserved pagefile section. The view holds its own
+        // reference after we close the handle, including on assertion failure.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            View(view)
+        };
+        let start = view.0.Value as usize;
+        let commit = |at: usize, len| {
+            // SAFETY: these pages belong to our reserved view.
+            let committed = unsafe { VirtualAlloc(at as _, len, MEM_COMMIT, PAGE_READWRITE) };
+            assert_eq!(committed as usize, at);
+        };
+        let early = start + BLOCK + 3 * KERNEL_PAGE;
+        let late = start + 2 * BLOCK + 3 * KERNEL_PAGE;
+        commit(start, BLOCK);
+        commit(early, KERNEL_PAGE);
+        let refresh = || guard(start, start + SIZE).unwrap();
+        assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE]);
+        // The last block is still entirely reserved.
+        assert!(!refresh().contains(&(late / PAGE)));
+
+        commit(late, KERNEL_PAGE); // Ordinary commit, without a runtime mapping notification.
+        for at in [early, late] {
+            assert!(writable(at));
+            // SAFETY: each address is inside its committed read-write page.
+            unsafe { (at as *mut u8).write_volatile(1) };
+        }
+        assert_eq!(refresh(), [early / PAGE, late / PAGE]);
+    }
+
+    #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -582,6 +723,89 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Two write-watched allocations side by side (the runtime reserves
+    /// title memory allocation by allocation), asked about as one range, as
+    /// a buffer spanning them is: the pages written in each are reported.
+    #[test]
+    fn a_range_over_several_watched_allocations_is_watched() {
+        let (a, b) = loop {
+            // SAFETY: a probe reservation, released at once to find room for two.
+            let span =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+            assert!(!span.is_null());
+            // SAFETY: the probe above.
+            unsafe { VirtualFree(span, 0, MEM_RELEASE) };
+            let at = |p: usize| {
+                // SAFETY: a fixed address in the room just released.
+                let got = unsafe {
+                    VirtualAlloc(
+                        p as *const _,
+                        2 * PAGE,
+                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    )
+                };
+                got as usize
+            };
+            let a = at(span as usize);
+            let b = at(span as usize + 2 * PAGE);
+            if a != 0 && b != 0 {
+                break (a, b);
+            }
+            for p in [a, b].into_iter().filter(|&p| p != 0) {
+                // SAFETY: ours.
+                unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            }
+        };
+        forget_journal(a, 2 * PAGE);
+        forget_journal(b, 2 * PAGE);
+        let _ = writes(a, b + 2 * PAGE, false);
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((a + 8) as *mut u8).write(1);
+            ((b + PAGE + 8) as *mut u8).write(1);
+        }
+        let (now, found) = writes(a, b + 2 * PAGE, false).expect("watched");
+        assert_eq!(found, [(a / PAGE, now), (b / PAGE + 1, now)]);
+        // SAFETY: ours.
+        unsafe {
+            VirtualFree(a as *mut _, 0, MEM_RELEASE);
+            VirtualFree(b as *mut _, 0, MEM_RELEASE);
+        }
+        forget_journal(a, 2 * PAGE);
+        forget_journal(b, 2 * PAGE);
+    }
+
+    /// A range in an allocation reserved but not committed yet (as the
+    /// title's are before it uses them) has no writes, and is asked again
+    /// once committed.
+    #[test]
+    fn a_range_never_committed_has_no_writes() {
+        // SAFETY: a fresh write-watched reservation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        forget_journal(p, 2 * PAGE);
+        let (_, none) = writes(p, p + 2 * PAGE, false).expect("nothing can be written there");
+        assert!(none.is_empty());
+        // SAFETY: committing and writing a page of our reservation.
+        unsafe {
+            assert!(!VirtualAlloc(p as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            ((p + 8) as *mut u8).write(1);
+        }
+        let (now, found) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert_eq!(found, [(p / PAGE, now)]);
+        // SAFETY: ours.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        forget_journal(p, 2 * PAGE);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

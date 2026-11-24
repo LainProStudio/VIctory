@@ -7,7 +7,7 @@
 //! `ResourceDescriptorHeap[]` draw or dispatch materializes and refreshes
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -80,13 +80,44 @@ enum ResolvedSlot {
     },
     PlacedTex {
         res: ID3D12Resource,
+        address: u64,
     },
     Buffer {
+        address: u64,
+        len: u64,
         read: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
         write: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
         res: Option<ID3D12Resource>,
     },
-    Null,
+    Null {
+        range: Option<(u64, u64)>,
+    },
+}
+
+impl ResolvedSlot {
+    fn range(&self) -> Option<(u64, u64)> {
+        match *self {
+            Self::CbvDirect { address, len, .. } => {
+                let start = address as u64;
+                Some((start, start.saturating_add((len as u64).max(1))))
+            }
+            Self::CbvBounce { address, len, .. } => {
+                Some((address, address.saturating_add(u64::from(len).max(1))))
+            }
+            Self::PlacedTex { address, .. } => Some((address, address.saturating_add(1))),
+            Self::Buffer { address, len, .. } => Some((address, address.saturating_add(len.max(1)))),
+            Self::Null { range } => range,
+        }
+    }
+
+    fn overlaps(&self, remaps: &[(u64, u64)]) -> bool {
+        let Some((start, end)) = self.range() else {
+            return false;
+        };
+        remaps
+            .iter()
+            .any(|&(r_start, r_end)| start < r_end && r_start < end)
+    }
 }
 
 #[derive(Default)]
@@ -110,17 +141,44 @@ struct Bindless {
 /// Bindless slots viewing placed textures: slot, view index and generation.
 type PlacedSlots = Arc<Vec<(u32, (u32, u32))>>;
 
-/// Bumped when title memory is mapped or unmapped (`title_memory_remapped`):
-/// requires re-validating every bindless slot's backing memory.
+const REMAP_LOG_CAP: usize = 512;
+
+/// Bounded history of recent `(epoch, at, end)` remaps so `bindless_plan`
+/// can invalidate only cached slots whose title range overlaps.
+static REMAP_LOG: Mutex<VecDeque<(u64, u64, u64)>> = Mutex::new(VecDeque::new());
+
+/// Bumped when title memory is mapped or unmapped (`title_memory_remapped`).
 static VIEWED_REMAP: AtomicU64 = AtomicU64::new(0);
 
 /// Bumped when individual title resources are released (`descriptor::forget`):
 /// only slots whose view generation went stale need pruning.
 static VIEWED_FORGET: AtomicU64 = AtomicU64::new(0);
 
-/// Title memory was mapped or unmapped: every bindless slot must recheck its backing memory.
-pub(crate) fn bindless_memory_remapped() {
-    VIEWED_REMAP.fetch_add(1, Ordering::Release);
+/// Title memory `[at, end)` was mapped or unmapped: record its range and bump
+/// the remap epoch under `REMAP_LOG` so log epochs remain contiguous.
+pub(crate) fn bindless_memory_remapped(at: u64, end: u64) {
+    let mut log = REMAP_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let epoch = VIEWED_REMAP.fetch_add(1, Ordering::AcqRel) + 1;
+    if log.len() == REMAP_LOG_CAP {
+        log.pop_front();
+    }
+    log.push_back((epoch, at, end));
+}
+
+/// Returns remapped `(at, end)` ranges since `prev` up to `current`, or
+/// `None` if the bounded remap log overflowed past `prev`.
+fn remaps_since(prev: u64, current: u64) -> Option<Vec<(u64, u64)>> {
+    let log = REMAP_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let first = log.front()?.0;
+    if prev + 1 < first {
+        return None;
+    }
+    Some(
+        log.iter()
+            .filter(|&&(epoch, _, _)| epoch > prev && epoch <= current)
+            .map(|&(_, at, end)| (at, end))
+            .collect(),
+    )
 }
 
 /// A viewed resource was released: bindless slots must prune stale views.
@@ -1129,13 +1187,18 @@ impl HostHeap {
                 }
                 let prev = b.resolved_global;
                 if prev.1 != global.1 {
-                    b.resolved.clear();
-                } else if prev.0 != global.0 {
+                    if let Some(remaps) = remaps_since(prev.1, global.1) {
+                        b.resolved.retain(|_, v| !v.overlaps(&remaps));
+                    } else {
+                        b.resolved.clear();
+                    }
+                }
+                if prev.0 != global.0 {
                     b.resolved.retain(|_, v| {
-                        !matches!(v, ResolvedSlot::PlacedTex { .. } | ResolvedSlot::Null)
+                        !matches!(v, ResolvedSlot::PlacedTex { .. } | ResolvedSlot::Null { .. })
                     });
                 }
-                let need_forget = prev.1 == global.1 && prev.2 != global.2;
+                let need_forget = prev.2 != global.2;
                 b.resolved_global = global;
                 let list = if need_forget {
                     b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
@@ -1203,11 +1266,16 @@ impl HostHeap {
             );
             if b.resolved_global != current_global {
                 if b.resolved_global.1 != current_global.1 {
-                    b.resolved.clear();
-                    b.resolved_global = current_global;
-                } else if b.resolved_global.0 != current_global.0 {
+                    if let Some(remaps) = remaps_since(b.resolved_global.1, current_global.1) {
+                        b.resolved.retain(|_, v| !v.overlaps(&remaps));
+                    } else {
+                        b.resolved.clear();
+                    }
+                    b.resolved_global.1 = current_global.1;
+                }
+                if b.resolved_global.0 != current_global.0 {
                     b.resolved.retain(|_, v| {
-                        !matches!(v, ResolvedSlot::PlacedTex { .. } | ResolvedSlot::Null)
+                        !matches!(v, ResolvedSlot::PlacedTex { .. } | ResolvedSlot::Null { .. })
                     });
                     b.resolved_global.0 = current_global.0;
                 }
@@ -1258,10 +1326,10 @@ impl HostHeap {
                         bounces.push((*cpu, *address, *len));
                         retained.push(res.clone());
                     }
-                    ResolvedSlot::PlacedTex { res } => {
+                    ResolvedSlot::PlacedTex { res, .. } => {
                         retained.push(res.clone());
                     }
-                    ResolvedSlot::Buffer { read, write, res } => {
+                    ResolvedSlot::Buffer { read, write, res, .. } => {
                         if let Some((shadow, addr, len)) = read {
                             reads.push((shadow.clone(), *addr, *len));
                         }
@@ -1272,7 +1340,7 @@ impl HostHeap {
                             retained.push(res.clone());
                         }
                     }
-                    ResolvedSlot::Null => {}
+                    ResolvedSlot::Null { .. } => {}
                 }
             }
             let plan_key = (
@@ -1314,23 +1382,26 @@ impl HostHeap {
         match &view {
             &View::Constant(address, size) => {
                 let capped = size.min(65_536);
+                let range = (address >= 0x10000 && capped > 0)
+                    .then(|| (address, address.saturating_add(u64::from(capped))));
                 if !valid_title_address_cached(committed, address, u64::from(capped)) {
                     self.set_unmapped_null(index, &view);
-                    return Some(ResolvedSlot::Null);
+                    return Some(ResolvedSlot::Null { range });
                 }
                 match self.materialize_bindless_cbv(index, slot_key, address, capped) {
                     Some(resolved) => Some(resolved),
                     None => {
                         self.set_unmapped_null(index, &view);
-                        Some(ResolvedSlot::Null)
+                        Some(ResolvedSlot::Null { range })
                     }
                 }
             }
             View::Placed(false, resource, desc) if resource[0] != 1 => {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let range = (address >= 0x10000).then(|| (address, address.saturating_add(1)));
                 if !valid_title_address_cached(committed, address, 1) {
                     self.set_unmapped_null(index, &view);
-                    return Some(ResolvedSlot::Null);
+                    return Some(ResolvedSlot::Null { range });
                 }
                 if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
                     && let Some(host_tex) =
@@ -1339,20 +1410,23 @@ impl HostHeap {
                     self.ensure_placed_slot(index, slot_key, &shader_view, host_tex.as_raw());
                     Some(ResolvedSlot::PlacedTex {
                         res: host_tex.clone(),
+                        address,
                     })
                 } else {
                     self.set_unmapped_null(index, &view);
-                    Some(ResolvedSlot::Null)
+                    Some(ResolvedSlot::Null { range })
                 }
             }
             _ => {
                 let Some((address, len)) = buffer_range(&view) else {
                     self.set_unmapped_null(index, &view);
-                    return Some(ResolvedSlot::Null);
+                    return Some(ResolvedSlot::Null { range: None });
                 };
+                let range = (address >= 0x10000 && len > 0)
+                    .then(|| (address, address.saturating_add(len)));
                 if !valid_title_address_cached(committed, address, len) {
                     self.set_unmapped_null(index, &view);
-                    return Some(ResolvedSlot::Null);
+                    return Some(ResolvedSlot::Null { range });
                 }
                 let res = self.ensure_buffer_slot(index, slot_key, &view);
                 let mut read = None;
@@ -1376,7 +1450,13 @@ impl HostHeap {
                         }
                     }
                 }
-                Some(ResolvedSlot::Buffer { read, write, res })
+                Some(ResolvedSlot::Buffer {
+                    address,
+                    len,
+                    read,
+                    write,
+                    res,
+                })
             }
         }
     }
@@ -3259,6 +3339,92 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(b);
 
         assert_eq!(release(r_keep), 0);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    #[test]
+    fn remap_only_invalidates_overlapping_bindless_slots() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(4);
+        let mem_a = crate::resource::Memory::zeroed(128 << 10, 64 << 10).unwrap();
+        let mem_b = crate::resource::Memory::zeroed(128 << 10, 64 << 10).unwrap();
+        crate::shadow::register(0x10_0001, mem_a.address(), 128 << 10);
+        crate::shadow::register(0x10_0002, mem_b.address(), 128 << 10);
+
+        // Reserve 64 KiB, keep it uncommitted initially so slot 2 resolves to `ResolvedSlot::Null`.
+        // SAFETY: fresh 64 KiB reservation released below.
+        let unmapped = unsafe {
+            VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE, PAGE_NOACCESS) as u64
+        };
+        assert_ne!(unmapped, 0);
+
+        let cbv = |at: u64, slot_idx: u64| {
+            create_cbv(
+                std::ptr::null(),
+                &[at as u32, (at >> 32) as u32, 256, 0],
+                base + slot_idx * 32,
+            );
+        };
+        cbv(mem_a.address(), 0);
+        cbv(mem_b.address(), 1);
+        cbv(unmapped, 2);
+
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let plan1 = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan1.reads.len(), 2);
+
+        // Remap covering only `mem_a` and NOT `mem_b` or `unmapped`.
+        bindless_memory_remapped(mem_a.address(), mem_a.address() + 4096);
+        {
+            let prev = host_heap.bindless.lock().unwrap().resolved_global;
+            let current = (prev.0, VIEWED_REMAP.load(Ordering::Acquire), prev.2);
+            let remaps = remaps_since(prev.1, current.1).expect("remap fits in bounded log");
+            assert_eq!(remaps.len(), 1);
+        }
+        // Build plan2 and check that before/after `resolved` evicted slot 0 (overlapping `mem_a`)
+        // while keeping slot 1 (`mem_b`) and slot 2 (`unmapped`) cached cleanly; wait —
+        // let's directly verify partial invalidation before `bindless_plan` re-resolves slot 0!
+        {
+            let mut b = host_heap.bindless.lock().unwrap();
+            let prev = b.resolved_global;
+            let cur = VIEWED_REMAP.load(Ordering::Acquire);
+            let remaps = remaps_since(prev.1, cur).unwrap();
+            b.resolved.retain(|_, v| !v.overlaps(&remaps));
+            assert!(!b.resolved.contains_key(&0), "overlapping slot 0 evicted");
+            assert!(b.resolved.contains_key(&1), "disjoint slot 1 stays cached");
+            assert!(b.resolved.contains_key(&2), "disjoint null slot 2 stays cached");
+        }
+
+        // Now commit `unmapped` and register a shadow, then remap `[unmapped, unmapped+4096)`:
+        // Wait — also `title_memory_remapped` evicts `Null` slots in `[unmapped, unmapped + 4096)`.
+        // SAFETY: commits the reservation we hold, then freed cleanly below.
+        unsafe {
+            assert!(!VirtualAlloc(unmapped as *mut _, 64 << 10, MEM_COMMIT, PAGE_READWRITE).is_null());
+        }
+        crate::shadow::register(unmapped as usize, unmapped, 64 << 10);
+        let plan2 = host_heap.bindless_plan().unwrap();
+        // Before remap notification, slot 2 was cached as Null (so only 2 reads).
+        assert_eq!(plan2.reads.len(), 2);
+
+        crate::watch::title_memory_remapped(unmapped as usize, 4096);
+        let plan3 = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan3.reads.len(), 3, "newly mapped Null slot invalidated & resolved");
+
+        crate::shadow::unregister(0x10_0001, mem_a.address());
+        crate::shadow::unregister(0x10_0002, mem_b.address());
+        crate::shadow::unregister(unmapped as usize, unmapped);
+        // SAFETY: free our temporary reservation.
+        unsafe {
+            VirtualFree(unmapped as *mut _, 64 << 10, MEM_DECOMMIT);
+            VirtualFree(unmapped as *mut _, 0, MEM_RELEASE);
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
     }
 
