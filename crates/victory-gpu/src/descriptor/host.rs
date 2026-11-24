@@ -431,39 +431,55 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends with its guard slot after `dynamic` (see [`HostHeap::guard_slot`]).
         let guard = u32::from(!sampler);
-        let (heap, count, extra) = match make(count + extra + guard) {
-            Ok(heap) => (heap, count, extra),
-            Err(e) if sampler && count > PORTABLE_SAMPLERS => {
-                // A sampler heap over the portable limit may be refused
-                // (D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE is 2,048 on
-                // every tier). Keep the first slots rather than losing the
-                // heap: that would also shift the bound heap indices.
-                tracing::warn!(
-                    error = %e,
-                    wanted = count,
-                    made = PORTABLE_SAMPLERS,
-                    lost = count - PORTABLE_SAMPLERS,
-                    "host sampler heap capped at {PORTABLE_SAMPLERS}"
-                );
-                (make(PORTABLE_SAMPLERS).ok()?, PORTABLE_SAMPLERS, 0)
+        let (heap, count, extra) = if sampler {
+            match make(count) {
+                Ok(heap) => (heap, count, 0),
+                Err(e) if count > PORTABLE_SAMPLERS => {
+                    // A sampler heap over the portable limit may be refused
+                    // (D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE is 2,048 on
+                    // every tier). Keep the first slots rather than losing the
+                    // heap: that would also shift the bound heap indices.
+                    tracing::warn!(
+                        error = %e,
+                        wanted = count,
+                        made = PORTABLE_SAMPLERS,
+                        lost = count - PORTABLE_SAMPLERS,
+                        "host sampler heap capped at {PORTABLE_SAMPLERS}"
+                    );
+                    (make(PORTABLE_SAMPLERS).ok()?, PORTABLE_SAMPLERS, 0)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
-            Err(e) if !sampler && count + extra + guard > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (
-                    make(PORTABLE_VIEWS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - 1,
-                    DYNAMIC_CAPPED,
-                )
+        } else if count.saturating_add(DYNAMIC).saturating_add(guard) <= PORTABLE_VIEWS {
+            match make(count + DYNAMIC + guard) {
+                Ok(heap) => (heap, count, DYNAMIC),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        } else if count.saturating_add(DYNAMIC_CAPPED).saturating_add(guard) <= PORTABLE_VIEWS {
+            match make(count + DYNAMIC_CAPPED + guard) {
+                Ok(heap) => (heap, count, DYNAMIC_CAPPED),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
+        } else {
+            // shortcut: descriptors past the host's limit are left out;
+            // a title that reaches them needs remapping.
+            tracing::warn!(count, "host view heap capped at {PORTABLE_VIEWS}");
+            (
+                make(PORTABLE_VIEWS).ok()?,
+                PORTABLE_VIEWS - DYNAMIC_CAPPED - guard,
+                DYNAMIC_CAPPED,
+            )
         };
         let total = count + extra + guard;
         // SAFETY: a live heap.
@@ -2434,13 +2450,26 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     )
                 };
                 Some(Some(texture.clone()))
+            } else if let (Some((data, len)), Some(desc)) =
+                (crate::resource::buffer_bytes(resource), desc)
+            {
+                buffer_srv(data as u64, len, srv_desc(desc), at)
+            } else if resource.is_null()
+                && let Some(words) = desc
+                && words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+            {
+                let mut host_desc = srv_desc(words);
+                // SAFETY: union member selected by `RAYTRACING_ACCELERATION_STRUCTURE`.
+                let title_va = unsafe { host_desc.Anonymous.RaytracingAccelerationStructure.Location };
+                let (as_res, host_va) = crate::raytracing::lookup_as(title_va)?;
+                host_desc.Anonymous.RaytracingAccelerationStructure.Location = host_va;
+                // SAFETY: null resource is required for TLAS SRVs; `at` is our heap slot.
+                unsafe {
+                    device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&host_desc), at)
+                };
+                Some(Some(as_res))
             } else {
-                match (crate::resource::buffer_bytes(resource), desc) {
-                    (Some((data, len)), Some(desc)) => {
-                        buffer_srv(data as u64, len, srv_desc(desc), at)
-                    }
-                    _ => None,
-                }
+                None
             }
         }
         View::Unordered(resource, _counter, desc) => {
@@ -4358,5 +4387,17 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
+    }
+
+    /// A large requested descriptor count is capped at PORTABLE_VIEWS
+    /// rather than creating a heap that violates D3D12 limits (#735).
+    #[test]
+    fn large_view_heap_is_capped_at_portable_limit() {
+        if host().is_none() {
+            return;
+        }
+        if let Some(heap) = HostHeap::new(false, 1_048_576) {
+            assert!(heap.count + heap.dynamic <= PORTABLE_VIEWS);
+        }
     }
 }
