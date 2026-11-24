@@ -381,8 +381,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[57] = object::ignore as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = object::ignore as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -430,6 +432,10 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+        let s1c8 = slot::<extern "system" fn() -> HRESULT>(device, 0x1c8);
+        assert_eq!(s1c8(), S_OK);
+        let s218 = slot::<extern "system" fn() -> HRESULT>(device, 0x218);
+        assert_eq!(s218(), S_OK);
     }
 
     #[test]
