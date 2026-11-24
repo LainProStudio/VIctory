@@ -80,6 +80,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod image_tests;
+#[cfg(test)]
+mod memory_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
