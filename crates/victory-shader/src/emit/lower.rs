@@ -9976,14 +9976,38 @@ impl<'a> Lower<'a> {
                 let bounds = self.buffer_bounds(h, index, off, stride, width / 8);
                 let active = self.buffer_store_guard(bounds, guard);
                 let at = self.begin_guarded(Some(active));
-                self.write_subword(off, width, x, |l, byte, mask, bits| {
-                    let [a, b] = coords(byte);
-                    let zero = l.s.m.i32(0);
-                    l.atomic_update(zero, |l, old| {
-                        let x = l.atomic_new_value(AtomicUpdate::MaskOr, old, mask, bits);
-                        l.buffer_compare_exchange(h, [a, b, iu], old, x, false)
+                if width == 16 {
+                    // GFX10 buffer_store_short writes one native 16-bit value. DXIL
+                    // RawBufferStore.i16 preserves the write width; widening it to an
+                    // i32 store would overwrite the adjacent halfword.
+                    let i16 = self.s.m.int(16);
+                    let value = self.s.m.cast(self.cur, Cast::Trunc, x, i16);
+                    let undef = self.s.m.undef(i16);
+                    let [coord0, coord1] = coords(off);
+                    let args = [
+                        h,
+                        coord0,
+                        coord1,
+                        value,
+                        undef,
+                        undef,
+                        undef,
+                        self.s.m.i8(1),
+                        self.s.m.i32(2),
+                    ];
+                    let void = self.s.t.void;
+                    self.s
+                        .op(self.cur, "rawBufferStore.i16", Attr::NoUnwind, void, 140, &args);
+                } else {
+                    self.write_subword(off, width, x, |l, byte, mask, bits| {
+                        let [a, b] = coords(byte);
+                        let zero = l.s.m.i32(0);
+                        l.atomic_update(zero, |l, old| {
+                            let x = l.atomic_new_value(AtomicUpdate::MaskOr, old, mask, bits);
+                            l.buffer_compare_exchange(h, [a, b, iu], old, x, false)
+                        });
                     });
-                });
+                }
                 self.end_guarded(at, &[]);
             }
             return Ok(());
