@@ -535,6 +535,9 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Reverse index from `Arc::as_ptr(&section) as usize` to mapped
+    /// `(view_base, start_page_index, page_count)` tuples.
+    section_views: HashMap<usize, Vec<(usize, usize, usize)>>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -674,6 +677,132 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// A contiguous range of pages in one `Section` together with the exact byte
+/// span `[within, within + len)` written inside it.
+struct SectionWrite {
+    section: Arc<Section>,
+    start_page: usize,
+    within: usize,
+    len: usize,
+}
+
+fn collect_section_write_ranges(
+    physical: &Physical,
+    section: &Arc<Section>,
+    start_page: usize,
+    within: usize,
+    len: usize,
+    out: &mut Vec<(usize, usize)>,
+) {
+    if len == 0 {
+        return;
+    }
+    let key = Arc::as_ptr(section) as usize;
+    let Some(views) = physical.section_views.get(&key) else {
+        return;
+    };
+    let write_start = start_page * PAGE + within;
+    let write_end = write_start + len;
+    for &(view_base, v_start, v_count) in views {
+        let view_start = v_start * PAGE;
+        let view_end = (v_start + v_count) * PAGE;
+        let overlap_start = write_start.max(view_start);
+        let overlap_end = write_end.min(view_end);
+        if overlap_start < overlap_end {
+            out.push((
+                view_base + (overlap_start - view_start),
+                overlap_end - overlap_start,
+            ));
+        }
+    }
+}
+
+fn coalesce_ranges(ranges: &mut Vec<(usize, usize)>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_unstable_by_key(|&(start, len)| (start, len));
+    let mut write = 0;
+    for i in 1..ranges.len() {
+        let (cur_start, cur_len) = ranges[write];
+        let cur_end = cur_start.saturating_add(cur_len);
+        let (next_start, next_len) = ranges[i];
+        let next_end = next_start.saturating_add(next_len);
+        if next_start <= cur_end {
+            ranges[write].1 = cur_end.max(next_end) - cur_start;
+        } else {
+            write += 1;
+            ranges[write] = (next_start, next_len);
+        }
+    }
+    ranges.truncate(write + 1);
+}
+
+/// Collects mapped virtual `(va_start, len)` ranges across `runs` for the exact
+/// byte span `[within, within + total_len)` under `PHYSICAL`, releasing the
+/// lock before returning.
+fn mapped_ranges_for(
+    runs: &[(Slice, usize)],
+    mut within: usize,
+    total_len: usize,
+) -> Vec<(usize, usize)> {
+    if total_len == 0 {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    {
+        let physical = physical();
+        let mut done = 0;
+        for (slice, n) in runs {
+            let k = (n * PAGE - within).min(total_len - done);
+            collect_section_write_ranges(
+                &physical,
+                &slice.section,
+                slice.index,
+                within,
+                k,
+                &mut ranges,
+            );
+            within = 0;
+            done += k;
+        }
+    }
+    coalesce_ranges(&mut ranges);
+    ranges
+}
+
+fn mapped_ranges_for_write(write: &SectionWrite) -> Vec<(usize, usize)> {
+    if write.len == 0 {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    {
+        let physical = physical();
+        collect_section_write_ranges(
+            &physical,
+            &write.section,
+            write.start_page,
+            write.within,
+            write.len,
+            &mut ranges,
+        );
+    }
+    coalesce_ranges(&mut ranges);
+    ranges
+}
+
+fn notify_mapped_writes(runs: &[(Slice, usize)], within: usize, total_len: usize) {
+    for (va, len) in mapped_ranges_for(runs, within, total_len) {
+        victory_gpu::kernel_will_write(va, len);
+    }
+}
+
+fn notify_mapped_page_window(write: &SectionWrite) {
+    for (va, len) in mapped_ranges_for_write(write) {
+        victory_gpu::kernel_will_write(va, len);
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// Writes directly through each section's persistent view (committing each
@@ -700,6 +829,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         }
         (within, done) = (0, done + k);
     }
+    notify_mapped_writes(&runs, offset % PAGE, data.len());
     true
 }
 
@@ -707,20 +837,25 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// through the section's persistent view: DirectStorage decodes directly
 /// into it without transient views or extra copies.
 pub(crate) struct PageWindow {
-    _section: Arc<Section>,
+    write: SectionWrite,
     ptr: *mut u8,
-    len: usize,
 }
 
-// SAFETY: `ptr` points into `_section`'s persistent read-write view; each
+// SAFETY: `ptr` points into `write.section`'s persistent read-write view; each
 // caller writes only its own request's byte range.
 unsafe impl Send for PageWindow {}
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
-        // SAFETY: `_section` keeps the persistent view mapped and `ensure_committed`
-        // committed all backing pages before constructing `PageWindow`.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        // SAFETY: `write.section` keeps the persistent view mapped and
+        // `ensure_committed` committed all backing pages before constructing `PageWindow`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.write.len) }
+    }
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        notify_mapped_page_window(&self.write);
     }
 }
 
@@ -740,11 +875,14 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let within = offset % PAGE;
     // SAFETY: `slice.index + *n <= slice.section.pages` and `within + len <= *n * PAGE`.
     let ptr = unsafe { slice.section.page_ptr(slice.index).add(within) };
-    Some(PageWindow {
-        _section: slice.section.clone(),
-        ptr,
+    let write = SectionWrite {
+        section: slice.section.clone(),
+        start_page: slice.index,
+        within,
         len,
-    })
+    };
+    notify_mapped_page_window(&write);
+    Some(PageWindow { write, ptr })
 }
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
@@ -1000,6 +1138,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, warn_on_f
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    let section_key = Arc::as_ptr(&slice.section) as usize;
+    physical
+        .section_views
+        .entry(section_key)
+        .or_default()
+        .push((base, slice.index, len / PAGE));
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1188,6 +1332,17 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        let section_key = Arc::as_ptr(&slice.section) as usize;
+        if let Some(entries) = physical.section_views.get_mut(&section_key) {
+            if let Some(pos) = entries.iter().position(|&(v_base, v_start, v_count)| {
+                v_base == at && v_start == slice.index && v_count == size / PAGE
+            }) {
+                entries.swap_remove(pos);
+            }
+            if entries.is_empty() {
+                physical.section_views.remove(&section_key);
+            }
+        }
         victory_gpu::title_memory_remapped(at, size);
         let splitting = at < base || at + size > end;
         if splitting {
@@ -1928,5 +2083,154 @@ mod tests {
         );
         assert!(section.ensure_committed(0, pages));
         assert!(section.all_committed(0, pages));
+    }
+
+    #[test]
+    fn section_views_tracks_maps_aliases_splits_and_frees() {
+        let pages = allocate(4);
+        let section_key = Arc::as_ptr(&physical().pages[&pages[0]].section) as usize;
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                4 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE) as usize;
+
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        {
+            let phys = physical();
+            assert_eq!(
+                phys.section_views.get(&section_key).map(Vec::as_slice),
+                Some([(a as usize, 0, 4)].as_slice())
+            );
+        }
+
+        // Alias pages 1..3 at `b`.
+        assert!(map_alias(b as u64, at(a, 1) as u64, (2 * PAGE) as u64));
+        {
+            let phys = physical();
+            let mut entries = phys.section_views[&section_key].clone();
+            entries.sort_unstable();
+            assert_eq!(entries, vec![(a as usize, 0, 4), (b as usize, 1, 2)]);
+        }
+
+        // Partial unmap of page 1 at `a` splits `[a, a+4P)` into `[a, 0, 1)` and `[a+2P, 2, 2)`.
+        assert_eq!(
+            XMemMapPhysicalPages(at(a, 1) as *mut c_void, 1, std::ptr::null()),
+            at(a, 1) as *mut c_void
+        );
+        {
+            let phys = physical();
+            let mut entries = phys.section_views[&section_key].clone();
+            entries.sort_unstable();
+            assert_eq!(
+                entries,
+                vec![(a as usize, 0, 1), (at(a, 2), 2, 2), (b as usize, 1, 2)]
+            );
+        }
+
+        // Freeing the physical page numbers leaves mapped views alive until unmapped.
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+        assert!(physical().section_views.contains_key(&section_key));
+
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert!(map_alias(b as u64, 0, (2 * PAGE) as u64));
+        assert!(!physical().section_views.contains_key(&section_key));
+
+        // SAFETY: our own reservations.
+        unsafe {
+            assert_ne!(VirtualFree(a, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(b, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn mapped_write_ranges_match_exact_overlapping_bytes() {
+        let (a_pages, b_pages) = (allocate(4), allocate(2));
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                4 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE) as usize;
+
+        // Map only `a_pages[1]` at `a + PAGE` and `b_pages[0]` at `a + 2*PAGE`,
+        // leaving `a_pages[0]` and `a_pages[2]` unmapped in `a`.
+        assert_eq!(
+            XMemMapPhysicalPages(at(a, 1) as *mut c_void, 1, a_pages[1..2].as_ptr()),
+            at(a, 1) as *mut c_void
+        );
+        assert_eq!(
+            XMemMapPhysicalPages(at(a, 2) as *mut c_void, 1, b_pages[0..1].as_ptr()),
+            at(a, 2) as *mut c_void
+        );
+        // Also alias `a_pages[1]` at `b`.
+        assert!(map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
+
+        // Write across `[a_pages[0], a_pages[1], b_pages[0]]` starting 100 bytes
+        // into `a_pages[0]` for `2 * PAGE + 25` bytes:
+        // - `a_pages[0]` is unmapped -> none
+        // - `a_pages[1]` is wholly written -> `[at(a, 1), PAGE)` and `[b, PAGE)`
+        // - `b_pages[0]` has `[0, 125)` written -> `[at(a, 2), 125)`
+        // Notice `at(a, 1)..at(a, 1)+PAGE` and `at(a, 2)..at(a, 2)+125` are contiguous and coalesce!
+        let write_pages = [a_pages[0], a_pages[1], b_pages[0]];
+        let total = 2 * PAGE + 25;
+        let run_list = runs(&write_pages, 100, total).unwrap();
+        let ranges = mapped_ranges_for(&run_list, 100, total);
+        assert_eq!(ranges, vec![(at(a, 1), PAGE + 125), (b as usize, PAGE)]);
+
+        // `page_window` on `a_pages[1..3]` with offset 200, len 500 only covers `a_pages[1]`.
+        let mut window = page_window(&a_pages[1..3], 200, 500).expect("one run");
+        assert_eq!(
+            mapped_ranges_for_write(&window.write),
+            vec![(at(a, 1) + 200, 500), (b as usize + 200, 500)]
+        );
+        // Map `a_pages[2]` while `window` is alive; re-querying (as `Drop` does) sees it too
+        // if the window extends into page 2.
+        let mut spanning = page_window(&a_pages[1..3], PAGE - 50, 200).expect("one run");
+        assert_eq!(
+            mapped_ranges_for_write(&spanning.write),
+            vec![(at(a, 1) + PAGE - 50, 50), (b as usize + PAGE - 50, 50)]
+        );
+        assert_eq!(
+            XMemMapPhysicalPages(at(a, 3) as *mut c_void, 1, a_pages[2..3].as_ptr()),
+            at(a, 3) as *mut c_void
+        );
+        assert_eq!(
+            mapped_ranges_for_write(&spanning.write),
+            vec![
+                (at(a, 1) + PAGE - 50, 50),
+                (at(a, 3), 150),
+                (b as usize + PAGE - 50, 50),
+            ]
+        );
+        spanning.bytes().fill(0x42);
+        drop(spanning);
+        window.bytes().fill(0x24);
+        drop(window);
+        let payload = vec![0x55; total];
+        assert!(write_physical(&write_pages, 100, &payload));
+
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 4, std::ptr::null()), b);
+        // SAFETY: our own reservations.
+        unsafe {
+            assert_ne!(VirtualFree(a, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(b, 0, MEM_RELEASE), 0);
+        }
+        assert_eq!(XMemFreePhysicalPages(a_pages.len(), a_pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(b_pages.len(), b_pages.as_ptr()), 1);
     }
 }
