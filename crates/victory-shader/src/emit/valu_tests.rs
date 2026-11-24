@@ -2222,7 +2222,7 @@ fn buffer_store_short_d16_hi_writes_the_high_halfword() {
 /// `op_sel_hi` pick each source's half for the low and high lanes of the
 /// operation (bit k for source k), `neg_lo`/`neg_hi` negate them.
 #[allow(clippy::too_many_arguments)]
-const fn vop3p(
+const fn vop3p_mods(
     op: u8,
     vdst: u8,
     [src0, src1, src2]: [u16; 3],
@@ -2266,7 +2266,7 @@ const DOT2_F32_F16_CASES: &[([u32; 4], u32)] = &[
 #[test]
 fn v_dot2_f32_f16_sums_f16_products_in_f32() {
     // v0 = v_dot2_f32_f16 v1, v2, v3 (no modifiers: op_sel_hi = 0b111)
-    let body = vop3p(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, false);
+    let body = vop3p_mods(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, false);
     let shader = build_valu_cs(&body);
     let inputs: Vec<[u32; 4]> = DOT2_F32_F16_CASES.iter().map(|c| c.0).collect();
     run_cases(&shader, &inputs, |backend, i, inp, got| {
@@ -2284,7 +2284,7 @@ fn v_dot2_f32_f16_applies_op_sel_and_negation_per_half() {
     // src0's halves swapped (op_sel bit 0 set, op_sel_hi bit 0 clear), src1's
     // low half negated (neg_lo bit 1), src0's high-lane half negated (neg_hi
     // bit 0): (1, 2) . (3, 4) + 0.5 becomes 2 * -3 + -1 * 4 + 0.5 = -9.5.
-    let body = vop3p(
+    let body = vop3p_mods(
         0x13,
         0,
         [vgpr(1), vgpr(2), vgpr(3)],
@@ -2314,7 +2314,7 @@ fn v_dot2_f32_f16_applies_op_sel_and_negation_per_half() {
 
 #[test]
 fn v_dot2_f32_f16_clamps_to_zero_one() {
-    let body = vop3p(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, true);
+    let body = vop3p_mods(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, true);
     let shader = build_valu_cs(&body);
     let cases: &[([u32; 4], u32)] = &[
         // 11.5 clamps to 1.0, -6 to 0.0
