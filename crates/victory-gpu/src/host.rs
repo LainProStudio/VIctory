@@ -1984,9 +1984,10 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .map_or(history.len(), |b| (done + b).max(done + 1));
     let mut text = format!(", commands {from}..{to} between its barriers:");
     let mut shown = 0;
-    for i in from..to {
+    let start = if done > from + 16 { done - 16 } else { from };
+    for i in start..to {
         let op = history[i];
-        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
+        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 16 {
             continue;
         }
         shown += 1;
