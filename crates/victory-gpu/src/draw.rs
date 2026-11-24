@@ -916,10 +916,19 @@ impl State {
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
                 let v = self.user_dword(compute, u);
-                let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
-                if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
-                    let _ = write!(text, " [heap {index}: {slot}]");
+                let table = u.root == RootType::Table;
+                let guard = matches!(u.root, RootType::ResourceHeap | RootType::SamplerHeap);
+                let (kind, index) = if table {
+                    ("table", v / 32)
+                } else if guard {
+                    ("guard", v)
+                } else {
+                    ("const", v)
+                };
+                let _ = write!(text, " u{}={v:#x} {kind}", u.index);
+                if !guard && let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
+                    let at = if table { "heap" } else { "as heap index" };
+                    let _ = write!(text, " [{at} {index}: {slot}]");
                 }
             }
             for &(slot, _) in stage
@@ -989,6 +998,8 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             self.depth_sampled |= readable(list, u, &view, self.read_only_depth(compute));
+        } else if index < host.count() {
+            host.make_null_kind(index, u.kind, u.dwords);
         }
     }
 
@@ -2052,6 +2063,151 @@ mod tests {
         };
         let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
         (shader, used)
+    }
+
+    #[test]
+    fn table_entry_unbound_slots_install_typed_null_views_without_faulting() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let s_mov_b32 = |dst: u8, src: u8| -> u32 {
+            0xBE80_0000 | (dst as u32) << 16 | 0x03 << 8 | src as u32
+        };
+        let s_load_dwordx4 = |dst: u8, base: u8, byte_off: u32| -> [u32; 2] {
+            [
+                0x3D << 26 | 2 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+                125 << 25 | (byte_off & 0x1F_FFFF),
+            ]
+        };
+        let v_mov_b32 = |vdst: u8, src0: u16| -> u32 {
+            0x7E00_0000 | (vdst as u32) << 17 | (1 << 9) | (src0 as u32 & 0x1FF)
+        };
+        let buffer_load_dword_offen = |vdst: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x0C << 18 | (1 << 12),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8 | vaddr as u32,
+            ]
+        };
+        let buffer_store_dword_offen = |vdata: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x1C << 18 | (1 << 12),
+                0x80 << 24
+                    | ((srsrc as u32 >> 2) & 0x1F) << 16
+                    | (vdata as u32) << 8
+                    | vaddr as u32,
+            ]
+        };
+
+        // Table at s[0:1]: entry +0 (dwords 0..4, offset 0) is SRV t0,
+        // entry +1 (dwords 8..12, offset 32 bytes) is UAV u0.
+        let mut words = Vec::new();
+        words.push(s_mov_b32(1, 0x80)); // high word = 0 -> s[0:1] is descriptor table
+        words.extend_from_slice(&s_load_dwordx4(4, 0, 0));
+        words.extend_from_slice(&s_load_dwordx4(8, 0, 32));
+        words.push(v_mov_b32(0, 0x80)); // offset = 0
+        words.extend_from_slice(&buffer_load_dword_offen(1, 0, 4));
+        words.extend_from_slice(&buffer_store_dword_offen(1, 0, 8));
+        words.push(0xBF81_0000); // s_endpgm
+
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = victory_shader::ir::build(&native.code, false, 4).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            total_size: 0,
+            parts: Vec::new(),
+        };
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+        #[repr(C)]
+        struct ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC,
+            placement: [u64; 2],
+        }
+        let heap_desc = ViewHeap {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 8,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            placement: [0; 2],
+        };
+        let heap_iid = ID3D12DescriptorHeap::IID;
+        let mut views = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const heap_desc).cast(),
+                (&raw const heap_iid).cast(),
+                &mut views,
+            ),
+            crate::object::S_OK
+        );
+        let heap_start =
+            crate::object::slot::<extern "system" fn(This) -> u64>(views, 0x48)(views);
+
+        // Both table entries (slot 0 SRV at heap_start+0 and slot 1 UAV at heap_start+32)
+        // are deliberately left uninitialized (`None` / null) -> `table_entry` must write
+        // typed null buffer SRV / raw null buffer UAV and execute with 0 debug-layer errors.
+        let list = host.new_list().expect("new_list");
+        let mut state = State::default();
+        state.set_heaps(&[views]);
+        state.set_pipeline(pso);
+        state.set_table(true, 0, heap_start);
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None, "no D3D12 debug errors expected");
+
+        let release =
+            |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(views), 0);
+        assert_eq!(release(pso), 0);
     }
 
     #[test]

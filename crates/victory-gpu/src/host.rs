@@ -1245,14 +1245,37 @@ impl Host {
                     return text;
                 }
             };
+            let com_identity = |obj: &ID3D12GraphicsCommandList| -> Option<*mut std::ffi::c_void> {
+                obj.cast::<windows::core::IUnknown>().ok().map(|u| u.as_raw())
+            };
+            let list_index = |l: Option<&ID3D12GraphicsCommandList>| -> Option<usize> {
+                let target = com_identity(l?)?;
+                runs.iter().position(|r| com_identity(&r.list) == Some(target))
+            };
+            let list_label = |l: Option<&ID3D12GraphicsCommandList>| -> String {
+                let Some(target) = l.and_then(com_identity) else {
+                    return "None".into();
+                };
+                runs.iter()
+                    .enumerate()
+                    .find_map(|(i, r)| {
+                        if com_identity(&r.list) == Some(target) {
+                            Some(format!("Some({i})"))
+                        } else if com_identity(&r.prelude.1) == Some(target) {
+                            Some(format!("prelude {i}"))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "None".into())
+            };
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                let label = list_label(p.pCommandList.as_ref());
+                progress.push(format!("{done}/{} {label}", p.BreadcrumbCount));
                 node = p.pNext;
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
@@ -1266,8 +1289,9 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = list_index(p.pCommandList.as_ref())
+                        .map(|i| runs[i])
+                        .or_else(|| (runs.len() == 1 && p.BreadcrumbCount > 2).then_some(runs[0]));
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {

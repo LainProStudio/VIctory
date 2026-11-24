@@ -603,14 +603,14 @@ impl HostHeap {
             victory_shader::ResourceType::Srv if dwords == 4 => null_buffer_view(at),
             victory_shader::ResourceType::Uav => {
                 if let Some(host) = host() {
-                    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                        Format: DXGI_FORMAT_R32_UINT,
-                        ViewDimension: if dwords == 4 {
-                            D3D12_UAV_DIMENSION_BUFFER
-                        } else {
-                            D3D12_UAV_DIMENSION_TEXTURE2D
-                        },
-                        ..Default::default()
+                    let desc = if dwords == 4 {
+                        null_buffer_uav_desc()
+                    } else {
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_UINT,
+                            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                            ..Default::default()
+                        }
                     };
                     // SAFETY: a slot of our heap; null resource makes a null UAV.
                     unsafe {
@@ -626,6 +626,7 @@ impl HostHeap {
             _ => null_view(at),
         }
         self.keep(index, None);
+        self.set_stride(index, 0);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's). A
@@ -2148,11 +2149,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         _ => return null_view(at),
     };
     let desc = if buffer {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
-        }
+        null_buffer_uav_desc()
     } else {
         null_uav_desc(dimension)
     };
@@ -2165,6 +2162,23 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+}
+
+/// A raw buffer UAV description that drops writes and reads zeros cleanly.
+fn null_buffer_uav_desc() -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                FirstElement: 0,
+                NumElements: 1,
+                StructureByteStride: 0,
+                CounterOffsetInBytes: 0,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+            },
+        },
+    }
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
