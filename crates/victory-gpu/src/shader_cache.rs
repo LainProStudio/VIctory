@@ -118,7 +118,7 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// Deterministic translator + cache-format fingerprint: hashes
 /// `victory-shader`'s compile-time source digest, the encoding schema version,
-/// and the active loop limit.
+/// and the active loop and spin-wait limits.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -129,17 +129,30 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        build_fingerprint(victory_shader::SOURCE_HASH, CACHE_SCHEMA_VERSION, limit)
+        let spin = victory_shader::emit::spin_limit();
+        if spin != victory_shader::emit::DEFAULT_SPIN_LIMIT {
+            tracing::warn!(
+                spin,
+                "VICTORY_SHADER_SPIN_LIMIT: spin-wait loops stop at this count"
+            );
+        }
+        build_fingerprint(victory_shader::SOURCE_HASH, CACHE_SCHEMA_VERSION, limit, spin)
     })
 }
 
-fn build_fingerprint(source_hash: &str, schema_version: u32, loop_limit: u32) -> [u8; 32] {
+fn build_fingerprint(
+    source_hash: &str,
+    schema_version: u32,
+    loop_limit: u32,
+    spin_limit: u32,
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(MAGIC);
     h.update(&schema_version.to_le_bytes());
     h.update(source_hash.as_bytes());
     h.update(&[0]);
     h.update(&loop_limit.to_le_bytes());
+    h.update(&spin_limit.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
@@ -480,16 +493,27 @@ mod tests {
 
     #[test]
     fn build_fingerprint_is_deterministic_and_sensitive() {
-        let base = build_fingerprint(victory_shader::SOURCE_HASH, CACHE_SCHEMA_VERSION, 1 << 20);
+        let spin = victory_shader::emit::DEFAULT_SPIN_LIMIT;
+        let base = build_fingerprint(
+            victory_shader::SOURCE_HASH,
+            CACHE_SCHEMA_VERSION,
+            1 << 20,
+            spin,
+        );
         assert_eq!(
             base,
-            build_fingerprint(victory_shader::SOURCE_HASH, CACHE_SCHEMA_VERSION, 1 << 20),
+            build_fingerprint(
+                victory_shader::SOURCE_HASH,
+                CACHE_SCHEMA_VERSION,
+                1 << 20,
+                spin,
+            ),
             "same inputs produce identical key"
         );
         assert_eq!(victory_shader::SOURCE_HASH.len(), 64, "BLAKE3 hex digest");
         assert_ne!(
             base,
-            build_fingerprint("different-source-hash", CACHE_SCHEMA_VERSION, 1 << 20),
+            build_fingerprint("different-source-hash", CACHE_SCHEMA_VERSION, 1 << 20, spin),
             "source hash changes invalidate key"
         );
         assert_ne!(
@@ -497,14 +521,25 @@ mod tests {
             build_fingerprint(
                 victory_shader::SOURCE_HASH,
                 CACHE_SCHEMA_VERSION + 1,
-                1 << 20
+                1 << 20,
+                spin,
             ),
             "schema version bump invalidates key"
         );
         assert_ne!(
             base,
-            build_fingerprint(victory_shader::SOURCE_HASH, CACHE_SCHEMA_VERSION, 1024),
+            build_fingerprint(victory_shader::SOURCE_HASH, CACHE_SCHEMA_VERSION, 1024, spin),
             "loop limit override invalidates key"
+        );
+        assert_ne!(
+            base,
+            build_fingerprint(
+                victory_shader::SOURCE_HASH,
+                CACHE_SCHEMA_VERSION,
+                1 << 20,
+                spin + 1,
+            ),
+            "spin limit override invalidates key"
         );
     }
 
