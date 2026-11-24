@@ -486,6 +486,20 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    #[cfg(test)]
+    pub fn fptoi_casts_guarded(&self) -> (usize, bool) {
+        let mut count = 0;
+        let mut guarded = true;
+        for inst in &self.insts {
+            if let Op::Cast(Cast::FpToUi | Cast::FpToSi, src) = inst.op {
+                count += 1;
+                guarded &=
+                    matches!(src, V::Inst(i) if matches!(self.insts[i as usize].op, Op::Select(..)));
+            }
+        }
+        (count, guarded)
+    }
+
     /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads

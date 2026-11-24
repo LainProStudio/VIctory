@@ -43,6 +43,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Total `FpToUi`/`FpToSi` casts emitted and whether each reads from a `select` guard.
+    #[cfg(test)]
+    pub fptoi_casts: (usize, bool),
 }
 
 pub(crate) struct Parts<'a> {
@@ -902,6 +905,8 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        #[cfg(test)]
+        let fptoi_casts = self.s.m.fptoi_casts_guarded();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -910,6 +915,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            fptoi_casts,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4005,7 +4012,8 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
-                let mut a = f(self, 0)?;
+                let x = f(self, 0)?;
+                let mut a = x;
                 if name == "v_cvt_rpi_i32_f32" {
                     let h = self.s.m.f32(0.5f32.to_bits());
                     a = self.s.m.bin(c, Bin::Add, a, h);
@@ -4013,14 +4021,51 @@ impl<'a> Lower<'a> {
                 if name != "v_cvt_i32_f32" && name != "v_cvt_u32_f32" {
                     a = self.unary(27, a);
                 }
-                // D3D's conversions saturate and give 0 for NaN, as the
-                // hardware does (checked on the RX 6700 XT and WARP).
-                let op = if name == "v_cvt_u32_f32" {
-                    Cast::FpToUi
+                // Guard the float before Cast::FpToUi / Cast::FpToSi so out-of-range,
+                // Inf, and NaN inputs never enter DXIL fptoui/fptosi as poison/UB,
+                // then select RDNA2 ISA saturation / NaN results.
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let zero_f = self.s.m.f32(0.0f32.to_bits());
+                let a_bits = self.as_int(a);
+                let r = if name == "v_cvt_u32_f32" {
+                    let (inf, limit, max, zero) = (
+                        k(self, 0x7F80_0000),
+                        k(self, 0x4F80_0000),
+                        k(self, u32::MAX),
+                        k(self, 0),
+                    );
+                    let in_range = self.s.m.cmp(c, pred::IULT, a_bits, limit);
+                    let safe = self.s.m.select(c, in_range, a, zero_f);
+                    let r = self.s.m.cast(c, Cast::FpToUi, safe, self.s.t.i32);
+                    let neg_or_nan = self.s.m.cmp(c, pred::IUGT, a_bits, inf);
+                    let sat = self.s.m.select(c, neg_or_nan, zero, max);
+                    self.s.m.select(c, in_range, r, sat)
                 } else {
-                    Cast::FpToSi
+                    let (abs, inf, zero) = (k(self, 0x7FFF_FFFF), k(self, 0x7F80_0000), k(self, 0));
+                    let (limit, max, min) = (
+                        k(self, 0x4F00_0000),
+                        k(self, 0x7FFF_FFFF),
+                        k(self, 0x8000_0000),
+                    );
+                    let mag = self.s.m.bin(c, Bin::And, a_bits, abs);
+                    let in_range = self.s.m.cmp(c, pred::IULT, mag, limit);
+                    let safe = self.s.m.select(c, in_range, a, zero_f);
+                    let r = self.s.m.cast(c, Cast::FpToSi, safe, self.s.t.i32);
+                    let neg = self.s.m.cmp(c, pred::SLT, a_bits, zero);
+                    let sat = self.s.m.select(c, neg, min, max);
+                    let r = self.s.m.select(c, in_range, r, sat);
+                    let x_bits = self.as_int(x);
+                    let x_mag = self.s.m.bin(c, Bin::And, x_bits, abs);
+                    let nan = self.s.m.cmp(c, pred::IUGT, x_mag, inf);
+                    if name == "v_cvt_i32_f32" {
+                        self.s.m.select(c, nan, zero, r)
+                    } else {
+                        // flr/rpi saturate a NaN by its sign.
+                        let x_neg = self.s.m.cmp(c, pred::SLT, x_bits, zero);
+                        let sat_nan = self.s.m.select(c, x_neg, min, max);
+                        self.s.m.select(c, nan, sat_nan, r)
+                    }
                 };
-                let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
@@ -7417,5 +7462,75 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn float_to_int_conversions_guard_poison_and_validate() {
+        // Load x from UAV[0], run v_rcp_iflag_f32 + v_mul_legacy_f32 + v_fma_f32,
+        // and convert via v_cvt_{u32,i32,flr_i32,rpi_i32}_f32.
+        let vop1 = |vdst: u32, op: u32, src0: u32| (0x3F << 25) | (vdst << 17) | (op << 9) | src0;
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0100,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE030_1000,
+            0x8001_0100,          // buffer_load_dword v1, v0, s[4:7], 0 offen
+            0xBF8C_3F70,          // s_waitcnt vmcnt(0)
+            vop1(2, 0x2B, 0x101), // v_rcp_iflag_f32 v2, v1
+            0x0804_0280 | 0x0400, // v_mul_legacy_f32 v2, v0, v2
+            0xD513_0002,
+            0x0402_0501 | (0x102 << 18), // v_fma_f32 v2, v1, v2, v2
+            vop1(3, 0x07, 0x102),        // v_cvt_u32_f32 v3, v2
+            vop1(4, 0x08, 0x102),        // v_cvt_i32_f32 v4, v2
+            vop1(5, 0x0D, 0x102),        // v_cvt_flr_i32_f32 v5, v2
+            vop1(6, 0x0C, 0x102),        // v_cvt_rpi_i32_f32 v6, v2
+            0xE07C_1000,
+            0x8001_0300, // buffer_store_dwordx4 v[3:6], v0, s[4:7], 0 offen
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&words, layout.clone(), used.clone()).unwrap();
+        assert_eq!(l.fptoi_casts, (4, true));
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let dxbc = crate::dxbc::build(&[]);
+        let c = crate::Container::parse(&dxbc).unwrap();
+        let out = super::super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert!(!out.dxil.is_empty());
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 }
