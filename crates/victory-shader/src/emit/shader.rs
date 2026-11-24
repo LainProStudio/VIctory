@@ -25,6 +25,7 @@ pub(crate) mod flags {
     pub const UAVS_64: u64 = 1 << 15;
     pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_INT64_GROUP_SHARED: u64 = 1 << 28;
@@ -729,6 +730,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= flags::FEATURE_RESOURCE_HEAP;
