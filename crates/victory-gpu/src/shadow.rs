@@ -1041,6 +1041,34 @@ mod tests {
             (0, 16, 1),
         )
         .expect("indirect bound");
+        // `indirect::bound` writes clamped arguments into `bounded`; copy them into
+        // `shadow.buffer` on the GPU so readback merges the GPU write into title memory.
+        // SAFETY: open list and live resources in their tracked states (`BUFFER_READ` / `INDIRECT_ARGUMENT`).
+        unsafe {
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATES,
+            };
+            let read_state = D3D12_RESOURCE_STATES(crate::host::BUFFER_READ as i32);
+            list.list.ResourceBarrier(&[
+                crate::host::transition(&shadow.buffer, read_state, D3D12_RESOURCE_STATE_COPY_DEST),
+                crate::host::transition(
+                    &bounded,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+            ]);
+            list.list
+                .CopyBufferRegion(&shadow.buffer, shadow.offset(mem.addr()), &bounded, 0, 16);
+            list.list.ResourceBarrier(&[
+                crate::host::transition(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_DEST, read_state),
+                crate::host::transition(
+                    &bounded,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ),
+            ]);
+        }
         crate::indirect::done(&list, &bounded);
         list.close();
         host.execute(&[&list]);

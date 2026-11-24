@@ -61,7 +61,7 @@ pub fn effective_wave64_mode() -> Wave64Mode {
 
 /// Serialization schema version for [`encode`] / [`decode`]. Bump whenever
 /// [`HostShader`]'s on-disk format changes.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 11;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 12;
 
 /// Opens a shader cache at `dir` (outside the repository), for offline AOT
 /// warming (`victory translate --write-cache`) or custom callers.

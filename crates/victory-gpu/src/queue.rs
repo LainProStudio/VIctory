@@ -261,6 +261,13 @@ extern "system" fn present(
     _parameters: *const u8,
 ) -> HRESULT {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        static PREV_DRAWN: AtomicU64 = AtomicU64::new(0);
+        let now = crate::draw::drawn();
+        let prev = PREV_DRAWN.swap(now, Ordering::Relaxed);
+        crate::capture::note_world_frame(frame, now.saturating_sub(prev));
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

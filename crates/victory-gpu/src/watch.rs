@@ -1532,6 +1532,7 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+        forget_journal(p, 3 * BLOCK);
         title_memory_remapped(p, 3 * BLOCK);
     }
 

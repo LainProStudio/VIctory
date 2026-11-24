@@ -16,17 +16,57 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
+static EXTRA_FRAMES: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// When `VICTORY_CAPTURE_WORLD_DRAWS=<min>` is set, automatically schedules
+/// swapchain and target capture for the next frame after world frames 2, 4,
+/// and 7 (capturing full render targets on world frames 3, 5, and 8).
+pub(crate) fn note_world_frame(frame: u64, draws_this_frame: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MIN: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let Some(min) = *MIN.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_WORLD_DRAWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    }) else {
+        return;
+    };
+    if draws_this_frame < min {
+        return;
+    }
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if matches!(n, 2 | 4 | 7) {
+        let next = frame + 1;
+        EXTRA_FRAMES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(next);
+        tracing::info!(
+            frame,
+            next_capture_frame = next,
+            world_frame = n,
+            draws = draws_this_frame,
+            "scheduled auto world-frame capture and target dump"
+        );
+    }
+}
+
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    let explicit = LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
         list.split(',')
             .filter_map(|f| f.trim().parse().ok())
             .collect()
-    })
-    .contains(&n)
+    });
+    explicit.contains(&n)
+        || EXTRA_FRAMES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&n)
 }
 
 /// Whether frame `n` is saved.
