@@ -514,6 +514,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Bound view heaps, including the slots mirrored after recording.
+    view_heaps: Vec<std::sync::Arc<crate::descriptor::host::HostHeap>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -625,6 +627,7 @@ impl Host {
         }
         batch.flush();
         let retired = take_retired();
+        let _direct_srvs = refresh_direct_srvs(runs);
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1295,6 +1298,17 @@ impl HostList {
         }
     }
 
+    pub(crate) fn use_view_heap(&self, heap: &std::sync::Arc<crate::descriptor::host::HostHeap>) {
+        let mut deferred = self.deferred();
+        if !deferred
+            .view_heaps
+            .iter()
+            .any(|other| std::sync::Arc::ptr_eq(other, heap))
+        {
+            deferred.view_heaps.push(heap.clone());
+        }
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -1385,6 +1399,77 @@ impl HostList {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn test_submission_counters() -> (u64, u64) {
+    (
+        SUBMISSION_US[0].load(Ordering::Relaxed),
+        COPY_BACK[1].load(Ordering::Relaxed),
+    )
+}
+
+/// Refresh live mirrored SRVs after deferred title writes and before
+/// GPU work. Retain the resources until the submission has finished.
+fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host::SrvRange)> {
+    use std::sync::Arc;
+
+    let started = std::time::Instant::now();
+    let mut heaps = std::collections::HashSet::new();
+    let mut ranges = Vec::new();
+    for list in runs {
+        for heap in &list.deferred().view_heaps {
+            if heaps.insert(Arc::as_ptr(heap)) {
+                let slots = heap.snapshot_srvs(&mut ranges);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DirectSlots, slots as u64);
+                let _ = slots;
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_unstable_by_key(|(_, r)| (Arc::as_ptr(&r.shadow), r.address));
+    let mut copied = 0usize;
+    let mut merged_count = 0u64;
+    crate::descriptor::with_live_views(|live| {
+        let mut pending: Option<(&Arc<crate::shadow::Shadow>, usize, usize)> = None;
+        for (key, range) in &ranges {
+            if !live(*key) || range.address == range.end {
+                continue;
+            }
+            if let Some((shadow, _, end)) = &mut pending
+                && Arc::ptr_eq(shadow, &range.shadow)
+                && range.address <= *end
+            {
+                *end = (*end).max(range.end);
+                continue;
+            }
+            if let Some((shadow, start, end)) =
+                pending.replace((&range.shadow, range.address, range.end))
+            {
+                copied += shadow.update(start, end - start);
+                merged_count += 1;
+            }
+        }
+        if let Some((shadow, start, end)) = pending {
+            copied += shadow.update(start, end - start);
+            merged_count += 1;
+        }
+    });
+    let elapsed = started.elapsed().as_micros() as u64;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::DirectRanges, merged_count);
+        add(C::DirectBytes, copied as u64);
+        add(C::DirectUs, elapsed);
+    }
+    let _ = merged_count;
+    PREPARING[0].fetch_add(elapsed, Ordering::Relaxed);
+    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    ranges
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
