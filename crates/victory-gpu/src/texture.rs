@@ -407,7 +407,7 @@ impl Staging {
     /// detiled into `linear` and copied in one sequential pass.
     fn detile(&self, tiled: &[u8], linear: &mut Vec<u8>, dst: *mut u8) {
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,

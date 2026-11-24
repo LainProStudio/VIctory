@@ -7,7 +7,7 @@
 //! `ResourceDescriptorHeap[]` draw or dispatch materializes and refreshes
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -141,8 +141,9 @@ struct Bindless {
     resolved: HashMap<u32, ResolvedSlot>,
     /// Global `(placed_epoch, remap_epoch, forget_epoch)` under which `resolved` was built.
     resolved_global: (u64, u64, u64),
-    /// What submissions do for the slots, until they or what they view change.
-    plan: Option<Arc<BindlessPlan>>,
+    /// What submissions do for the slots, cached with the revision key it was
+    /// built/validated under.
+    plan: Option<((u64, u64, u64, u64), Arc<BindlessPlan>)>,
     /// The placed-texture slots draws prepare at recording, keyed only by
     /// `(placed_revision, VIEWED_FORGET)`.
     placed: Option<((u64, u64), PlacedSlots)>,
@@ -211,7 +212,6 @@ const READ_GAP: usize = 1 << 20;
 /// What a submission does for a heap's bindless slots, made again only when
 /// the slots or what they view change ([`HostHeap::bindless_plan`]).
 pub(crate) struct BindlessPlan {
-    key: (u64, u64, u64, u64),
     /// Title memory the slots read, merged per host copy (address, bytes):
     /// refreshed at each submission using the heap.
     pub(crate) reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -248,23 +248,34 @@ impl BindlessPlan {
     }
 }
 
-/// `ranges` (host copy, address, bytes) sorted and merged per host copy
-/// where they overlap or lie within `gap` of each other.
-fn merged(
-    mut ranges: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
+type ShadowGroups<'a> = HashMap<usize, (&'a Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>;
+
+/// Sorts and merges `[addr, end)` spans grouped by shadow identity where adjacent
+/// spans lie within `gap` bytes of each other, cloning each `Arc<Shadow>` once per
+/// coalesced output range.
+fn merge_shadow_ranges(
+    mut groups: ShadowGroups<'_>,
     gap: usize,
 ) -> Vec<(Arc<crate::shadow::Shadow>, usize, usize)> {
-    ranges.sort_unstable_by_key(|(s, a, _)| (Arc::as_ptr(s) as usize, *a));
-    let mut out: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for (shadow, address, len) in ranges {
-        if let Some((s, a, l)) = out.last_mut()
-            && Arc::ptr_eq(s, &shadow)
-            && address <= *a + *l + gap
-        {
-            *l = (*l).max(address + len - *a);
-            continue;
+    let mut keys: Vec<usize> = groups.keys().copied().collect();
+    keys.sort_unstable();
+    let mut out = Vec::new();
+    for k in keys {
+        let (shadow, mut spans) = groups.remove(&k).expect("key from groups");
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (addr, end) in spans {
+            if let Some((_, prev_end)) = merged.last_mut()
+                && addr <= *prev_end + gap
+            {
+                *prev_end = (*prev_end).max(end);
+                continue;
+            }
+            merged.push((addr, end));
         }
-        out.push((shadow, address, len));
+        for (addr, end) in merged {
+            out.push((shadow.clone(), addr, end - addr));
+        }
     }
     out
 }
@@ -1260,16 +1271,18 @@ impl HostHeap {
     /// releasing individual resources prunes only stale slots in one `VIEWS`
     /// pass without invalidating live cached slots.
     pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
+        use windows::core::Interface;
         if self.sampler {
             return None;
         }
         loop {
             let key = self.revision();
             let global = (key.1, key.2, key.3);
+            let mut remap_invalidated = false;
             let (check_forget, entries_or_dirty): (bool, Vec<(u32, (u32, u32))>) = {
                 let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(plan) = &b.plan
-                    && plan.key == key
+                if let Some((cached_key, plan)) = &b.plan
+                    && *cached_key == key
                 {
                     return Some(plan.clone());
                 }
@@ -1285,28 +1298,43 @@ impl HostHeap {
                 }
                 let prev = b.resolved_global;
                 if prev.1 != global.1 {
+                    let before = b.resolved.len();
                     if let Some(remaps) = remaps_since(prev.1, global.1) {
                         b.resolved.retain(|_, v| !v.overlaps(&remaps));
                     } else {
                         b.resolved.clear();
                     }
+                    remap_invalidated = b.resolved.len() != before;
                 }
                 let need_forget = prev.2 != global.2;
                 b.resolved_global = global;
+                let dirty: Vec<(u32, (u32, u32))> = b
+                    .slots
+                    .iter()
+                    .filter(|(idx, _)| !b.resolved.contains_key(idx))
+                    .map(|(&idx, &v)| (idx, v))
+                    .collect();
+                if !need_forget
+                    && !remap_invalidated
+                    && dirty.is_empty()
+                    && let Some((cached_key, plan)) = &mut b.plan
+                    && cached_key.0 == key.0
+                    && cached_key.1 == global.0
+                {
+                    *cached_key = key;
+                    return Some(plan.clone());
+                }
                 let list = if need_forget {
                     b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
                 } else {
-                    b.slots
-                        .iter()
-                        .filter(|(idx, _)| !b.resolved.contains_key(idx))
-                        .map(|(&idx, &v)| (idx, v))
-                        .collect()
+                    dirty
                 };
                 (need_forget, list)
             };
 
             let dirty: Vec<(u32, (u32, u32))> = if check_forget {
                 let stale_forgotten = crate::descriptor::stale_slots(&entries_or_dirty);
+                let had_stale = !stale_forgotten.is_empty();
                 for &idx in &stale_forgotten {
                     self.clear_stale_slot(idx);
                 }
@@ -1335,11 +1363,33 @@ impl HostHeap {
                     b.plan = None;
                     return None;
                 }
-                b.slots
+                let dirty: Vec<(u32, (u32, u32))> = b
+                    .slots
                     .iter()
                     .filter(|(idx, _)| !b.resolved.contains_key(idx))
                     .map(|(&idx, &v)| (idx, v))
-                    .collect()
+                    .collect();
+                if !had_stale && !remap_invalidated && dirty.is_empty() {
+                    let current_global = (
+                        crate::resource::placed_epoch(),
+                        VIEWED_REMAP.load(Ordering::Acquire),
+                        VIEWED_FORGET.load(Ordering::Acquire),
+                    );
+                    let rev = self.revision.load(Ordering::Acquire);
+                    let can_reuse = current_global.0 == global.0
+                        && current_global.1 == global.1
+                        && rev == key.0
+                        && b.plan
+                            .as_ref()
+                            .is_some_and(|(ck, _)| ck.0 == rev && ck.1 == current_global.0);
+                    if can_reuse {
+                        b.resolved_global = current_global;
+                        let (cached_key, plan) = b.plan.as_mut().expect("checked cached plan");
+                        *cached_key = (rev, current_global.0, current_global.1, current_global.2);
+                        return Some(plan.clone());
+                    }
+                }
+                dirty
             } else {
                 entries_or_dirty
             };
@@ -1412,8 +1462,31 @@ impl HostHeap {
                 return None;
             }
 
-            let (mut reads, mut writes, mut bounces, mut retained) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let mut read_groups: ShadowGroups<'_> = HashMap::new();
+            let mut write_groups: ShadowGroups<'_> = HashMap::new();
+            let mut bounces = Vec::new();
+            let mut seen_res = HashSet::<usize>::new();
+            let mut retained = Vec::new();
+            let mut push_res = |res: &ID3D12Resource| {
+                if seen_res.insert(res.as_raw() as usize) {
+                    retained.push(res.clone());
+                }
+            };
+            fn add_span<'a>(
+                groups: &mut ShadowGroups<'a>,
+                shadow: &'a Arc<crate::shadow::Shadow>,
+                addr: usize,
+                len: usize,
+            ) {
+                if len == 0 {
+                    return;
+                }
+                groups
+                    .entry(Arc::as_ptr(shadow) as usize)
+                    .or_insert_with(|| (shadow, Vec::new()))
+                    .1
+                    .push((addr, addr.saturating_add(len)));
+            }
             for resolved in b.resolved.values() {
                 match resolved {
                     ResolvedSlot::CbvDirect {
@@ -1422,10 +1495,8 @@ impl HostHeap {
                         len,
                         res,
                     } => {
-                        if *len > 0 {
-                            reads.push((shadow.clone(), *address, *len));
-                        }
-                        retained.push(res.clone());
+                        add_span(&mut read_groups, shadow, *address, *len);
+                        push_res(res);
                     }
                     ResolvedSlot::CbvBounce {
                         cpu,
@@ -1434,20 +1505,20 @@ impl HostHeap {
                         res,
                     } => {
                         bounces.push((*cpu, *address, *len));
-                        retained.push(res.clone());
+                        push_res(res);
                     }
                     ResolvedSlot::PlacedTex { res, .. } => {
-                        retained.push(res.clone());
+                        push_res(res);
                     }
                     ResolvedSlot::Buffer { read, write, res, .. } => {
                         if let Some((shadow, addr, len)) = read {
-                            reads.push((shadow.clone(), *addr, *len));
+                            add_span(&mut read_groups, shadow, *addr, *len);
                         }
                         if let Some((shadow, addr, len)) = write {
-                            writes.push((shadow.clone(), *addr, *len));
+                            add_span(&mut write_groups, shadow, *addr, *len);
                         }
                         if let Some(res) = res {
-                            retained.push(res.clone());
+                            push_res(res);
                         }
                     }
                     ResolvedSlot::Null { .. } => {}
@@ -1460,13 +1531,12 @@ impl HostHeap {
                 current_global.2,
             );
             let plan = Arc::new(BindlessPlan {
-                key: plan_key,
-                reads: merged(reads, READ_GAP),
-                writes: merged(writes, 0),
+                reads: merge_shadow_ranges(read_groups, READ_GAP),
+                writes: merge_shadow_ranges(write_groups, 0),
                 bounces,
                 _retained: retained,
             });
-            b.plan = Some(plan.clone());
+            b.plan = Some((plan_key, plan.clone()));
             return Some(plan);
         }
     }
@@ -3966,6 +4036,52 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(host_heap.placed_revision(), (0, 0, 0, 0));
         assert!(host_heap.placed_slots().is_empty());
 
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    #[test]
+    fn unrelated_forget_reuses_existing_bindless_plan() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(4);
+        let mem = crate::resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
+        crate::shadow::register(0x30_0001, mem.address(), 64 << 10);
+        create_cbv(
+            std::ptr::null(),
+            &[mem.address() as u32, (mem.address() >> 32) as u32, 256, 0],
+            base,
+        );
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let plan1 = host_heap.bindless_plan().unwrap();
+        crate::descriptor::host::bindless_viewed_changed();
+        let plan2 = host_heap.bindless_plan().unwrap();
+        assert!(Arc::ptr_eq(&plan1, &plan2));
+
+        crate::shadow::unregister(0x30_0001, mem.address());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    #[test]
+    fn bindless_plan_deduplicates_retained_resources() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(8);
+        let mem = crate::resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
+        crate::shadow::register(0x30_0002, mem.address(), 64 << 10);
+        for i in 0..4u64 {
+            let at = mem.address() + i * 256;
+            create_cbv(std::ptr::null(), &[at as u32, (at >> 32) as u32, 256, 0], base + i * 32);
+        }
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let plan = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan._retained.len(), 1);
+        assert_eq!(plan.reads.len(), 1);
+
+        crate::shadow::unregister(0x30_0002, mem.address());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
     }

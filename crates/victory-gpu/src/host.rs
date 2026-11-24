@@ -1226,17 +1226,39 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut upload_pool = self.texture_uploads.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let (mut deferred_us, mut prelude_us, mut tex_uploads, mut bindless_us) =
+            (0u64, 0u64, 0usize, 0u64);
         let (_plans, back) = {
             let mut batch = Batch::default();
             for list in runs {
+                #[cfg(feature = "diagnostics")]
+                let t0 = std::time::Instant::now();
                 let uploads = list.run_deferred(&mut batch, self, &mut upload_pool);
+                #[cfg(feature = "diagnostics")]
+                {
+                    deferred_us += t0.elapsed().as_micros() as u64;
+                    tex_uploads += uploads.len();
+                }
                 firsts.push(lists.len());
+                #[cfg(feature = "diagnostics")]
+                let t1 = std::time::Instant::now();
                 if let Some(prelude) = list.prelude(&uploads) {
                     lists.push(Some(prelude));
                 }
+                #[cfg(feature = "diagnostics")]
+                {
+                    prelude_us += t1.elapsed().as_micros() as u64;
+                }
                 lists.push(list.list.cast().ok());
             }
+            #[cfg(feature = "diagnostics")]
+            let tb = std::time::Instant::now();
             batch.prepare_bindless();
+            #[cfg(feature = "diagnostics")]
+            {
+                bindless_us = tb.elapsed().as_micros() as u64;
+            }
             (batch.plans, batch.copy_back)
         };
         let prepared = std::time::Instant::now();
@@ -1327,6 +1349,27 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            let prep_ms = (prepared - started).as_millis() as u64;
+            let gpu_ms = gpu.as_millis() as u64;
+            let copyback_ms = copying.elapsed().as_millis() as u64;
+            if prep_ms >= 150 || gpu_ms >= 150 || copyback_ms >= 150 {
+                tracing::warn!(
+                    frame = crate::frame::current(),
+                    sub = this_submission,
+                    lists = runs.len(),
+                    prep_ms,
+                    deferred_ms = deferred_us / 1000,
+                    prelude_ms = prelude_us / 1000,
+                    bindless_ms = bindless_us / 1000,
+                    gpu_ms,
+                    copyback_ms,
+                    tex_uploads,
+                    "slow submission breakdown"
+                );
+            }
+        }
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
