@@ -133,6 +133,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging, copy);
 }
 
+fn hash_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HASH_TEXTURES"))
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all). Returns `true` when the
@@ -154,7 +159,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        if let Some((now, written)) =
+            crate::watch::writes(start, start + size, !hash_textures())
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return (0, false);
             }

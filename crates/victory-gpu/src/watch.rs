@@ -359,7 +359,14 @@ pub fn writing(at: usize, len: usize) {
     if len == 0 {
         return;
     }
-    open(&mut guards(), at, at + len);
+    let end = at.saturating_add(len);
+    let mut g = guards();
+    let range = at / BLOCK..end.div_ceil(BLOCK);
+    let absent: Vec<usize> = g.absent.range(range).copied().collect();
+    for block in absent {
+        g.absent.remove(&block);
+    }
+    open(&mut g, at, end);
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -990,5 +997,29 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    #[test]
+    fn writing_clears_absent_and_opens_guarded_blocks() {
+        let v = view(2);
+        assert!(guard(v, v + 2 * BLOCK).is_some());
+        let first = v / BLOCK;
+        {
+            let mut g = guards();
+            assert!(g.clean.contains(&first));
+            g.absent.insert(first + 1);
+            g.clean.remove(&(first + 1));
+            g.protected.remove(&(first + 1));
+        }
+        // Writing to both blocks wakes up guarded `first` and absent `first + 1`.
+        writing(v + 128, BLOCK);
+        {
+            let g = guards();
+            assert!(!g.clean.contains(&first), "clean cleared");
+            assert!(!g.protected.contains(&first), "protection opened");
+            assert!(!g.absent.contains(&(first + 1)), "absent cleared");
+        }
+        forget_journal(v, 2 * BLOCK);
+        title_memory_remapped(v, 2 * BLOCK);
     }
 }

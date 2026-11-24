@@ -1705,7 +1705,7 @@ pub(crate) fn placed_epoch() -> u64 {
 /// [`evict_placed_textures`] calls cannot free the underlying [`Resource`]
 /// while a reader uses it.
 #[cfg(windows)]
-pub(crate) struct PlacedTexture(This);
+pub(crate) struct PlacedTexture(This, u64);
 
 // SAFETY: `Resource` uses atomic refcounting (`object::add_ref` / `release_boxed`)
 // and thread-safe interior synchronization.
@@ -1719,6 +1719,10 @@ impl PlacedTexture {
     pub(crate) fn this(&self) -> This {
         self.0
     }
+
+    pub(crate) fn end(&self) -> u64 {
+        self.1
+    }
 }
 
 #[cfg(windows)]
@@ -1726,6 +1730,15 @@ impl Drop for PlacedTexture {
     fn drop(&mut self) {
         resource_release(self.0);
     }
+}
+
+/// Exclusive end title address for a placed texture description at `address`.
+#[cfg(windows)]
+pub(crate) fn placed_texture_end(address: u64, desc: &[u32; 14]) -> u64 {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let size = footprint(&d).map_or(1, |info| info.size.max(1));
+    address.saturating_add(size)
 }
 
 /// The resource for a texture placed at `address` with the resource
@@ -1736,9 +1749,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<PlacedTexture
         return None;
     }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(r, _)) = map.get(&(address, *desc)) {
+    if let Some(&(r, end)) = map.get(&(address, *desc)) {
         object::add_ref(r as This);
-        return Some(PlacedTexture(r as This));
+        return Some(PlacedTexture(r as This, end));
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
@@ -1767,7 +1780,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<PlacedTexture
     }
     map.insert((address, *desc), (out as usize, end));
     object::add_ref(out);
-    Some(PlacedTexture(out))
+    Some(PlacedTexture(out, end))
 }
 
 /// Releases placed textures whose backing range overlaps `[start, end)`.

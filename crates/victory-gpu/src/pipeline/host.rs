@@ -366,13 +366,19 @@ impl GraphicsState {
             .map(|e| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
+                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
+                // An appended element starts at the next multiple of
+                // min(4, its size) after the previous one, where D3D12 (and
+                // vkd3d) place it; the host pipeline gets the title's
+                // descriptions, so the offsets read here must match.
                 let offset = if e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT {
                     next[slot]
+                        .checked_next_multiple_of(bytes.clamp(1, 4))
+                        .unwrap_or(u32::MAX)
                 } else {
                     e.AlignedByteOffset
                 };
-                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
-                next[slot] = offset + bytes;
+                next[slot] = offset.saturating_add(bytes);
                 Input {
                     slot: slot as u32,
                     offset,
@@ -1210,7 +1216,7 @@ mod tests {
     fn resource_heap_root_can_bind_without_sampler_heap() {
         use windows::core::Interface;
         let Some(host) = crate::host::host() else { return };
-        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+        if crate::switch::on("VICTORY_D3D12_DEBUG") {
             host.device
                 .cast::<ID3D12InfoQueue>()
                 .expect("D3D12 debug queue");
@@ -1243,5 +1249,68 @@ mod tests {
         list.close();
         host.execute(&[&list]);
         assert_eq!(host.log_messages(), None);
+    }
+
+    fn test_element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
+            SemanticIndex: 0,
+            Format: format,
+            InputSlot: 0,
+            AlignedByteOffset: offset,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }
+    }
+
+    fn element_offsets(inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> Vec<u32> {
+        let state = GraphicsState {
+            inputs: inputs.to_vec(),
+            ..GraphicsState::default()
+        };
+        state.elements().iter().map(|e| e.offset).collect()
+    }
+
+    /// An appended element after one of 1 or 2 bytes started right after
+    /// it; D3D12 aligns it to min(4, its size), so the rectangle expansion
+    /// read its vertices from the wrong bytes.
+    #[test]
+    fn appended_elements_are_aligned() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        const APPEND: u32 = D3D12_APPEND_ALIGNED_ELEMENT;
+        // RG8 (2 bytes) then RG32 float: 4, not 2.
+        let a = [
+            test_element(DXGI_FORMAT_R8G8_UNORM, 0),
+            test_element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+        ];
+        assert_eq!(element_offsets(&a), [0, 4]);
+        // R8 then R16 float: 2, not 1; then R8 packs right after it.
+        let b = [
+            test_element(DXGI_FORMAT_R8_UNORM, 0),
+            test_element(DXGI_FORMAT_R16_FLOAT, APPEND),
+            test_element(DXGI_FORMAT_R8_UNORM, APPEND),
+        ];
+        assert_eq!(element_offsets(&b), [0, 2, 4]);
+        // Already aligned layouts are unchanged.
+        let c = [
+            test_element(DXGI_FORMAT_R8G8B8A8_UNORM, 0),
+            test_element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+            test_element(DXGI_FORMAT_R32G32B32_FLOAT, APPEND),
+        ];
+        assert_eq!(element_offsets(&c), [0, 4, 12]);
+    }
+
+    /// An explicit offset near 4 GiB overflowed the next appended offset
+    /// (a panic in debug builds).
+    #[test]
+    fn a_huge_explicit_offset_does_not_overflow() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+        };
+        let inputs = [
+            test_element(DXGI_FORMAT_R32G32B32A32_FLOAT, u32::MAX - 8),
+            test_element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
+        ];
+        let _ = element_offsets(&inputs);
     }
 }

@@ -81,6 +81,7 @@ enum ResolvedSlot {
     PlacedTex {
         res: ID3D12Resource,
         address: u64,
+        end: u64,
     },
     Buffer {
         address: u64,
@@ -104,7 +105,9 @@ impl ResolvedSlot {
             Self::CbvBounce { address, len, .. } => {
                 Some((address, address.saturating_add(u64::from(len).max(1))))
             }
-            Self::PlacedTex { address, .. } => Some((address, address.saturating_add(1))),
+            Self::PlacedTex { address, end, .. } => {
+                Some((address, end.max(address.saturating_add(1))))
+            }
             Self::Buffer { address, len, .. } => Some((address, address.saturating_add(len.max(1)))),
             Self::Null { range } => range,
         }
@@ -134,14 +137,15 @@ struct Bindless {
     resolved_global: (u64, u64, u64),
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
-    /// The placed-texture slots draws prepare at recording, likewise.
-    placed: Option<((u64, u64, u64, u64), PlacedSlots)>,
+    /// The placed-texture slots draws prepare at recording, keyed only by
+    /// `(slots_revision, VIEWED_FORGET)`.
+    placed: Option<((u64, u64), PlacedSlots)>,
 }
 
 /// Bindless slots viewing placed textures: slot, view index and generation.
 type PlacedSlots = Arc<Vec<(u32, (u32, u32))>>;
 
-const REMAP_LOG_CAP: usize = 512;
+const REMAP_LOG_CAP: usize = 8192;
 
 /// Bounded history of recent `(epoch, at, end)` remaps so `bindless_plan`
 /// can invalidate only cached slots whose title range overlaps.
@@ -1186,9 +1190,12 @@ impl HostHeap {
     }
 
     /// The slots viewing placed textures (not buffers), which draws prepare
-    /// as they are recorded; found again only when the slots change.
+    /// as they are recorded; found again only when the slots or forget epoch change.
     fn placed_slots(&self) -> PlacedSlots {
-        let key = self.revision();
+        let key = (
+            self.revision.load(Ordering::Acquire),
+            VIEWED_FORGET.load(Ordering::Acquire),
+        );
         let entries: Vec<(u32, (u32, u32))> = {
             let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((k, placed)) = &b.placed
@@ -1247,11 +1254,6 @@ impl HostHeap {
                     } else {
                         b.resolved.clear();
                     }
-                }
-                if prev.0 != global.0 {
-                    b.resolved.retain(|_, v| {
-                        !matches!(v, ResolvedSlot::PlacedTex { .. } | ResolvedSlot::Null { .. })
-                    });
                 }
                 let need_forget = prev.2 != global.2;
                 b.resolved_global = global;
@@ -1328,12 +1330,7 @@ impl HostHeap {
                     }
                     b.resolved_global.1 = current_global.1;
                 }
-                if b.resolved_global.0 != current_global.0 {
-                    b.resolved.retain(|_, v| {
-                        !matches!(v, ResolvedSlot::PlacedTex { .. } | ResolvedSlot::Null { .. })
-                    });
-                    b.resolved_global.0 = current_global.0;
-                }
+                b.resolved_global.0 = current_global.0;
                 // If only `VIEWED_FORGET` bumped during resolve, leave
                 // `b.resolved_global.2` as-is so the next iteration prunes incrementally.
                 continue;
@@ -1453,7 +1450,8 @@ impl HostHeap {
             }
             View::Placed(false, resource, desc) if resource[0] != 1 => {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let range = (address >= 0x10000).then(|| (address, address.saturating_add(1)));
+                let end = crate::resource::placed_texture_end(address, resource);
+                let range = (address >= 0x10000).then_some((address, end));
                 if !valid_title_address_cached(committed, address, 1) {
                     self.set_unmapped_null(index, &view);
                     return Some(ResolvedSlot::Null { range });
@@ -1467,6 +1465,7 @@ impl HostHeap {
                     Some(ResolvedSlot::PlacedTex {
                         res: host_tex.clone(),
                         address,
+                        end: placed.end,
                     })
                 } else {
                     self.set_unmapped_null(index, &view);
@@ -2239,6 +2238,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 /// keeping its backing `Resource` alive until the caller finishes using it.
 pub(crate) struct PlacedView {
     pub(crate) view: View,
+    pub(crate) end: u64,
     _hold: crate::resource::PlacedTexture,
 }
 
@@ -2262,9 +2262,11 @@ pub(crate) fn placed_texture(view: &View) -> Option<PlacedView> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
+    let end = texture.end();
     let view = View::Shader(texture.this() as usize, desc[..10].try_into().ok());
     Some(PlacedView {
         view,
+        end,
         _hold: texture,
     })
 }
@@ -3617,5 +3619,83 @@ void main(uint3 id : SV_DispatchThreadID) {
         });
         crate::watch::title_memory_remapped(addr as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr, &desc));
+    }
+
+    #[test]
+    fn remap_only_invalidates_overlapping_placed_texture_slots() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(4);
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let addr_a = mem.address();
+        let addr_b = mem.address() + (128 << 10);
+        let tex_srv_host = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        let mut srv_words = [0u32; 10];
+        // SAFETY: `D3D12_SHADER_RESOURCE_VIEW_DESC` is 40 bytes (`[u32; 10]`).
+        srv_words.copy_from_slice(&unsafe {
+            std::ptr::from_ref(&tex_srv_host).cast::<[u32; 10]>().read()
+        });
+        let make_placed = |addr: u64, slot_idx: u64| {
+            let mut resource = [0u32; 14];
+            resource[0] = 3; // TEXTURE2D
+            resource[4] = 16;
+            resource[6] = 16;
+            resource[7] = 0x0001_0001;
+            resource[8] = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+            resource[9] = 1;
+            resource[11] = 0x100; // LINEAR
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&srv_words);
+            desc[10] = addr as u32;
+            desc[11] = (addr >> 32) as u32;
+            create_placed_srv(std::ptr::null(), &resource, &desc, base + slot_idx * 32);
+        };
+        make_placed(addr_a, 0);
+        make_placed(addr_b, 1);
+
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let _plan1 = host_heap.bindless_plan().unwrap();
+        {
+            let b = host_heap.bindless.lock().unwrap();
+            assert!(matches!(
+                b.resolved.get(&0),
+                Some(ResolvedSlot::PlacedTex { address, .. }) if *address == addr_a
+            ));
+            assert!(matches!(
+                b.resolved.get(&1),
+                Some(ResolvedSlot::PlacedTex { address, .. }) if *address == addr_b
+            ));
+        }
+
+        // Remap inside texture A's footprint (128 bytes in): evicts only slot 0, keeps slot 1!
+        crate::watch::title_memory_remapped((addr_a + 128) as usize, 256);
+        {
+            let mut b = host_heap.bindless.lock().unwrap();
+            let prev = b.resolved_global;
+            let cur = VIEWED_REMAP.load(Ordering::Acquire);
+            let remaps = remaps_since(prev.1, cur).expect("remap fits in REMAP_LOG");
+            b.resolved.retain(|_, v| !v.overlaps(&remaps));
+            assert!(!b.resolved.contains_key(&0), "overlapping PlacedTex slot 0 evicted");
+            assert!(b.resolved.contains_key(&1), "disjoint PlacedTex slot 1 stays cached");
+        }
+        let _plan2 = host_heap.bindless_plan().unwrap();
+        assert!(host_heap.bindless.lock().unwrap().resolved.contains_key(&0));
+
+        crate::watch::title_memory_remapped(addr_a as usize, 256 << 10);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
     }
 }

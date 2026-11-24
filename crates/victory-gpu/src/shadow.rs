@@ -50,7 +50,7 @@ pub(crate) struct Shadow {
 #[cfg(feature = "diagnostics")]
 fn log_copyback() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_LOG_COPYBACK").is_some())
+    *ENABLED.get_or_init(|| crate::switch::on("VICTORY_LOG_COPYBACK"))
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
