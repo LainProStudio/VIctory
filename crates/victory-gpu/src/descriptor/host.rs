@@ -2430,6 +2430,11 @@ impl HostHeap {
                 }
             }
             View::Placed(false, resource, desc) if resource[0] != 1 => {
+                if !placed_texture_has_extent(resource) {
+                    // Only replacing the descriptor can repair its extent.
+                    self.set_unmapped_null_into(index, view, retired);
+                    return Some(ResolvedSlot::Null { range: None });
+                }
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let end = crate::resource::placed_texture_end(address, resource);
                 let range = (address >= 0x10000).then_some((address, end));
@@ -3390,6 +3395,12 @@ impl std::ops::Deref for PlacedView {
     }
 }
 
+/// Width and height belong to the placed resource description, not its SRV.
+fn placed_texture_has_extent(resource: &[u32; 14]) -> bool {
+    // The 64-bit width follows Dimension, padding, and Alignment.
+    (resource[4] != 0 || resource[5] != 0) && resource[6] != 0
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<PlacedView> {
@@ -3397,7 +3408,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<PlacedView> {
     let View::Placed(false, resource, desc) = view else {
         return None;
     };
-    if resource[0] == BUFFER {
+    if resource[0] == BUFFER || !placed_texture_has_extent(resource) {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -3990,6 +4001,27 @@ void main(uint3 id : SV_DispatchThreadID) {
             (&title[..68], &title[100..]),
             (&before[..68], &before[100..])
         );
+    }
+
+    #[test]
+    fn placed_texture_srv_rejects_empty_extents_before_resource_lookup() {
+        let mut resource = [0; 14];
+        resource[0] = 3; // TEXTURE2D
+        let mut desc = [0; 16];
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        desc[10] = 0x10000;
+        for (width, height) in [(0, 0), (0, 1), (1, 0)] {
+            resource[4] = width;
+            resource[6] = height;
+            assert!(!placed_texture_has_extent(&resource));
+            assert!(placed_texture(&View::Placed(false, resource, desc)).is_none());
+        }
+        for (lo, hi, height) in [(1, 0, 1), (1920, 0, 1080), (0, 1, 1)] {
+            resource[4] = lo;
+            resource[5] = hi;
+            resource[6] = height;
+            assert!(placed_texture_has_extent(&resource));
+        }
     }
 
     #[test]
