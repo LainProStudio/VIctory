@@ -874,44 +874,58 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
-        else {
-            return;
-        };
-        let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
-            crate::host::host(),
-        ) else {
-            return;
-        };
-        if !crate::host::allows_rtv(texture) {
-            return;
-        }
-        // SAFETY: the title passes four floats (null is tolerated).
-        let Some(color) = (unsafe { color.as_ref() }) else {
-            return;
-        };
-        let rects = (count > 0 && !rects.is_null()).then(|| {
-            // SAFETY: the title passes `count` rectangles, laid out as the host's.
-            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
-        });
-        const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(Some(texture), record.desc().as_ref());
-        // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
-                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    State(before as i32),
-                    State(RENDER_TARGET as i32),
-                )]);
-            }
-            list.list.ClearRenderTargetView(rtv, color, rects);
-        }
+        let record = crate::descriptor::rtv_record(handle);
+        let _ran = record_clear_rtv(this, record, color, count, rects);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::record_clear("rtv", record.map_or(0, |r| r.resource as usize), _ran);
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
+}
+
+#[cfg(windows)]
+fn record_clear_rtv(
+    this: This,
+    record: Option<crate::descriptor::RtvRecord>,
+    color: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) -> bool {
+    let (Some(list), Some(record)) = (host_list(this), record) else {
+        return false;
+    };
+    let (Some(texture), Some(host)) = (
+        crate::resource::host_resource(record.resource),
+        crate::host::host(),
+    ) else {
+        return false;
+    };
+    if !crate::host::allows_rtv(texture) {
+        return false;
+    }
+    // SAFETY: the title passes four floats (null is tolerated).
+    let Some(color) = (unsafe { color.as_ref() }) else {
+        return false;
+    };
+    let rects = (count > 0 && !rects.is_null()).then(|| {
+        // SAFETY: the title passes `count` rectangles, laid out as the host's.
+        unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+    });
+    const RENDER_TARGET: u32 = 0x4;
+    let rtv = host.rtv(Some(texture), record.desc().as_ref());
+    // SAFETY: an open list, a fresh view of a live texture.
+    unsafe {
+        if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+            list.list.ResourceBarrier(&[crate::host::transition(
+                texture,
+                State(before as i32),
+                State(RENDER_TARGET as i32),
+            )]);
+        }
+        list.list.ClearRenderTargetView(rtv, color, rects);
+    }
+    true
 }
 
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
@@ -927,32 +941,53 @@ extern "system" fn clear_dsv(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
-        else {
-            return;
-        };
-        let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
-            crate::host::host(),
-        ) else {
-            return;
-        };
-        let rects = (count > 0 && !rects.is_null()).then(|| {
-            // SAFETY: the title passes `count` rectangles, laid out as the host's.
-            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
-        });
-        const DEPTH_WRITE: u32 = 0x10;
-        ensure_state(list, record.resource, DEPTH_WRITE);
-        let dsv = host.dsv(texture, record.depth_desc().as_ref());
-        // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
-        };
+        let record = crate::descriptor::dsv_record(handle);
+        let _ran = record_clear_dsv(this, record, flags, depth, stencil, count, rects);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::record_clear("dsv", record.map_or(0, |r| r.resource as usize), _ran);
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
+}
+
+#[cfg(windows)]
+fn record_clear_dsv(
+    this: This,
+    record: Option<crate::descriptor::RtvRecord>,
+    flags: u32,
+    depth: f32,
+    stencil: u8,
+    count: u32,
+    rects: *const Rect,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
+    let (Some(list), Some(record)) = (host_list(this), record) else {
+        return false;
+    };
+    let (Some(texture), Some(host)) = (
+        crate::resource::host_resource(record.resource),
+        crate::host::host(),
+    ) else {
+        return false;
+    };
+    let rects = (count > 0 && !rects.is_null()).then(|| {
+        // SAFETY: the title passes `count` rectangles, laid out as the host's.
+        unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+    });
+    const DEPTH_WRITE: u32 = 0x10;
+    ensure_state(list, record.resource, DEPTH_WRITE);
+    let dsv = host.dsv(texture, record.depth_desc().as_ref());
+    // SAFETY: an open list, a fresh view of a live texture.
+    unsafe {
+        list.list.ClearDepthStencilView(
+            dsv,
+            D3D12_CLEAR_FLAGS(flags as i32 & 3),
+            depth,
+            stencil,
+            rects,
+        )
+    };
+    true
 }
 
 /// Clear a resource-backed texture with a matching bound GPU UAV and CPU UAV.
@@ -1335,7 +1370,7 @@ mod state {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
-    /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
+    /// The groups a mesh dispatch of `x` Ãƒâ€” `y` Ãƒâ€” `z` groups runs: the
     /// title's mesh programs read only the x group id, so `x` (y and z
     /// other than 1 are logged once); none if any dimension is empty.
     pub(super) fn mesh_groups(x: u32, y: u32, z: u32) -> Option<u32> {
@@ -1353,6 +1388,9 @@ mod state {
         super::count_draw();
         if let Some(x) = mesh_groups(x, y, z) {
             with_state(this, |list, s| s.dispatch_mesh(list, x));
+        } else {
+            #[cfg(feature = "diagnostics")]
+            with_state(this, |_, s| s.trace_operation("dispatch", false, "skipped"));
         }
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With an
@@ -1375,6 +1413,9 @@ mod state {
         if indirect == 0 {
             if x != 0 {
                 with_state(this, |list, s| s.dispatch_mesh(list, x));
+            } else {
+                #[cfg(feature = "diagnostics")]
+                with_state(this, |_, s| s.trace_operation("dispatch", false, "skipped"));
             }
             return;
         }
@@ -1461,6 +1502,8 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        with_state(this, |_, s| s.trace_operation("indirect", false, "dropped"));
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
@@ -1477,6 +1520,11 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
+        #[cfg(feature = "diagnostics")]
+        with_state(this, |_, s| {
+            let compute = matches!(args, [[2 | 105, ..]]);
+            s.trace_operation("indirect", compute, "dropped")
+        });
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",

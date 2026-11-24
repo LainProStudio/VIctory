@@ -249,6 +249,19 @@ pub(crate) fn bound(this: This) {
     }
 }
 
+/// Title hashes are available even when no host pipeline could be built.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn trace_hashes(this: This) -> Vec<String> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .map(|s| s.hash.clone())
+        .collect()
+}
+
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).

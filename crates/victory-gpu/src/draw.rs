@@ -92,7 +92,7 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
+    /// Tables made afresh in this list: (table, what it holds) Ã¢â€ â€™ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds (title heap, first, count), given
@@ -102,10 +102,10 @@ pub(crate) struct State {
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
-    /// address) → dynamic slot.
+    /// address) Ã¢â€ â€™ dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
     /// Root UAVs bound as one-view tables in this list: (host heap, title
-    /// address) → dynamic slot.
+    /// address) Ã¢â€ â€™ dynamic slot.
     root_uav_slots: std::collections::HashMap<(usize, u64), u32>,
 }
 
@@ -656,31 +656,45 @@ impl State {
         value: UavClear,
         rects: &[RECT],
     ) {
+        let _ran = self.record_clear_uav(list, gpu, cpu, resource, value, rects);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::record_clear("uav", resource as usize, _ran);
+    }
+
+    fn record_clear_uav(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        cpu: u64,
+        resource: This,
+        value: UavClear,
+        rects: &[RECT],
+    ) -> bool {
         let heap_id = self.heaps[0];
         if heap_id == 0 {
-            return;
+            return false;
         }
         let heap = crate::descriptor::heap(heap_id as This);
         if heap.index(gpu).is_none() {
-            return;
+            return false;
         }
         let (Some(View::Unordered(cpu_resource, _, words)), Some(View::Unordered(gpu_resource, _, _))) =
             (crate::descriptor::view(cpu), crate::descriptor::view(gpu))
         else {
-            return;
+            return false;
         };
         if cpu_resource != resource as usize || gpu_resource != cpu_resource {
-            return;
+            return false;
         }
         let (Some((texture, twin_format)), Some(native_heap)) =
             (crate::resource::host_unordered(resource), heap.host())
         else {
-            return;
+            return false;
         };
         let Some((slot, gpu_handle, cpu_handle)) =
             native_heap.clear_texture_uav(list, resource, texture, twin_format, words.as_ref())
         else {
-            return;
+            return false;
         };
         self.lease.add(heap_id, slot, 1);
         self.bind_heaps(list);
@@ -699,6 +713,7 @@ impl State {
                 }
             }
         }
+        true
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -1021,11 +1036,17 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let _ran = self.record_dispatch(list, x, y, z);
+        #[cfg(feature = "diagnostics")]
+        self.trace_operation("dispatch", true, if _ran { "ran" } else { "dropped" });
+    }
+
+    fn record_dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -1035,15 +1056,15 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            return;
+            return false;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -1053,6 +1074,87 @@ impl State {
             emit_uav_barrier(list);
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Report the title's stage hashes even when translation failed. Looking up a
+    /// host pipeline can queue work, so inspect its bindings only after a host op ran.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_operation(&self, kind: &'static str, compute: bool, status: &'static str) {
+        use crate::capture::{Pass, record_pass, trace_resource};
+        record_pass(|| {
+            let status =
+                if status == "dropped" && crate::pipeline::is_skipped(self.pipeline as This) {
+                    "skipped"
+                } else {
+                    status
+                };
+            let mut pass = Pass {
+                kind,
+                status,
+                hashes: crate::pipeline::trace_hashes(self.pipeline as This),
+                ..Pass::default()
+            };
+            if !compute {
+                pass.rtvs = self.targets.iter().map(|&r| trace_resource(r)).collect();
+                pass.dsv = self
+                    .depth
+                    .map(|d| trace_resource(d.resource))
+                    .unwrap_or_default();
+            }
+            if status != "ran" {
+                pass.uavs.push("?".into());
+                return pass;
+            }
+            if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                let roots = self.roots_ref(compute);
+                for stage in &p.stages {
+                    for &(slot, _) in &stage.root_uavs {
+                        if let Some(Root::View(at)) = roots.get(usize::from(slot)) {
+                            pass.uavs.push(format!("{at:#x},?,0"));
+                        }
+                    }
+                    let t = stage.translated();
+                    if t.resource_heap && t.writes_memory {
+                        pass.uavs.push("bindless".into());
+                    }
+                    for u in t
+                        .used
+                        .iter()
+                        .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                    {
+                        let Some(Root::Table(table)) = roots.get(usize::from(u.slot)) else {
+                            continue;
+                        };
+                        let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4)
+                        else {
+                            continue;
+                        };
+                        let Some(heap) = self.heap_of(handle) else {
+                            continue;
+                        };
+                        if heap.samplers() || !(handle - heap.start).is_multiple_of(32) {
+                            continue;
+                        }
+                        match crate::descriptor::view(handle) {
+                            Some(View::Unordered(r, _, _)) if r != 0 => {
+                                pass.uavs.push(trace_resource(r))
+                            }
+                            Some(View::Placed(true, r, d)) => {
+                                let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                                let width = u64::from(r[4]) | u64::from(r[5]) << 32;
+                                pass.uavs
+                                    .push(format!("{address:#x},{width}x{},{}", r[6], r[8]));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                pass.uavs.sort_unstable();
+                pass.uavs.dedup();
+            }
+            pass
+        });
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1128,6 +1230,8 @@ impl State {
                 }
                 Err(_) => false,
             };
+        #[cfg(feature = "diagnostics")]
+        self.trace_operation("dispatch", false, if ran { "ran" } else { "dropped" });
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1365,6 +1469,19 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        let _status = self.record_draw(list, vertices, instances, first, first_instance);
+        #[cfg(feature = "diagnostics")]
+        self.trace_operation("draw", false, _status);
+    }
+
+    fn record_draw(
+        &mut self,
+        list: &HostList,
+        vertices: u32,
+        instances: u32,
+        first: u32,
+        first_instance: u32,
+    ) -> &'static str {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
@@ -1389,8 +1506,9 @@ impl State {
                             emit_uav_barrier(list);
                         }
                         DRAWN.fetch_add(1, Ordering::Relaxed);
+                        return "ran";
                     }
-                    return;
+                    return "skipped";
                 }
             } else {
                 // Rectangles were expanded into their own vertex buffers (their
@@ -1413,12 +1531,13 @@ impl State {
                     emit_uav_barrier(list);
                 }
                 DRAWN.fetch_add(1, Ordering::Relaxed);
-                return;
+                return "ran";
             }
         }
         DROPPED.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         dropped(self.pipeline);
+        "dropped"
     }
 
     /// Binds a synthesized scratch index buffer expanding a non-indexed
@@ -1671,6 +1790,21 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        let _status =
+            self.record_draw_indexed(list, indices, instances, first, base, first_instance);
+        #[cfg(feature = "diagnostics")]
+        self.trace_operation("draw", false, _status);
+    }
+
+    fn record_draw_indexed(
+        &mut self,
+        list: &HostList,
+        indices: u32,
+        instances: u32,
+        first: u32,
+        base: i32,
+        first_instance: u32,
+    ) -> &'static str {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
@@ -1697,8 +1831,9 @@ impl State {
                             emit_uav_barrier(list);
                         }
                         DRAWN.fetch_add(1, Ordering::Relaxed);
+                        return "ran";
                     }
-                    return;
+                    return "skipped";
                 }
             } else {
                 #[cfg(feature = "diagnostics")]
@@ -1714,12 +1849,13 @@ impl State {
                     emit_uav_barrier(list);
                 }
                 DRAWN.fetch_add(1, Ordering::Relaxed);
-                return;
+                return "ran";
             }
         }
         DROPPED.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         dropped(self.pipeline);
+        "dropped"
     }
 }
 
@@ -1731,6 +1867,19 @@ impl State {
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let ran = self.record_indirect(list, (kind, stride, max), arguments, count);
+        #[cfg(feature = "diagnostics")]
+        self.trace_operation("indirect", kind == 2, if ran { "ran" } else { "dropped" });
+        ran
+    }
+
+    fn record_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),

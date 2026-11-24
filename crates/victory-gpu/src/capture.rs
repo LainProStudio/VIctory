@@ -18,6 +18,162 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 
 static EXTRA_FRAMES: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
+// Command recording order between presents, like the existing target capture.
+// Only the first auto-capture is armed. No descriptor inspection on other frames.
+use std::sync::atomic::{AtomicU64, Ordering};
+static TRACE_FRAME: AtomicU64 = AtomicU64::new(0);
+static PASSES: std::sync::Mutex<Vec<Pass>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(Default)]
+pub(crate) struct Pass {
+    pub(crate) kind: &'static str,
+    pub(crate) status: &'static str,
+    pub(crate) hashes: Vec<String>,
+    pub(crate) rtvs: Vec<String>,
+    pub(crate) dsv: String,
+    pub(crate) uavs: Vec<String>,
+}
+
+fn tracing_frame(target: u64, frame: u64) -> bool {
+    target != 0 && target == frame
+}
+
+pub(crate) fn record_pass(build: impl FnOnce() -> Pass) {
+    let target = TRACE_FRAME.load(Ordering::Acquire);
+    if target == 0 || !tracing_frame(target, crate::queue::presented() + 1) {
+        return;
+    }
+    let pass = build();
+    let mut rows = PASSES.lock().unwrap_or_else(|e| e.into_inner());
+    if TRACE_FRAME.load(Ordering::Relaxed) == target {
+        rows.push(pass);
+    }
+}
+
+/// Object addresses match the target PNG filenames.
+pub(crate) fn trace_resource(resource: usize) -> String {
+    if resource == 0 {
+        return String::new();
+    }
+    if let Some((address, size)) = crate::resource::buffer_bytes(resource as _) {
+        return format!("{address:p},{size}x1,0");
+    }
+    crate::resource::host_resource(resource as _).map_or_else(
+        || format!("{resource:#x},?,?"),
+        |texture| {
+            // SAFETY: the command holds a live resource.
+            let d = unsafe { texture.GetDesc() };
+            format!("{resource:#x},{}x{},{}", d.Width, d.Height, d.Format.0)
+        },
+    )
+}
+
+fn write_passes(mut out: impl std::io::Write, rows: &[Pass]) -> std::io::Result<()> {
+    writeln!(out, "op_idx\tkind\tstatus\tshader_hashes\trtvs\tdsv\tuavs")?;
+    for (i, p) in rows.iter().enumerate() {
+        writeln!(
+            out,
+            "{i}\t{}\t{}\t{}\t{}\t{}\t{}",
+            p.kind,
+            p.status,
+            p.hashes.join(";"),
+            p.rtvs.join(";"),
+            p.dsv,
+            p.uavs.join(";")
+        )?;
+    }
+    out.flush()
+}
+
+pub(crate) fn record_clear(view: &str, resource: usize, ran: bool) {
+    record_pass(|| {
+        let target = if ran {
+            trace_resource(resource)
+        } else {
+            format!("{resource:#x},?,?")
+        };
+        let mut pass = Pass {
+            kind: "clear",
+            status: if ran { "ran" } else { "dropped" },
+            ..Pass::default()
+        };
+        match view {
+            "rtv" => pass.rtvs.push(target),
+            "dsv" => pass.dsv = target,
+            "uav" => pass.uavs.push(target),
+            _ => unreachable!(),
+        }
+        pass
+    });
+}
+
+#[cfg(test)]
+mod pass_tests {
+    use super::*;
+
+    #[test]
+    fn filters_to_the_armed_frame() {
+        assert!(!tracing_frame(0, 0));
+        assert!(!tracing_frame(0, 19));
+        assert!(!tracing_frame(19, 18));
+        assert!(tracing_frame(19, 19));
+        assert!(!tracing_frame(19, 20));
+    }
+
+    #[test]
+    fn writes_seven_columns_with_empty_bindings_and_ordered_indices() {
+        let cases = [
+            Pass {
+                kind: "dispatch",
+                status: "dropped",
+                hashes: vec!["abc".into()],
+                ..Pass::default()
+            },
+            Pass {
+                kind: "clear",
+                status: "ran",
+                rtvs: vec!["0xbeef,64x32,28".into()],
+                ..Pass::default()
+            },
+            Pass {
+                kind: "indirect",
+                status: "skipped",
+                hashes: vec!["a".into(), "b".into()],
+                ..Pass::default()
+            },
+        ];
+        let mut bytes = Vec::new();
+        write_passes(&mut bytes, &cases).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                "op_idx\tkind\tstatus\tshader_hashes\trtvs\tdsv\tuavs\n",
+                "0\tdispatch\tdropped\tabc\t\t\t\n",
+                "1\tclear\tran\t\t0xbeef,64x32,28\t\t\n",
+                "2\tindirect\tskipped\ta;b\t\t\t\n"
+            )
+        );
+    }
+}
+
+fn dump_passes(frame: u64) {
+    if TRACE_FRAME
+        .compare_exchange(frame, 0, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let rows = std::mem::take(&mut *PASSES.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(dir) = folder() else { return };
+    let path = dir.join(format!("frame-{frame}-passes.tsv"));
+    let saved = std::fs::create_dir_all(dir)
+        .and_then(|_| std::fs::File::create(&path))
+        .and_then(|f| write_passes(std::io::BufWriter::new(f), &rows));
+    if let Err(error) = saved {
+        tracing::warn!(?path, %error, "could not save pass trace");
+    }
+}
+
 fn parse_positive_u64(v: &str) -> Option<u64> {
     v.trim().parse::<u64>().ok().filter(|&n| n > 0)
 }
@@ -59,6 +215,12 @@ pub(crate) fn note_world_frame(frame: u64, draws_this_frame: u64) -> Option<u64>
     let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if matches!(n, 2 | 4 | 7) {
         let next = frame + 1;
+        if n == 2
+            && folder().is_some()
+            && std::env::var("VICTORY_TRACE_FRAME").as_deref() == Ok("1")
+        {
+            TRACE_FRAME.store(next, Ordering::Release);
+        }
         EXTRA_FRAMES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -394,6 +556,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    dump_passes(frame);
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
