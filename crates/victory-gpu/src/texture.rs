@@ -51,17 +51,20 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
     /// Cached memory each subresource is detiled into before one sequential
     /// copy to the (write-combined) staging buffer; kept across calls.
     linear: Vec<u8>,
 }
+
+/// Room to read a watched or hashed texture's memory into, shared by all
+/// textures (a buffer each would hold the sum of their sizes for good). Kept,
+/// already touched, so refreshing does not fault its pages in again.
+static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -155,13 +158,19 @@ impl Staging {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return (0, false);
             }
-            last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            let Last { read, linear, .. } = last;
-            self.detile(read, linear);
+            let mut read = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(extra) = size.checked_sub(read.len())
+                && read.try_reserve_exact(extra).is_err()
+            {
+                once!(bytes = size, "no room to read a texture's memory; not uploaded");
+                return (0, false);
+            }
+            last.asked = now;
+            read.resize(size, 0);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            self.detile(&read, &mut last.linear);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
@@ -169,8 +178,15 @@ impl Staging {
         // Copy the whole texture out first: asking `committed` (VirtualQuery
         // per region) is slow, especially under Wine, while the read fails by
         // itself if any page is not committed.
-        last.read.resize(size, 0);
-        if !crate::host::read_into(self.memory, &mut last.read) {
+        let mut read = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(extra) = size.checked_sub(read.len())
+            && read.try_reserve_exact(extra).is_err()
+        {
+            once!(bytes = size, "no room to read a texture's memory; not uploaded");
+            return (0, false);
+        }
+        read.resize(size, 0);
+        if !crate::host::read_into(self.memory, &mut read) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -180,15 +196,14 @@ impl Staging {
             );
             return (0, false);
         }
-        let hash = blake3::hash(&last.read);
+        let hash = blake3::hash(&read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return (size, false);
         }
         last.hash = Some(hash);
-        let Last { read, linear, .. } = last;
-        self.detile(read, linear);
+        self.detile(&read, &mut last.linear);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
