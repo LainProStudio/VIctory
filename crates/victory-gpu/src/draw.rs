@@ -94,7 +94,7 @@ pub(crate) struct State {
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
     /// Last bindless view heap prepared on this list: `(heap, revision, copy_epoch)`.
-    bindless_prepared: Option<(usize, (u64, u64, u64), u64)>,
+    bindless_prepared: Option<(usize, (u64, u64, u64, u64), u64)>,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,

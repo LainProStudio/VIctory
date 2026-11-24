@@ -98,25 +98,33 @@ struct Bindless {
     bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
     /// Incremental resolution cache per tracked slot for unchanged slots.
     resolved: HashMap<u32, ResolvedSlot>,
-    /// Global `(placed_epoch, viewed_epoch)` under which `resolved` was built.
-    resolved_global: (u64, u64),
+    /// Global `(placed_epoch, remap_epoch, forget_epoch)` under which `resolved` was built.
+    resolved_global: (u64, u64, u64),
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
     /// The placed-texture slots draws prepare at recording, likewise.
-    placed: Option<((u64, u64, u64), PlacedSlots)>,
+    placed: Option<((u64, u64, u64, u64), PlacedSlots)>,
 }
 
 /// Bindless slots viewing placed textures: slot, view index and generation.
 type PlacedSlots = Arc<Vec<(u32, (u32, u32))>>;
 
-/// Bumped when views go stale or title memory is mapped or unmapped: what
-/// bindless slots view may have changed though no slot was written.
-static VIEWED: AtomicU64 = AtomicU64::new(0);
+/// Bumped when title memory is mapped or unmapped (`title_memory_remapped`):
+/// requires re-validating every bindless slot's backing memory.
+static VIEWED_REMAP: AtomicU64 = AtomicU64::new(0);
 
-/// Bindless slots must be checked again: a resource their views name was
-/// released, or title memory was mapped or unmapped.
+/// Bumped when individual title resources are released (`descriptor::forget`):
+/// only slots whose view generation went stale need pruning.
+static VIEWED_FORGET: AtomicU64 = AtomicU64::new(0);
+
+/// Title memory was mapped or unmapped: every bindless slot must recheck its backing memory.
+pub(crate) fn bindless_memory_remapped() {
+    VIEWED_REMAP.fetch_add(1, Ordering::Release);
+}
+
+/// A viewed resource was released: bindless slots must prune stale views.
 pub(crate) fn bindless_viewed_changed() {
-    VIEWED.fetch_add(1, Ordering::Release);
+    VIEWED_FORGET.fetch_add(1, Ordering::Release);
 }
 
 /// Bindless unordered access ranges larger than this are not copied back.
@@ -134,7 +142,7 @@ const READ_GAP: usize = 1 << 20;
 /// What a submission does for a heap's bindless slots, made again only when
 /// the slots or what they view change ([`HostHeap::bindless_plan`]).
 pub(crate) struct BindlessPlan {
-    key: (u64, u64, u64),
+    key: (u64, u64, u64, u64),
     /// Title memory the slots read, merged per host copy (address, bytes):
     /// refreshed at each submission using the heap.
     pub(crate) reads: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -509,13 +517,14 @@ impl HostHeap {
         self.count
     }
 
-    /// Current bindless slot, placed-texture, and viewed-memory epochs, for
+    /// Current bindless slot, placed-texture, remap, and forget epochs, for
     /// caching what the slots need.
-    pub(crate) fn revision(&self) -> (u64, u64, u64) {
+    pub(crate) fn revision(&self) -> (u64, u64, u64, u64) {
         (
             self.revision.load(Ordering::Acquire),
             crate::resource::placed_epoch(),
-            VIEWED.load(Ordering::Acquire),
+            VIEWED_REMAP.load(Ordering::Acquire),
+            VIEWED_FORGET.load(Ordering::Acquire),
         )
     }
 
@@ -1077,15 +1086,17 @@ impl HostHeap {
 
     /// At submission: what the heap's bindless slots need. Only dirty or
     /// invalidated slots are re-resolved, using a per-call `VirtualQuery`
-    /// region cache; unchanged slots reuse their cached resolution.
+    /// region cache; unchanged slots reuse their cached resolution, and
+    /// releasing individual resources prunes only stale slots in one `VIEWS`
+    /// pass without invalidating live cached slots.
     pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
         if self.sampler {
             return None;
         }
         loop {
             let key = self.revision();
-            let global = (key.1, key.2);
-            let dirty: Vec<(u32, (u32, u32))> = {
+            let global = (key.1, key.2, key.3);
+            let (check_forget, entries_or_dirty): (bool, Vec<(u32, (u32, u32))>) = {
                 let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(plan) = &b.plan
                     && plan.key == key
@@ -1098,15 +1109,54 @@ impl HostHeap {
                     b.plan = None;
                     return None;
                 }
-                if b.resolved_global != global {
+                let prev = b.resolved_global;
+                if prev.1 != global.1 {
                     b.resolved.clear();
-                    b.resolved_global = global;
+                } else if prev.0 != global.0 {
+                    b.resolved.retain(|_, v| {
+                        !matches!(v, ResolvedSlot::PlacedTex { .. } | ResolvedSlot::Null)
+                    });
+                }
+                let need_forget = prev.1 == global.1 && prev.2 != global.2;
+                b.resolved_global = global;
+                let list = if need_forget {
+                    b.slots.iter().map(|(&idx, &v)| (idx, v)).collect()
+                } else {
+                    b.slots
+                        .iter()
+                        .filter(|(idx, _)| !b.resolved.contains_key(idx))
+                        .map(|(&idx, &v)| (idx, v))
+                        .collect()
+                };
+                (need_forget, list)
+            };
+
+            let dirty: Vec<(u32, (u32, u32))> = if check_forget {
+                let stale_forgotten = crate::descriptor::stale_slots(&entries_or_dirty);
+                for &idx in &stale_forgotten {
+                    self.clear_stale_slot(idx);
+                }
+                let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+                for idx in stale_forgotten {
+                    b.resolved.remove(&idx);
+                    if b.slots.remove(&idx).is_some()
+                        && let Some(bounce) = b.cbv_bounce.get_mut(&idx)
+                    {
+                        bounce.active = false;
+                    }
+                }
+                if b.slots.is_empty() {
+                    b.resolved.clear();
+                    b.plan = None;
+                    return None;
                 }
                 b.slots
                     .iter()
                     .filter(|(idx, _)| !b.resolved.contains_key(idx))
                     .map(|(&idx, &v)| (idx, v))
                     .collect()
+            } else {
+                entries_or_dirty
             };
 
             #[cfg(feature = "diagnostics")]
@@ -1130,11 +1180,21 @@ impl HostHeap {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let current_global = (
                 crate::resource::placed_epoch(),
-                VIEWED.load(Ordering::Acquire),
+                VIEWED_REMAP.load(Ordering::Acquire),
+                VIEWED_FORGET.load(Ordering::Acquire),
             );
             if b.resolved_global != current_global {
-                b.resolved.clear();
-                b.resolved_global = current_global;
+                if b.resolved_global.1 != current_global.1 {
+                    b.resolved.clear();
+                    b.resolved_global = current_global;
+                } else if b.resolved_global.0 != current_global.0 {
+                    b.resolved.retain(|_, v| {
+                        !matches!(v, ResolvedSlot::PlacedTex { .. } | ResolvedSlot::Null)
+                    });
+                    b.resolved_global.0 = current_global.0;
+                }
+                // If only `VIEWED_FORGET` bumped during resolve, leave
+                // `b.resolved_global.2` as-is so the next iteration prunes incrementally.
                 continue;
             }
             for idx in stale {
@@ -1201,6 +1261,7 @@ impl HostHeap {
                 self.revision.load(Ordering::Acquire),
                 current_global.0,
                 current_global.1,
+                current_global.2,
             );
             let plan = Arc::new(BindlessPlan {
                 key: plan_key,
@@ -3112,6 +3173,61 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(fourth.reads.len(), 1);
         assert_eq!(fourth.reads[0].2, 0x2100, "released resource slot pruned");
 
+        assert_eq!(release(title_heap), 0);
+    }
+
+    #[test]
+    fn forget_only_invalidates_released_slot_not_live_cache() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(4);
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let r_keep = make_title_buffer(mem.address(), 512, false);
+        let r_drop = make_title_buffer(mem.address() + 0x10000, 512, false);
+        let srv_desc_host = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: POD conversion of 40-byte SRV desc.
+        let raw_srv: [u32; 10] = unsafe {
+            std::ptr::from_ref(&srv_desc_host)
+                .cast::<[u32; 10]>()
+                .read()
+        };
+        create_srv(std::ptr::null(), r_keep, &raw_srv, base);
+        create_srv(std::ptr::null(), r_drop, &raw_srv, base + 32);
+
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let plan1 = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan1.reads.len(), 2);
+
+        let (vi0, gen0) = host_heap.bindless.lock().unwrap().slots[&0];
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(r_drop), 0);
+
+        // Even while `r_drop`'s `forget` bumped `VIEWED_FORGET`, slot 0 stays in
+        // `resolved` instead of being cleared and re-resolved.
+        let plan2 = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan2.reads.len(), 1);
+        assert_eq!(plan2.reads[0].1, mem.address() as usize);
+        let b = host_heap.bindless.lock().unwrap();
+        assert!(!b.slots.contains_key(&1));
+        assert!(!b.resolved.contains_key(&1));
+        assert_eq!(b.slots.get(&0), Some(&(vi0, gen0)));
+        assert!(b.resolved.contains_key(&0));
+        drop(b);
+
+        assert_eq!(release(r_keep), 0);
         assert_eq!(release(title_heap), 0);
     }
 

@@ -526,6 +526,23 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
+/// Returns every `index` in `entries` (`(slot_index, (view_index, generation))`)
+/// whose recorded view generation is no longer current. Locks `VIEWS` once.
+#[cfg(windows)]
+pub(crate) fn stale_slots(entries: &[(u32, (u32, u32))]) -> Vec<u32> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    entries
+        .iter()
+        .filter_map(|&(index, (vi, generation))| {
+            let stale = views
+                .list
+                .get(vi as usize)
+                .is_none_or(|(_, current)| *current != generation);
+            stale.then_some(index)
+        })
+        .collect()
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
