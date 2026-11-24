@@ -4802,6 +4802,87 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
+        // Bytes and halves: (bits, signed) of `ds_read_{u,i}{8,16}` and
+        // `ds_write_b{8,16}`, read and written within their dword.
+        // shortcut: a half at byte 3 of a dword (crossing into the next) is
+        // taken as within it.
+        // `_d16`: the value is a 16-bit half of the VGPR (`_hi`: the high
+        // one); a read keeps the other half.
+        let base = name.trim_end_matches("_hi").trim_end_matches("_d16");
+        let (d16, hi) = (name.contains("_d16"), name.ends_with("_hi"));
+        let narrow = match base {
+            "ds_read_u8" | "ds_write_b8" => Some((8u32, false)),
+            "ds_read_i8" => Some((8, true)),
+            "ds_read_u16" | "ds_write_b16" => Some((16, false)),
+            "ds_read_i16" => Some((16, true)),
+            _ => None,
+        };
+        if let Some((bits, signed)) = narrow {
+            let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+            let (address, in_bounds) = byte_and_bounds(self, offset);
+            let three = k(self, 3);
+            let byte = self.s.m.bin(c, Bin::And, address, three);
+            let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+            let mask = k(self, (1u32 << bits) - 1);
+            if name.starts_with("ds_read") {
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let zero = k(self, 0);
+                let safe = self.s.m.select(c, in_bounds, address, zero);
+                let loaded = self.lds_load_dword(safe);
+                let c = self.cur;
+                let w = self.s.m.select(c, in_bounds, loaded, zero);
+                let x = self.s.m.bin(c, Bin::LShr, w, shift);
+                let x = if signed {
+                    // Up to the top, then arithmetically back down.
+                    let up = k(self, 32 - bits);
+                    let t = self.s.m.bin(c, Bin::Shl, x, up);
+                    self.s.m.bin(c, Bin::AShr, t, up)
+                } else {
+                    self.s.m.bin(c, Bin::And, x, mask)
+                };
+                let x = if !d16 {
+                    x
+                } else if !hi {
+                    self.low_half(inst, reg, x)
+                } else {
+                    let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => k(self, 0),
+                    };
+                    let (low, sixteen) = (k(self, 0xFFFF), k(self, 16));
+                    let old = self.s.m.bin(c, Bin::And, old, low);
+                    let x = self.s.m.bin(c, Bin::Shl, x, sixteen);
+                    self.s.m.bin(c, Bin::Or, old, x)
+                };
+                self.write(inst, Reg::V(reg), x, guard);
+            } else {
+                let mut v = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                if hi {
+                    let sixteen = k(self, 16);
+                    v = self.s.m.bin(c, Bin::LShr, v, sixteen);
+                }
+                let v = self.s.m.bin(c, Bin::And, v, mask);
+                let v = self.s.m.bin(c, Bin::Shl, v, shift);
+                let hole = self.s.m.bin(c, Bin::Shl, mask, shift);
+                let all = k(self, u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, hole, all);
+                let cond = match guard {
+                    Some(g) => self.s.m.bin(c, Bin::And, g, in_bounds),
+                    None => in_bounds,
+                };
+                let at = self.begin_guarded(Some(cond));
+                if self.wide_lds {
+                    self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_GROUP_SHARED;
+                }
+                self.lds_update_dword(address, |l, old| {
+                    let c = l.cur;
+                    let kept = l.s.m.bin(c, Bin::And, old, keep);
+                    l.s.m.bin(c, Bin::Or, kept, v)
+                });
+                self.end_guarded(at, &[]);
+            }
+            return Ok(());
+        }
         if let Some(rest) = name.strip_prefix("ds_read") {
             let reg = dst_reg.ok_or("an LDS read result")?;
             let elements = if rest.starts_with('2') {
@@ -5741,7 +5822,7 @@ impl<'a> Lower<'a> {
             ..
         } = inst.fields
         else {
-            return Err("a scalar memory read as data");
+            return Err("a scalar memory read as data without a scalar destination");
         };
         let count = match inst.name().strip_prefix("s_load_dword") {
             Some("") => 1u32,
@@ -5749,7 +5830,7 @@ impl<'a> Lower<'a> {
             Some("x4") => 4,
             Some("x8") => 8,
             Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+            _ => return Err("a scalar memory read as data of another kind"),
         };
         // How the program uses the descriptor tells the view's kind.
         let use_at = self
@@ -5803,7 +5884,19 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
+            // A buffer descriptor also read by `s_buffer_load`: a raw SRV
+            // has a size (a constant buffer view does not).
+            Fields::Smem { .. } => match used.map(|u| u.kind) {
+                Some(ResourceType::Srv) => ((11 | u, 0), None),
+                Some(ResourceType::Cbv) => {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                _ => return Err("a descriptor read as data and by a scalar load"),
+            },
+            Fields::Flat { .. } => {
+                return Err("a descriptor read as data and by a global access");
+            }
+            _ => return Err("a descriptor read as data and by another instruction"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
